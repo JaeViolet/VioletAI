@@ -11,8 +11,9 @@ from PySide6.QtCore import QObject, Signal, Slot
 
 from config import (
     CONNECT_TIMEOUT_SECONDS,
+    DEFAULT_MODEL_NAME,
     KEEP_ALIVE,
-    MODEL_NAME,
+    OLLAMA_BASE_URL,
     OLLAMA_URL,
     READ_TIMEOUT_SECONDS,
 )
@@ -48,7 +49,10 @@ def parse_stream_line(line: str | bytes) -> dict[str, Any]:
     return data
 
 
-def iter_message_chunks(lines: Iterable[str | bytes]) -> Iterator[tuple[str, bool]]:
+def iter_message_chunks(
+    lines: Iterable[str | bytes],
+    model_name: str = DEFAULT_MODEL_NAME,
+) -> Iterator[tuple[str, bool]]:
     for line in lines:
         data = parse_stream_line(line)
         if not data:
@@ -57,22 +61,40 @@ def iter_message_chunks(lines: Iterable[str | bytes]) -> Iterator[tuple[str, boo
             message = str(error)
             if "not found" in message.lower() or "pull model" in message.lower():
                 raise ModelMissingError(
-                    f"Configured model '{MODEL_NAME}' is missing. Run: ollama pull {MODEL_NAME}"
+                    f"Configured model '{model_name}' is missing. Run: ollama pull {model_name}"
                 )
             raise OllamaError(message)
         chunk = data.get("message", {}).get("content", "")
         yield str(chunk), bool(data.get("done"))
 
 
-def _http_error_message(response: requests.Response) -> str:
+def _http_error_message(response: requests.Response, model_name: str) -> str:
     try:
         data = response.json()
     except ValueError:
         data = {}
     error_text = str(data.get("error") or response.text or response.reason)
     if response.status_code == 404 or "not found" in error_text.lower():
-        return f"Configured model '{MODEL_NAME}' is missing. Run: ollama pull {MODEL_NAME}"
+        return f"Configured model '{model_name}' is missing. Run: ollama pull {model_name}"
     return f"Ollama request failed with HTTP {response.status_code}: {error_text}"
+
+
+def discover_models() -> list[str]:
+    response = requests.get(
+        f"{OLLAMA_BASE_URL}/api/tags",
+        timeout=(CONNECT_TIMEOUT_SECONDS, 20),
+    )
+    response.raise_for_status()
+    data = response.json()
+    models = data.get("models", [])
+    if not isinstance(models, list):
+        raise OllamaError("Ollama returned an invalid model list.")
+    names = sorted(
+        str(model.get("name", ""))
+        for model in models
+        if isinstance(model, dict) and model.get("name")
+    )
+    return names
 
 
 class OllamaWorker(QObject):
@@ -85,9 +107,14 @@ class OllamaWorker(QObject):
     failed = Signal(str)
     stopped = Signal()
 
-    def __init__(self, messages: list[dict[str, str]]) -> None:
+    def __init__(
+        self,
+        messages: list[dict[str, str]],
+        model_name: str = DEFAULT_MODEL_NAME,
+    ) -> None:
         super().__init__()
         self._messages = messages
+        self._model_name = model_name
         self._cancelled = False
         self._response: requests.Response | None = None
 
@@ -98,7 +125,7 @@ class OllamaWorker(QObject):
             self._response = requests.post(
                 OLLAMA_URL,
                 json={
-                    "model": MODEL_NAME,
+                    "model": self._model_name,
                     "messages": self._messages,
                     "stream": True,
                     "keep_alive": KEEP_ALIVE,
@@ -107,11 +134,12 @@ class OllamaWorker(QObject):
                 timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS),
             )
             if self._response.status_code >= 400:
-                raise OllamaError(_http_error_message(self._response))
+                raise OllamaError(_http_error_message(self._response, self._model_name))
 
             self.connected.emit()
             for chunk, done in iter_message_chunks(
-                self._response.iter_lines(decode_unicode=True)
+                self._response.iter_lines(decode_unicode=True),
+                self._model_name,
             ):
                 if self._cancelled:
                     self.cancelled.emit()
@@ -164,3 +192,22 @@ class OllamaWorker(QObject):
         self._cancelled = True
         if self._response is not None:
             self._response.close()
+
+
+class ModelDiscoveryWorker(QObject):
+    finished = Signal(list)
+    failed = Signal(str)
+    stopped = Signal()
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.finished.emit(discover_models())
+        except requests.ConnectionError:
+            self.failed.emit("Could not connect to Ollama for model discovery.")
+        except requests.Timeout:
+            self.failed.emit("Ollama model discovery timed out.")
+        except (requests.RequestException, OllamaError) as error:
+            self.failed.emit(str(error))
+        finally:
+            self.stopped.emit()

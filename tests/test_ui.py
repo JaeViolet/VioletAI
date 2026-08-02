@@ -14,12 +14,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtGui import QKeyEvent  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QLabel  # noqa: E402
 
-from config import SYSTEM_PROMPT  # noqa: E402
+from config import DEFAULT_MODEL_NAME, SYSTEM_PROMPT  # noqa: E402
 from conversation_store import ConversationStore  # noqa: E402
 from main import MainWindow  # noqa: E402
-from ollama_client import InvalidStreamError, OllamaWorker, iter_message_chunks  # noqa: E402
+from ollama_client import InvalidStreamError, OllamaWorker, discover_models, iter_message_chunks  # noqa: E402
+from sidebar import ChatSidebar  # noqa: E402
 from widgets import AutoGrowingInput, MarkdownView, MessageBubble  # noqa: E402
 
 
@@ -27,6 +28,18 @@ class ChatFoundationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
+
+    def _window_with_temp_store(self) -> tuple[MainWindow, tempfile.TemporaryDirectory]:
+        temp_dir = tempfile.TemporaryDirectory()
+        store = ConversationStore(Path(temp_dir.name))
+        patcher = patch("main.ConversationStore", return_value=store)
+        refresh = patch.object(MainWindow, "_refresh_models")
+        patcher.start()
+        refresh.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(refresh.stop)
+        self.addCleanup(temp_dir.cleanup)
+        return MainWindow(), temp_dir
 
     def test_markdown_message_splits_out_code_block(self) -> None:
         bubble = MessageBubble(
@@ -51,11 +64,7 @@ class ChatFoundationTests(unittest.TestCase):
         editor = AutoGrowingInput()
         emissions: list[bool] = []
         editor.send_requested.connect(lambda: emissions.append(True))
-        enter = QKeyEvent(
-            QKeyEvent.Type.KeyPress,
-            Qt.Key.Key_Return,
-            Qt.KeyboardModifier.NoModifier,
-        )
+        enter = QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_Return, Qt.KeyboardModifier.NoModifier)
         editor.keyPressEvent(enter)
         self.assertEqual(emissions, [True])
 
@@ -67,6 +76,22 @@ class ChatFoundationTests(unittest.TestCase):
         editor.keyPressEvent(shifted_enter)
         self.assertEqual(editor.toPlainText(), "\n")
 
+    def test_prompt_history_navigation_preserves_draft(self) -> None:
+        editor = AutoGrowingInput()
+        editor.remember_prompt("first")
+        editor.remember_prompt("second")
+        editor.setPlainText("draft")
+        up = QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_Up, Qt.KeyboardModifier.NoModifier)
+        down = QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_Down, Qt.KeyboardModifier.NoModifier)
+        editor.keyPressEvent(up)
+        self.assertEqual(editor.toPlainText(), "second")
+        editor.keyPressEvent(up)
+        self.assertEqual(editor.toPlainText(), "first")
+        editor.keyPressEvent(down)
+        self.assertEqual(editor.toPlainText(), "second")
+        editor.keyPressEvent(down)
+        self.assertEqual(editor.toPlainText(), "draft")
+
     def test_stream_parser_combines_chunks_and_rejects_bad_json(self) -> None:
         lines = [
             '{"message":{"content":"Hello"},"done":false}',
@@ -76,34 +101,116 @@ class ChatFoundationTests(unittest.TestCase):
         with self.assertRaises(InvalidStreamError):
             list(iter_message_chunks(["not-json"]))
 
+    def test_stream_parser_accepts_lines_as_they_arrive(self) -> None:
+        lines = (line for line in ['{"message":{"content":"A"},"done":false}', '{"done":true}'])
+        self.assertEqual(list(iter_message_chunks(lines)), [("A", False), ("", True)])
+
     def test_conversation_persistence_round_trips_unicode(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = ConversationStore(Path(temp_dir))
             conversation = store.create(SYSTEM_PROMPT)
-            conversation.messages.append({"role": "user", "content": "Hello, Violet ✨"})
+            conversation.messages.append({"role": "user", "content": "Hello, Violet"})
             conversation.messages.append({"role": "assistant", "content": "Saved as UTF-8."})
             store.save(conversation)
-
             restored = store.load_latest()
             self.assertIsNotNone(restored)
             assert restored is not None
             self.assertEqual(restored.id, conversation.id)
-            self.assertEqual(restored.messages[1]["content"], "Hello, Violet ✨")
+            self.assertEqual(restored.messages[1]["content"], "Hello, Violet")
 
-    @patch("main.ConversationStore")
-    def test_window_restores_latest_conversation(self, store_class: Mock) -> None:
+    def test_conversation_grouping_search_rename_and_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ConversationStore(Path(temp_dir))
+            conversation = store.create(SYSTEM_PROMPT)
+            conversation.messages.append({"role": "user", "content": "Write Python code"})
+            store.save(conversation)
+            self.assertEqual(store.search("python")[0].id, conversation.id)
+            self.assertTrue(any(item.id == conversation.id for item in store.grouped()["Today"]))
+            renamed = store.rename(conversation.id, "Code notes")
+            self.assertIsNotNone(renamed)
+            assert renamed is not None
+            self.assertEqual(renamed.title, "Code notes")
+            self.assertTrue(store.delete(conversation.id))
+            self.assertEqual(store.list_conversations(), [])
+
+    def test_existing_conversation_file_compatibility_adds_title(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "old.json"
+            path.write_text(
+                '{"id":"old","created_at":"2026-08-02T00:00:00+00:00",'
+                '"updated_at":"2026-08-02T00:00:00+00:00","messages":['
+                '{"role":"system","content":"s"},{"role":"user","content":"First prompt here"}]}',
+                encoding="utf-8",
+            )
+            conversation = ConversationStore(Path(temp_dir)).load(path)
+            self.assertIsNotNone(conversation)
+            assert conversation is not None
+            self.assertEqual(conversation.title, "First prompt here")
+
+    def test_window_restores_latest_conversation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = ConversationStore(Path(temp_dir))
             conversation = store.create(SYSTEM_PROMPT)
             conversation.messages.append({"role": "user", "content": "Restore me"})
             store.save(conversation)
-            store_class.return_value = store
-
-            window = MainWindow()
+            with patch("main.ConversationStore", return_value=store), patch.object(MainWindow, "_refresh_models"):
+                window = MainWindow()
             self.assertEqual(window.messages[-1]["content"], "Restore me")
             self.assertEqual(window.status.text(), "Ready")
             self.assertTrue(window.send_button.isEnabled())
             window.close()
+
+    def test_empty_chat_branding_has_no_auto_assistant_message(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        labels = [label.text() for label in window.findChildren(QLabel)]
+        self.assertEqual(len(window.messages), 1)
+        self.assertEqual(window.messages[0]["role"], "system")
+        self.assertEqual(window.windowTitle(), "VioletAI")
+        self.assertIn("VioletAI", labels)
+        window.close()
+
+    def test_immediate_scroll_after_user_message(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        with patch.object(window, "_start_generation"):
+            for index in range(20):
+                window._add_message(f"old {index}", "user")
+            self.app.processEvents()
+            window.scroll_area.verticalScrollBar().setValue(0)
+            window.input_box.setPlainText("Scroll now")
+            window.send_message()
+            self.app.processEvents()
+            bar = window.scroll_area.verticalScrollBar()
+            self.assertEqual(bar.value(), bar.maximum())
+        window.close()
+
+    def test_auto_scroll_pauses_and_resumes_near_bottom(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.scroll_area.verticalScrollBar().setRange(0, 100)
+        window.scroll_area.verticalScrollBar().setValue(0)
+        window._handle_scroll_change(0)
+        self.assertFalse(window._auto_scroll_enabled)
+        window.scroll_area.verticalScrollBar().setValue(100)
+        window._handle_scroll_change(100)
+        self.assertTrue(window._auto_scroll_enabled)
+        window.close()
+
+    def test_auto_scroll_during_streaming_uses_bottom_when_enabled(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window._auto_scroll_enabled = True
+        window._receive_chunk("hello")
+        self.app.processEvents()
+        self.assertIsNotNone(window.pending_bubble)
+        window.close()
+
+    def test_sidebar_filters_conversations_live(self) -> None:
+        sidebar = ChatSidebar()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ConversationStore(Path(temp_dir))
+            conversation = store.create(SYSTEM_PROMPT)
+            conversation.messages.append({"role": "user", "content": "Find me"})
+            store.save(conversation)
+            sidebar.rebuild(store.grouped("find"), conversation.id)
+            self.assertGreater(sidebar.list_layout.count(), 1)
 
     @patch("ollama_client.requests.post")
     def test_ollama_worker_combines_streamed_chunks(self, post: Mock) -> None:
@@ -114,14 +221,12 @@ class ChatFoundationTests(unittest.TestCase):
             '{"message":{"content":" there"},"done":true}',
         ]
         post.return_value = response
-        worker = OllamaWorker([{"role": "user", "content": "Hi"}])
+        worker = OllamaWorker([{"role": "user", "content": "Hi"}], DEFAULT_MODEL_NAME)
         chunks: list[str] = []
         answers: list[str] = []
         worker.chunk_received.connect(chunks.append)
         worker.finished.connect(answers.append)
-
         worker.run()
-
         self.assertEqual(chunks, ["Hello", " there"])
         self.assertEqual(answers, ["Hello there"])
         response.close.assert_called_once()
@@ -132,18 +237,36 @@ class ChatFoundationTests(unittest.TestCase):
         response.status_code = 200
         response.iter_lines.return_value = ['{"message":{"content":"Hello"},"done":false}']
         post.return_value = response
-        worker = OllamaWorker([{"role": "user", "content": "Hi"}])
+        worker = OllamaWorker([{"role": "user", "content": "Hi"}], DEFAULT_MODEL_NAME)
         cancelled: list[bool] = []
         finished: list[str] = []
         worker.cancelled.connect(lambda: cancelled.append(True))
         worker.finished.connect(finished.append)
-
         worker.cancel()
         worker.run()
-
         self.assertEqual(cancelled, [True])
         self.assertEqual(finished, [])
         response.close.assert_called_once()
+
+    @patch("ollama_client.requests.get")
+    def test_model_discovery_reads_ollama_tags(self, get: Mock) -> None:
+        response = Mock()
+        response.json.return_value = {"models": [{"name": "a:1"}, {"name": "b:2"}]}
+        get.return_value = response
+        self.assertEqual(discover_models(), ["a:1", "b:2"])
+
+    def test_model_switching_and_disabled_visible_during_generation(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        window._set_model_selector([DEFAULT_MODEL_NAME, "other:1"])
+        window.model_selector.setCurrentText("other:1")
+        self.assertEqual(window.active_model, "other:1")
+        window._set_controls_generating(True)
+        self.assertTrue(window.model_selector.isVisible())
+        self.assertFalse(window.model_selector.isEnabled())
+        window._set_controls_generating(False)
+        self.assertTrue(window.model_selector.isEnabled())
+        window.close()
 
 
 if __name__ == "__main__":

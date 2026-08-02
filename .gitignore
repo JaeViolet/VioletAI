@@ -12,6 +12,10 @@ venv/
 logs/
 *.log
 
+# Local app data
+memory/conversations/
+memory/preferences.json
+
 # Ollama models
 ollama/models/
 models/
