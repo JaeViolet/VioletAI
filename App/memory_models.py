@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-CATEGORIES = ("profile", "preference", "project", "person", "fact", "temporary")
+CATEGORIES = ("User", "Preferences", "Projects", "People", "Facts", "Temporary")
 
 
 @dataclass(slots=True)

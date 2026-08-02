@@ -761,7 +761,9 @@ class MainWindow(QMainWindow):
         )
         if memory_result.handled:
             bubble = self._append_assistant_direct(memory_result.response)
-            if memory_result.remembered:
+            if memory_result.updated:
+                self._add_memory_confirmation(bubble, "Memory updated.")
+            elif memory_result.remembered:
                 self._add_memory_confirmation(bubble, "✓ Remembered")
             elif memory_result.removed:
                 self._add_memory_confirmation(bubble, "Memory removed.")

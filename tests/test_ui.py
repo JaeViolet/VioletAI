@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -21,9 +22,9 @@ from conversation_store import ConversationStore  # noqa: E402
 import design  # noqa: E402
 from design import Colors, PNG_CONTROL_ICON_SIZE, asset_icon_path, icon  # noqa: E402
 from main import MainWindow  # noqa: E402
-from memory_models import ParsedMemory  # noqa: E402
+from memory_models import CATEGORIES, ParsedMemory  # noqa: E402
 from memory_service import MemoryService  # noqa: E402
-from memory_store import MemoryStore, MemoryStoreError, normalize_key  # noqa: E402
+from memory_store import MemoryStore, MemoryStoreError, normalize_category, normalize_key  # noqa: E402
 from ollama_client import InvalidStreamError, OllamaWorker, discover_models, iter_message_chunks  # noqa: E402
 from prompts import build_ollama_messages, format_relevant_memories  # noqa: E402
 from sidebar import ChatSidebar  # noqa: E402
@@ -133,7 +134,7 @@ class ChatFoundationTests(unittest.TestCase):
             store = MemoryStore(Path(temp_dir) / "memory.db")
             self.assertEqual(store.schema_version(), 1)
             record = store.add_memory(
-                ParsedMemory("preference", "user", "favorite color", "紫", "favorite color is 紫"),
+                ParsedMemory("Preferences", "user", "favorite color", "紫", "favorite color is 紫"),
                 "conversation-1",
                 "1",
                 "Remember that my favorite color is 紫.",
@@ -141,6 +142,7 @@ class ChatFoundationTests(unittest.TestCase):
             self.assertTrue((Path(temp_dir) / "memory.db").exists())
             self.assertEqual(record.source_user_text, "Remember that my favorite color is 紫.")
             self.assertEqual(store.get(record.id).value, "紫")
+            self.assertEqual(store.get(record.id).category, "Preferences")
 
     def test_explicit_memory_creation_duplicate_and_conflict_superseding(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -168,8 +170,89 @@ class ChatFoundationTests(unittest.TestCase):
             all_records = service.store.list_memories(include_archived=True)
             self.assertEqual(len(active), 1)
             self.assertEqual(active[0].value, "blue")
+            self.assertEqual(active[0].category, "User")
             self.assertEqual(len(all_records), 2)
             self.assertTrue(any(not record.active for record in all_records))
+
+    def test_explicit_memory_update_phrases_supersede_existing_value(self) -> None:
+        phrases = [
+            "Update my favorite color to blue.",
+            "Change my favorite color to blue.",
+            "My favorite color is now blue.",
+            "In your memory it says my favorite color is purple; change it to blue.",
+            "Replace my saved favorite color with blue.",
+        ]
+        for phrase in phrases:
+            with self.subTest(phrase=phrase), tempfile.TemporaryDirectory() as temp_dir:
+                service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+                service.handle_explicit_intent("Remember that my favorite color is purple.", "c1", "1")
+                result = service.handle_explicit_intent(phrase, "c1", "2")
+                self.assertTrue(result.updated)
+                active = service.retrieve("favorite color", mark_accessed=False)
+                all_records = service.store.list_memories(include_archived=True)
+                self.assertEqual(len(active), 1)
+                self.assertEqual(active[0].value, "blue")
+                self.assertTrue(any(record.value == "purple" and not record.active for record in all_records))
+
+    def test_memory_update_non_command_ambiguous_and_unicode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+            service.handle_explicit_intent("Remember that my favorite color is purple.", "c1", "1")
+            self.assertFalse(service.handle_explicit_intent("Blue is a nice color.", "c1", "2").handled)
+            service.handle_explicit_intent("Remember that my favorite color backup is violet.", "c1", "3")
+            ambiguous = service.handle_explicit_intent("Change my favorite color to green.", "c1", "4")
+            self.assertTrue(ambiguous.clarification_needed)
+            self.assertIn("multiple", ambiguous.response.casefold())
+            service.store.archive(service.retrieve("favorite color backup", mark_accessed=False)[0].id)
+            unicode_update = service.handle_explicit_intent("Update my favorite color to blå.", "c1", "5")
+            self.assertTrue(unicode_update.updated)
+            self.assertEqual(service.retrieve("favorite color", mark_accessed=False)[0].value, "blå")
+
+    def test_profile_category_migrates_to_user_without_data_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "memory.db"
+            store = MemoryStore(path)
+            legacy = store.add_memory(
+                ParsedMemory("profile", "user", "birthday", "June 1", "birthday is June 1"),
+                "conversation-1",
+                "1",
+                "Remember that my birthday is June 1.",
+            )
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(
+                    "UPDATE memories SET category='profile', normalized_key=? WHERE id=?",
+                    ("profile:user:birthday", legacy.id),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            migrated = MemoryStore(path)
+            records = migrated.search(category="User")
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].category, "User")
+            self.assertEqual(records[0].value, "June 1")
+            self.assertEqual(normalize_category("profile"), "User")
+            self.assertEqual(normalize_key("profile", "user", "birthday"), "user:user:birthday")
+            self.assertEqual(MemoryService(migrated).retrieve("birthday", mark_accessed=False)[0].value, "June 1")
+
+    def test_memory_categories_use_title_case_and_filters_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = MemoryStore(Path(temp_dir) / "memory.db")
+            for category in CATEGORIES:
+                store.add_memory(
+                    ParsedMemory(category, "user", f"{category.casefold()} key", category, f"{category} memory"),
+                    "conversation-1",
+                    category,
+                    f"Remember {category}.",
+                )
+
+            self.assertEqual(CATEGORIES, ("User", "Preferences", "Projects", "People", "Facts", "Temporary"))
+            for category in CATEGORIES:
+                records = store.search(category=category)
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0].category, category)
 
     def test_no_memory_creation_without_explicit_user_intent_and_vancouver_scenario(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -184,11 +267,11 @@ class ChatFoundationTests(unittest.TestCase):
     def test_memory_retrieval_limits_category_archive_and_expiration(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"), max_retrieved=2)
-            service.remember(ParsedMemory("preference", "user", "favorite color", "purple", "favorite color is purple"), "c", "1", "Remember that my favorite color is purple.")
-            service.remember(ParsedMemory("profile", "user", "location", "Toronto", "I live in Toronto"), "c", "2", "Remember that I live in Toronto.")
-            expired = service.remember(ParsedMemory("temporary", "user", "snack", "tea", "snack is tea", expires_at="2000-01-01T00:00:00+00:00"), "c", "3", "Remember my snack is tea until tomorrow.")
+            service.remember(ParsedMemory("Preferences", "user", "favorite color", "purple", "favorite color is purple"), "c", "1", "Remember that my favorite color is purple.")
+            service.remember(ParsedMemory("User", "user", "location", "Toronto", "I live in Toronto"), "c", "2", "Remember that I live in Toronto.")
+            expired = service.remember(ParsedMemory("Temporary", "user", "snack", "tea", "snack is tea", expires_at="2000-01-01T00:00:00+00:00"), "c", "3", "Remember my snack is tea until tomorrow.")
             service.store.archive(expired.id)
-            color = service.retrieve("favorite color", category="preference")
+            color = service.retrieve("favorite color", category="Preferences")
             self.assertEqual(len(color), 1)
             self.assertEqual(color[0].value, "purple")
             self.assertLessEqual(len(service.retrieve("what do you remember about me")), 2)
@@ -492,6 +575,10 @@ class ChatFoundationTests(unittest.TestCase):
         window.memory_service.handle_explicit_intent("Remember that my favorite color is purple.", "c1", "1")
         window.open_settings_overlay()
         self.assertTrue(window.settings_overlay.isVisible())
+        self.assertEqual(
+            [window.settings_overlay.category_filter.itemText(index) for index in range(window.settings_overlay.category_filter.count())],
+            ["All", *CATEGORIES],
+        )
         window.settings_overlay.search_input.setText("favorite")
         self.app.processEvents()
         self.assertTrue(window.settings_overlay.store.search("favorite"))

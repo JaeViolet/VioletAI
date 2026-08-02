@@ -11,9 +11,22 @@ from pathlib import Path
 from typing import Iterator
 
 from config import MEMORY_DB_PATH
-from memory_models import MemoryRecord, ParsedMemory
+from memory_models import CATEGORIES, MemoryRecord, ParsedMemory
 
 SCHEMA_VERSION = 1
+CATEGORY_ALIASES = {
+    "profile": "User",
+    "user": "User",
+    "preference": "Preferences",
+    "preferences": "Preferences",
+    "project": "Projects",
+    "projects": "Projects",
+    "person": "People",
+    "people": "People",
+    "fact": "Facts",
+    "facts": "Facts",
+    "temporary": "Temporary",
+}
 
 
 def utc_now() -> str:
@@ -97,9 +110,23 @@ class MemoryStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_subject ON memories(subject, active)"
             )
+            self._migrate_category_names(connection)
             connection.execute(
                 "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', ?)",
                 (str(SCHEMA_VERSION),),
+            )
+
+    def _migrate_category_names(self, connection: sqlite3.Connection) -> None:
+        rows = connection.execute("SELECT id, category, subject, key FROM memories").fetchall()
+        for row in rows:
+            category = normalize_category(row["category"])
+            connection.execute(
+                """
+                UPDATE memories
+                SET category=?, normalized_key=?
+                WHERE id=?
+                """,
+                (category, normalize_key(category, row["subject"], row["key"]), row["id"]),
             )
 
     def _backup_before_migration(self) -> None:
@@ -139,7 +166,7 @@ class MemoryStore:
                 """,
                 (
                     record_id,
-                    parsed.category,
+                    normalize_category(parsed.category),
                     parsed.subject,
                     parsed.key,
                     parsed.value,
@@ -206,7 +233,7 @@ class MemoryStore:
             clauses.append("active=1")
         if category and category != "All":
             clauses.append("category=?")
-            params.append(category)
+            params.append(normalize_category(category))
         if query:
             like = f"%{query.casefold()}%"
             clauses.append(
@@ -265,16 +292,20 @@ class MemoryStore:
                     updated_at=?, manually_edited=1
                 WHERE id=?
                 """,
-                (category, subject, key, value, normalize_key(category, subject, key), content, now, memory_id),
+                (normalize_category(category), subject, key, value, normalize_key(category, subject, key), content, now, memory_id),
             )
         return self.get(memory_id)
+
+
+def normalize_category(category: str) -> str:
+    return CATEGORY_ALIASES.get(category.casefold().strip(), category if category in CATEGORIES else "Facts")
 
 
 def normalize_key(category: str, subject: str, key: str) -> str:
     def clean(value: str) -> str:
         return " ".join(value.casefold().replace("_", " ").split())
 
-    return f"{clean(category)}:{clean(subject)}:{clean(key)}"
+    return f"{clean(normalize_category(category))}:{clean(subject)}:{clean(key)}"
 
 
 def row_to_record(row: sqlite3.Row) -> MemoryRecord:

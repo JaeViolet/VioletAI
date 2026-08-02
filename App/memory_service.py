@@ -19,6 +19,15 @@ REMEMBER_PREFIXES = (
     "please remember",
 )
 FORGET_PREFIXES = ("forget that", "forget my", "forget everything you know about", "delete the memory about")
+UPDATE_PATTERNS = (
+    re.compile(r"^(?:update|change) my (?P<key>.+?) to (?P<value>.+)$", re.IGNORECASE),
+    re.compile(r"^my (?P<key>.+?) is now (?P<value>.+)$", re.IGNORECASE),
+    re.compile(r"^replace my saved (?P<key>.+?) with (?P<value>.+)$", re.IGNORECASE),
+    re.compile(
+        r"^in your memory it says my (?P<key>.+?) is (?P<old>.+?);?\s*change it to (?P<value>.+)$",
+        re.IGNORECASE,
+    ),
+)
 MEMORY_QUERY_PATTERNS = (
     "what do you remember about me",
     "what do you remember",
@@ -32,6 +41,7 @@ class MemoryActionResult:
     handled: bool
     response: str = ""
     remembered: bool = False
+    updated: bool = False
     removed: bool = False
     clarification_needed: bool = False
     memories: list[MemoryRecord] | None = None
@@ -75,6 +85,10 @@ class MemoryService:
                 memories=[memory],
             )
 
+        update_result = self.handle_update_intent(text, conversation_id, source_message_id)
+        if update_result.handled:
+            return update_result
+
         forget_query = self._strip_prefix(text, FORGET_PREFIXES)
         if forget_query is not None:
             matches = self.find_forget_matches(forget_query)
@@ -88,6 +102,46 @@ class MemoryService:
                 self.store.archive(memory.id)
             return MemoryActionResult(True, "Memory removed.", removed=True, memories=matches)
 
+        return MemoryActionResult(False)
+
+    def handle_update_intent(
+        self,
+        text: str,
+        conversation_id: str,
+        source_message_id: str | None,
+    ) -> MemoryActionResult:
+        cleaned = " ".join(text.strip().strip(".").split())
+        for pattern in UPDATE_PATTERNS:
+            match = pattern.match(cleaned)
+            if not match:
+                continue
+            key = match.group("key").strip()
+            value = match.group("value").strip()
+            if not key or not value:
+                return MemoryActionResult(True, "What memory should I update?", clarification_needed=True)
+            matches = self.find_update_matches(key)
+            if not matches:
+                return MemoryActionResult(True, f"I could not find a saved memory for {key}.")
+            if len(matches) > 1:
+                lines = ["I found multiple matching memories. Which one should I update?"]
+                lines.extend(f"- {memory.category} / {memory.key}: {memory.value}" for memory in matches[:5])
+                return MemoryActionResult(True, "\n".join(lines), clarification_needed=True, memories=matches)
+            existing = matches[0]
+            parsed = ParsedMemory(
+                category=existing.category,
+                subject=existing.subject,
+                key=existing.key,
+                value=value,
+                content=f"{existing.key} is {value}",
+            )
+            memory = self.remember(parsed, conversation_id, source_message_id, text)
+            return MemoryActionResult(
+                True,
+                f"Memory updated: {memory.key} is {memory.value}.",
+                remembered=True,
+                updated=True,
+                memories=[memory],
+            )
         return MemoryActionResult(False)
 
     def _strip_prefix(self, text: str, prefixes: tuple[str, ...]) -> str | None:
@@ -112,18 +166,18 @@ class MemoryService:
             expires_at = (datetime.now(UTC) + timedelta(days=1)).isoformat(timespec="seconds")
             cleaned = re.sub(r"\buntil tomorrow\b", "", cleaned, flags=re.IGNORECASE).strip()
 
-        category = "fact"
+        category = "Facts"
         subject = "user"
         key = "note"
         value = cleaned
 
         patterns = [
-            (r"^my (?P<key>.+?) is (?P<value>.+)$", "profile"),
-            (r"^i am (?P<value>.+)$", "profile"),
-            (r"^i live in (?P<value>.+)$", "profile"),
-            (r"^i like (?P<value>.+)$", "preference"),
-            (r"^i prefer (?P<value>.+)$", "preference"),
-            (r"^project (?P<key>.+?) is (?P<value>.+)$", "project"),
+            (r"^my (?P<key>.+?) is (?P<value>.+)$", "User"),
+            (r"^i am (?P<value>.+)$", "User"),
+            (r"^i live in (?P<value>.+)$", "User"),
+            (r"^i like (?P<value>.+)$", "Preferences"),
+            (r"^i prefer (?P<value>.+)$", "Preferences"),
+            (r"^project (?P<key>.+?) is (?P<value>.+)$", "Projects"),
         ]
         for pattern, detected_category in patterns:
             match = re.match(pattern, cleaned, flags=re.IGNORECASE)
@@ -133,7 +187,7 @@ class MemoryService:
             groups = match.groupdict()
             if "key" in groups and groups.get("key"):
                 key = groups["key"].strip()
-                if category == "project":
+                if category == "Projects":
                     subject = f"project {key}"
                     key = "description"
             else:
@@ -149,14 +203,14 @@ class MemoryService:
         if key == "note":
             possessive = re.match(r"^my (?P<key>.+?) (?P<value>.+)$", cleaned, flags=re.IGNORECASE)
             if possessive:
-                category = "profile"
+                category = "User"
                 key = possessive.group("key").strip()
                 value = possessive.group("value").strip()
 
         if not value:
             return None
         if expires_at:
-            category = "temporary"
+            category = "Temporary"
         return ParsedMemory(
             category=category,
             subject=subject,
@@ -241,6 +295,20 @@ class MemoryService:
         if cleaned.casefold().startswith("my "):
             cleaned = cleaned[3:]
         return self.retrieve(cleaned, limit=10, mark_accessed=False, include_all_if_query=not cleaned)
+
+    def find_update_matches(self, key: str) -> list[MemoryRecord]:
+        cleaned = key.strip()
+        if cleaned.casefold().startswith("my "):
+            cleaned = cleaned[3:]
+        direct_matches = [
+            memory
+            for memory in self.store.search(cleaned, include_archived=False)
+            if memory.key.casefold() == cleaned.casefold()
+            or cleaned.casefold() in memory.key.casefold()
+        ]
+        if direct_matches:
+            return direct_matches
+        return self.retrieve(cleaned, limit=10, mark_accessed=False)
 
     def _looks_specific(self, query: str) -> bool:
         return len(re.findall(r"\w+", query)) >= 3
