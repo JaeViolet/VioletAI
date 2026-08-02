@@ -35,11 +35,11 @@ from PySide6.QtWidgets import (
 
 from config import APP_FOOTER_TEXT, APP_NAME, DEFAULT_MODEL_NAME, SYSTEM_PROMPT
 from conversation_store import Conversation, ConversationStore
-from design import Motion, app_stylesheet, icon
+from design import Motion, PNG_CONTROL_ICON_SIZE, app_stylesheet, icon
 from ollama_client import ModelDiscoveryWorker, OllamaWorker
 from preferences import Preferences
 from sidebar import ChatSidebar, SearchOverlay
-from widgets import AutoGrowingInput, MessageActions, MessageBubble, ThinkingBubble
+from widgets import AutoGrowingInput, MessageActions, MessageBubble, ModelSelector, ThinkingBubble
 
 
 class MainWindow(QMainWindow):
@@ -139,19 +139,20 @@ class MainWindow(QMainWindow):
         self.scroll_area.viewport().installEventFilter(self)
         main_layout.addWidget(self.scroll_area, 1)
 
-        input_panel = QFrame(objectName="inputPanel")
-        input_outer = QHBoxLayout(input_panel)
+        self.input_panel = QFrame(objectName="inputPanel")
+        input_outer = QHBoxLayout(self.input_panel)
         input_outer.setContentsMargins(24, 8, 24, 14)
         input_outer.addStretch()
 
         self.composer = QFrame(objectName="composer")
         self.composer.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.composer.setFrameShape(QFrame.Shape.NoFrame)
-        self.composer.setMaximumWidth(self.CONTENT_MAX_WIDTH)
+        self.composer.setProperty("compact", True)
+        self.composer.setFixedWidth(self.CONTENT_MAX_WIDTH)
         self.composer_layout = QVBoxLayout(self.composer)
         self.composer_layout.setContentsMargins(12, 4, 6, 4)
         self.composer_layout.setSpacing(4)
-        self.composer_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinAndMaxSize)
+        self.composer_layout.setSizeConstraint(QLayout.SizeConstraint.SetDefaultConstraint)
 
         self.input_box = AutoGrowingInput()
         self.input_box.send_requested.connect(self.send_message)
@@ -169,32 +170,32 @@ class MainWindow(QMainWindow):
         self.toolbar_tools_button.setIconSize(QSize(18, 18))
         self.toolbar_tools_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.toolbar_tools_button.setMenu(self._build_tools_menu())
-        self.model_selector = QComboBox(objectName="modelSelector")
+        self.model_selector = ModelSelector(objectName="modelSelector")
         self._configure_model_selector(self.model_selector)
         self.model_selector.currentTextChanged.connect(self._model_changed)
-        self.toolbar_model_selector = QComboBox(objectName="modelSelector")
+        self.toolbar_model_selector = ModelSelector(objectName="modelSelector")
         self._configure_model_selector(self.toolbar_model_selector)
         self.toolbar_model_selector.currentTextChanged.connect(self._model_changed)
         self.send_button = QToolButton(objectName="sendButton")
         self.send_button.setToolTip("Send message")
-        self.send_button.setIcon(icon("send", "white", 21))
-        self.send_button.setIconSize(QSize(21, 21))
+        self.send_button.setIcon(icon("send", "white", PNG_CONTROL_ICON_SIZE))
+        self.send_button.setIconSize(QSize(PNG_CONTROL_ICON_SIZE, PNG_CONTROL_ICON_SIZE))
         self.send_button.clicked.connect(self.send_message)
         self.toolbar_send_button = QToolButton(objectName="sendButton")
         self.toolbar_send_button.setToolTip("Send message")
-        self.toolbar_send_button.setIcon(icon("send", "white", 21))
-        self.toolbar_send_button.setIconSize(QSize(21, 21))
+        self.toolbar_send_button.setIcon(icon("send", "white", PNG_CONTROL_ICON_SIZE))
+        self.toolbar_send_button.setIconSize(QSize(PNG_CONTROL_ICON_SIZE, PNG_CONTROL_ICON_SIZE))
         self.toolbar_send_button.clicked.connect(self.send_message)
         self.stop_button = QToolButton(objectName="sendButton")
         self.stop_button.setToolTip("Stop generating")
-        self.stop_button.setIcon(icon("stop", "white", 21))
-        self.stop_button.setIconSize(QSize(21, 21))
+        self.stop_button.setIcon(icon("stop", "white", PNG_CONTROL_ICON_SIZE))
+        self.stop_button.setIconSize(QSize(PNG_CONTROL_ICON_SIZE, PNG_CONTROL_ICON_SIZE))
         self.stop_button.clicked.connect(self.stop_generation)
         self.stop_button.hide()
         self.toolbar_stop_button = QToolButton(objectName="sendButton")
         self.toolbar_stop_button.setToolTip("Stop generating")
-        self.toolbar_stop_button.setIcon(icon("stop", "white", 21))
-        self.toolbar_stop_button.setIconSize(QSize(21, 21))
+        self.toolbar_stop_button.setIcon(icon("stop", "white", PNG_CONTROL_ICON_SIZE))
+        self.toolbar_stop_button.setIconSize(QSize(PNG_CONTROL_ICON_SIZE, PNG_CONTROL_ICON_SIZE))
         self.toolbar_stop_button.clicked.connect(self.stop_generation)
         self.toolbar_stop_button.hide()
 
@@ -230,7 +231,7 @@ class MainWindow(QMainWindow):
         panel_layout = QVBoxLayout()
         panel_layout.setContentsMargins(0, 0, 0, 0)
         panel_layout.setSpacing(5)
-        panel_layout.addWidget(input_panel)
+        panel_layout.addWidget(self.input_panel)
         panel_layout.addWidget(self.footer_status)
         main_layout.addLayout(panel_layout)
         main_layout.addSpacing(10)
@@ -269,6 +270,11 @@ class MainWindow(QMainWindow):
         self._updating_composer_mode = True
         self._composer_multiline = multiline
         try:
+            is_compact = not multiline
+            if self.composer.property("compact") != is_compact:
+                self.composer.setProperty("compact", is_compact)
+                self.composer.style().unpolish(self.composer)
+                self.composer.style().polish(self.composer)
             if multiline:
                 self.composer_layout.setContentsMargins(14, 10, 8, 8)
                 self.tools_button.hide()
@@ -327,6 +333,18 @@ class MainWindow(QMainWindow):
                 self._set_visible_if_needed(self.toolbar_stop_button, False)
 
     def _make_welcome(self) -> QWidget:
+        row = QWidget()
+        row.setProperty("messageRow", True)
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(0)
+
+        content = QWidget(objectName="welcomeContentColumn")
+        content.setProperty("welcomeContentColumn", True)
+        content_layout = QHBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+
         welcome = QWidget(objectName="welcome")
         layout = QVBoxLayout(welcome)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -337,7 +355,12 @@ class MainWindow(QMainWindow):
         for label in (icon, title, subtitle):
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(label)
-        return welcome
+        content_layout.addWidget(welcome)
+        row.setProperty("contentColumn", content)
+        row_layout.addStretch(1)
+        row_layout.addWidget(content)
+        row_layout.addStretch(1)
+        return row
 
     def _clear_message_rows(self) -> None:
         while self.message_layout.count() > 1:
@@ -419,7 +442,10 @@ class MainWindow(QMainWindow):
     def _resize_rows(self) -> None:
         viewport_width = self.scroll_area.viewport().width()
         available = max(280, min(self.CONTENT_MAX_WIDTH, viewport_width - 96))
-        self.composer.setMaximumWidth(available)
+        if self.composer.width() != available:
+            self.composer.setFixedWidth(available)
+        if hasattr(self, "input_panel") and self.input_panel.layout() is not None:
+            self.input_panel.layout().activate()
         if hasattr(self, "input_box"):
             self.input_box._update_height()
         self._update_composer_mode()
@@ -449,6 +475,8 @@ class MainWindow(QMainWindow):
                         bubble.setMaximumWidth(max_width)
                     bubble.updateGeometry()
                     self._settle_message_row(row, bubble)
+                else:
+                    self._settle_content_row(row, content if isinstance(content, QWidget) else None)
         self.message_layout.activate()
         self.message_container.setMinimumHeight(self.message_layout.sizeHint().height())
         self.message_container.updateGeometry()
@@ -462,6 +490,17 @@ class MainWindow(QMainWindow):
             column.setMinimumHeight(column.sizeHint().height())
             column.updateGeometry()
         if isinstance(content, QWidget):
+            if content.layout() is not None:
+                content.layout().activate()
+            content.setMinimumHeight(content.sizeHint().height())
+            content.updateGeometry()
+        if row.layout() is not None:
+            row.layout().activate()
+        row.setMinimumHeight(row.sizeHint().height())
+        row.updateGeometry()
+
+    def _settle_content_row(self, row: QWidget, content: QWidget | None) -> None:
+        if content is not None:
             if content.layout() is not None:
                 content.layout().activate()
             content.setMinimumHeight(content.sizeHint().height())

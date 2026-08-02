@@ -18,11 +18,12 @@ from PySide6.QtWidgets import QApplication, QFrame, QLabel, QMessageBox, QToolBu
 
 from config import DEFAULT_MODEL_NAME, SYSTEM_PROMPT  # noqa: E402
 from conversation_store import ConversationStore  # noqa: E402
-from design import icon  # noqa: E402
+import design  # noqa: E402
+from design import Colors, PNG_CONTROL_ICON_SIZE, asset_icon_path, icon  # noqa: E402
 from main import MainWindow  # noqa: E402
 from ollama_client import InvalidStreamError, OllamaWorker, discover_models, iter_message_chunks  # noqa: E402
 from sidebar import ChatSidebar  # noqa: E402
-from widgets import AutoGrowingInput, CodeBlock, MarkdownView, MessageBubble  # noqa: E402
+from widgets import AutoGrowingInput, CodeBlock, MarkdownView, MessageActions, MessageBubble  # noqa: E402
 
 
 class ChatFoundationTests(unittest.TestCase):
@@ -377,6 +378,8 @@ class ChatFoundationTests(unittest.TestCase):
         window.show()
         self.assertEqual(window.send_button.minimumWidth(), 38)
         self.assertEqual(window.send_button.minimumHeight(), 38)
+        self.assertEqual(window.send_button.iconSize().width(), PNG_CONTROL_ICON_SIZE)
+        self.assertEqual(window.stop_button.iconSize().width(), PNG_CONTROL_ICON_SIZE)
         self.assertEqual(window.stop_button.minimumWidth(), window.send_button.minimumWidth())
         self.assertEqual(window.stop_button.minimumHeight(), window.send_button.minimumHeight())
         self.assertEqual(window.toolbar_send_button.minimumWidth(), window.send_button.minimumWidth())
@@ -410,21 +413,117 @@ class ChatFoundationTests(unittest.TestCase):
         window.show()
         self.assertTrue(window.composer.testAttribute(Qt.WidgetAttribute.WA_StyledBackground))
         self.assertEqual(window.composer.frameShape(), QFrame.Shape.NoFrame)
-        self.assertIn("border-radius: 28px", window.styleSheet())
+        self.assertTrue(window.composer.property("compact"))
+        self.assertIn('border-radius: 25px', window.styleSheet())
         window.input_box.setPlainText("one\ntwo\nthree\nfour")
         self.app.processEvents()
         window._update_composer_mode()
+        self.assertFalse(window.composer.property("compact"))
         self.assertTrue(window.composer.testAttribute(Qt.WidgetAttribute.WA_StyledBackground))
         self.assertIn("border-radius: 28px", window.styleSheet())
+        window.input_box.setPlainText("one")
+        self.app.processEvents()
+        window._update_composer_mode()
+        self.assertTrue(window.composer.property("compact"))
         window.close()
 
-    def test_vector_icons_render_at_multiple_sizes(self) -> None:
+    def test_png_icon_assets_resolve_and_render_at_multiple_sizes(self) -> None:
         for name in ("copy", "regen", "send", "stop"):
+            self.assertTrue(asset_icon_path(name).exists())
             for size in (16, 18, 21, 28):
                 rendered = icon(name, "white", size)
                 self.assertFalse(rendered.isNull())
                 pixmap = rendered.pixmap(size, size)
                 self.assertFalse(pixmap.isNull(), f"{name} at {size}px did not render")
+
+    def test_missing_png_icon_asset_fails_gracefully(self) -> None:
+        with patch.object(design, "ICON_ASSETS_DIR", Path("missing-assets")):
+            missing_icon = design.icon("send", "white", 21)
+        self.assertTrue(missing_icon.isNull())
+
+    def test_message_action_icons_use_png_assets(self) -> None:
+        actions = MessageActions()
+        self.assertFalse(actions.copy_button.icon().isNull())
+        self.assertFalse(actions.regenerate_button.icon().isNull())
+        self.assertEqual(actions.copy_button.iconSize().width(), PNG_CONTROL_ICON_SIZE)
+        self.assertEqual(actions.regenerate_button.iconSize().width(), PNG_CONTROL_ICON_SIZE)
+
+    def test_model_selector_chevron_visible_in_compact_expanded_and_disabled(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        self.assertEqual(window.model_selector.arrow_color(), Colors.TEXT_MUTED)
+        window.input_box.setPlainText("line one\nline two\nline three")
+        self.app.processEvents()
+        window._update_composer_mode()
+        self.assertEqual(window.toolbar_model_selector.arrow_color(), Colors.TEXT_MUTED)
+        window._set_controls_generating(True)
+        self.assertEqual(window.toolbar_model_selector.arrow_color(), Colors.TEXT_FAINT)
+        window._set_controls_generating(False)
+        window.input_box.setPlainText("one")
+        self.app.processEvents()
+        window._update_composer_mode()
+        window._set_controls_generating(True)
+        self.assertEqual(window.model_selector.arrow_color(), Colors.TEXT_FAINT)
+        window.close()
+
+    def test_composer_width_only_changes_on_window_resize(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.resize(1180, 820)
+        window.show()
+        self.app.processEvents()
+        window._resize_rows()
+        initial_width = window.composer.width()
+        window.input_box.setPlainText("short single line")
+        self.app.processEvents()
+        window._update_composer_mode()
+        self.assertEqual(window.composer.width(), initial_width)
+        window.input_box.setPlainText("one\ntwo\nthree\nfour")
+        self.app.processEvents()
+        window._update_composer_mode()
+        self.assertEqual(window.composer.width(), initial_width)
+        window.input_box.setPlainText("short")
+        self.app.processEvents()
+        window._update_composer_mode()
+        self.assertEqual(window.composer.width(), initial_width)
+        window._set_controls_generating(True)
+        self.assertEqual(window.composer.width(), initial_width)
+        window._set_controls_generating(False)
+        self.assertEqual(window.composer.width(), initial_width)
+        window.resize(900, 700)
+        self.app.processEvents()
+        window._resize_rows()
+        self.assertNotEqual(window.composer.width(), initial_width)
+        window.close()
+
+    def test_welcome_content_centers_to_composer_column_after_sidebar_and_resize(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.resize(1180, 820)
+        window.show()
+        self.app.processEvents()
+        window._resize_rows()
+
+        def centers() -> tuple[int, int]:
+            welcome_column = window.findChild(QWidget, "welcomeContentColumn")
+            self.assertIsNotNone(welcome_column)
+            assert welcome_column is not None
+            composer_center = window.composer.mapTo(window, window.composer.rect().center()).x()
+            welcome_center = welcome_column.mapTo(window, welcome_column.rect().center()).x()
+            return composer_center, welcome_center
+
+        composer_center, welcome_center = centers()
+        self.assertAlmostEqual(composer_center, welcome_center, delta=2)
+        window.sidebar.set_expanded(False)
+        self.app.processEvents()
+        window._resize_rows()
+        composer_center, welcome_center = centers()
+        self.assertAlmostEqual(composer_center, welcome_center, delta=2)
+        window.sidebar.set_expanded(True)
+        window.resize(960, 720)
+        self.app.processEvents()
+        window._resize_rows()
+        composer_center, welcome_center = centers()
+        self.assertAlmostEqual(composer_center, welcome_center, delta=2)
+        window.close()
 
     def test_code_blocks_have_no_internal_scrollbars_and_contribute_height(self) -> None:
         code = "def demo():\n" + "\n".join("    print('hello world')" for _ in range(30))

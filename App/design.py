@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 
@@ -48,9 +50,42 @@ class Motion:
 
 
 ICON_SIZE = 18
+PNG_CONTROL_ICON_SIZE = 21
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ICON_ASSETS_DIR = PROJECT_ROOT / "assets" / "icons"
+PNG_ICON_NAMES = {
+    "copy": "copy.png",
+    "regen": "regenerate.png",
+    "regenerate": "regenerate.png",
+    "send": "send.png",
+    "stop": "stop.png",
+}
+
+
+def asset_icon_path(name: str) -> Path:
+    return ICON_ASSETS_DIR / PNG_ICON_NAMES[name]
+
+
+def png_icon(name: str, size: int = ICON_SIZE) -> QIcon:
+    asset_name = PNG_ICON_NAMES.get(name)
+    if asset_name is None:
+        return QIcon()
+    pixmap = QPixmap(str(ICON_ASSETS_DIR / asset_name))
+    if pixmap.isNull():
+        return QIcon()
+    scaled = pixmap.scaled(
+        size,
+        size,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    return QIcon(scaled)
 
 
 def icon(name: str, color: str = Colors.TEXT, size: int = ICON_SIZE) -> QIcon:
+    if name in PNG_ICON_NAMES:
+        return png_icon(name, size)
+
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
@@ -215,6 +250,9 @@ def app_stylesheet() -> str:
             background: {Colors.COMPOSER}; border: 1px solid {Colors.BORDER_STRONG};
             border-radius: 28px;
         }}
+        #composer[compact="true"] {{
+            border-radius: 25px;
+        }}
         #composerToolbar {{ background: transparent; border: none; }}
         #messageInput {{
             background: transparent; color: {Colors.TEXT}; border: none;
@@ -234,9 +272,6 @@ def app_stylesheet() -> str:
         }}
         #modelSelector::drop-down {{
             width: 16px; border: none;
-        }}
-        #modelSelector::down-arrow {{
-            width: 7px; height: 7px;
         }}
         #modelSelector QAbstractItemView {{
             background: {Colors.COMPOSER}; color: {Colors.TEXT};

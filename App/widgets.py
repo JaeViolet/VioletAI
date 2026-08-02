@@ -10,12 +10,15 @@ from PySide6.QtGui import (
     QFont,
     QFontDatabase,
     QFontMetrics,
+    QPainter,
+    QPen,
     QKeyEvent,
     QSyntaxHighlighter,
     QTextCharFormat,
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -28,7 +31,28 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from design import icon
+from design import Colors, PNG_CONTROL_ICON_SIZE, icon
+
+
+class ModelSelector(QComboBox):
+    """QComboBox with a reliable chevron that survives native stylesheet quirks."""
+
+    def arrow_color(self) -> str:
+        return Colors.TEXT_FAINT if not self.isEnabled() else Colors.TEXT_MUTED
+
+    def paintEvent(self, event: QEvent) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor(self.arrow_color()), 1.4)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        x = self.width() - 17
+        y = self.height() / 2 - 1
+        painter.drawLine(x - 3, y, x, y + 3)
+        painter.drawLine(x, y + 3, x + 3, y)
+        painter.end()
 
 
 class AutoGrowingInput(QTextEdit):
@@ -291,7 +315,8 @@ class CodeBlock(QFrame):
         copy_button = QToolButton()
         copy_button.setObjectName("copyButton")
         copy_button.setToolTip("Copy code")
-        copy_button.setIcon(icon("copy"))
+        copy_button.setIcon(icon("copy", size=PNG_CONTROL_ICON_SIZE))
+        copy_button.setIconSize(QSize(PNG_CONTROL_ICON_SIZE, PNG_CONTROL_ICON_SIZE))
         copy_button.clicked.connect(self._copy)
         header_layout.addWidget(language_label)
         header_layout.addStretch()
@@ -467,14 +492,16 @@ class MessageActions(QFrame):
         self.copy_button = QToolButton()
         self.copy_button.setObjectName("actionButton")
         self.copy_button.setToolTip("Copy response")
-        self.copy_button.setIcon(icon("copy"))
+        self.copy_button.setIcon(icon("copy", size=PNG_CONTROL_ICON_SIZE))
+        self.copy_button.setIconSize(QSize(PNG_CONTROL_ICON_SIZE, PNG_CONTROL_ICON_SIZE))
         self.copy_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.copy_button.clicked.connect(self._copy_clicked)
 
         self.regenerate_button = QToolButton()
         self.regenerate_button.setObjectName("actionButton")
         self.regenerate_button.setToolTip("Regenerate response")
-        self.regenerate_button.setIcon(icon("regen"))
+        self.regenerate_button.setIcon(icon("regen", size=PNG_CONTROL_ICON_SIZE))
+        self.regenerate_button.setIconSize(QSize(PNG_CONTROL_ICON_SIZE, PNG_CONTROL_ICON_SIZE))
         self.regenerate_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.regenerate_button.clicked.connect(self.regenerate_requested.emit)
         self.copied_label = QLabel("")
