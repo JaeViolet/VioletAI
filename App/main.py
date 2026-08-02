@@ -39,7 +39,14 @@ from design import Motion, PNG_CONTROL_ICON_SIZE, app_stylesheet, icon
 from ollama_client import ModelDiscoveryWorker, OllamaWorker
 from preferences import Preferences
 from sidebar import ChatSidebar, SearchOverlay
-from widgets import AutoGrowingInput, MessageActions, MessageBubble, ModelSelector, ThinkingBubble
+from widgets import (
+    AutoGrowingInput,
+    MessageActions,
+    MessageBubble,
+    ModelSelector,
+    ThinkingBubble,
+    apply_interaction_cursors,
+)
 
 
 class MainWindow(QMainWindow):
@@ -89,6 +96,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(760, 520)
         self._build_interface()
         self._apply_style()
+        apply_interaction_cursors(self)
         self._rebuild_sidebar()
         self._rebuild_messages()
         self._refresh_models()
@@ -550,6 +558,7 @@ class MainWindow(QMainWindow):
         row_layout.addWidget(content)
         row_layout.addStretch(1)
         self.message_layout.insertWidget(self.message_layout.count() - 1, row)
+        apply_interaction_cursors(row)
         self._animate_appearance(row)
         self._resize_rows()
         return bubble
@@ -585,6 +594,7 @@ class MainWindow(QMainWindow):
         actions.copy_requested.connect(lambda: QApplication.clipboard().setText(bubble.text()))
         actions.regenerate_requested.connect(lambda: self.regenerate_response(message_index))
         layout.addWidget(actions)
+        apply_interaction_cursors(actions)
 
     def _show_thinking(self) -> None:
         self._remove_thinking()

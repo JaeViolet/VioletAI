@@ -17,12 +17,15 @@ from PySide6.QtGui import (
     QTextCharFormat,
 )
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QApplication,
     QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPlainTextEdit,
+    QScrollBar,
     QSizePolicy,
     QTextBrowser,
     QTextEdit,
@@ -32,6 +35,18 @@ from PySide6.QtWidgets import (
 )
 
 from design import Colors, PNG_CONTROL_ICON_SIZE, icon
+
+
+def apply_interaction_cursors(root: QWidget) -> None:
+    for widget_type in (QAbstractButton, QComboBox, QScrollBar):
+        for widget in root.findChildren(widget_type):
+            widget.setCursor(Qt.CursorShape.PointingHandCursor)
+    for widget_type in (QLineEdit, QTextEdit, QPlainTextEdit, QTextBrowser):
+        for widget in root.findChildren(widget_type):
+            if hasattr(widget, "viewport"):
+                widget.viewport().setCursor(Qt.CursorShape.IBeamCursor)
+            else:
+                widget.setCursor(Qt.CursorShape.IBeamCursor)
 
 
 class ModelSelector(QComboBox):

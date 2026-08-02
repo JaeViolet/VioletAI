@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 from config import APP_NAME
 from conversation_store import Conversation
 from design import Motion, icon
+from widgets import apply_interaction_cursors
 
 
 class ConversationRow(QFrame):
@@ -181,6 +182,7 @@ class SearchOverlay(QFrame):
             button.setIcon(icon("expand"))
             button.clicked.connect(lambda _checked=False, cid=conversation.id: self.selected.emit(cid))
             self.results_layout.insertWidget(self.results_layout.count() - 1, button)
+        apply_interaction_cursors(self)
 
 
 class ChatSidebar(QFrame):
@@ -270,6 +272,7 @@ class ChatSidebar(QFrame):
         collapsed_layout.addStretch(1)
         self.root_layout.addWidget(self.collapsed_container, 1)
         self.collapsed_container.hide()
+        apply_interaction_cursors(self)
 
     def toggle(self) -> None:
         self.set_expanded(not self._expanded)
@@ -334,3 +337,4 @@ class ChatSidebar(QFrame):
                 row.delete_requested.connect(self.delete_requested.emit)
                 self.list_layout.insertWidget(self.list_layout.count() - 1, row)
         self._sync_list_width()
+        apply_interaction_cursors(self)
