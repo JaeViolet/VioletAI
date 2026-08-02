@@ -30,7 +30,7 @@ CATEGORY_ALIASES = {
 
 
 def utc_now() -> str:
-    return datetime.now(UTC).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="microseconds")
 
 
 class MemoryStoreError(RuntimeError):

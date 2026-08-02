@@ -22,15 +22,17 @@ from PySide6.QtWidgets import (
 from design import Colors, icon
 from memory_models import CATEGORIES, MemoryRecord
 from memory_store import MemoryStore
+from preferences import MEMORY_MODES, Preferences
 from widgets import apply_interaction_cursors
 
 
 class SettingsOverlay(QFrame):
     closed = Signal()
 
-    def __init__(self, store: MemoryStore, parent: QWidget | None = None) -> None:
+    def __init__(self, store: MemoryStore, preferences: Preferences | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.store = store
+        self.preferences = preferences
         self.setObjectName("searchOverlay")
         self.setWindowFlags(Qt.WindowType.Widget)
         self.setMaximumSize(860, 580)
@@ -102,12 +104,22 @@ class SettingsOverlay(QFrame):
         self.include_archived = QComboBox()
         self.include_archived.setObjectName("modelSelector")
         self.include_archived.addItems(["Active", "All"])
+        self.sort_order = QComboBox()
+        self.sort_order.setObjectName("modelSelector")
+        self.sort_order.addItems(["Updated", "Created", "Category", "Accessed"])
+        self.memory_mode = QComboBox()
+        self.memory_mode.setObjectName("modelSelector")
+        self.memory_mode.addItems(MEMORY_MODES)
+        if self.preferences is not None:
+            self.memory_mode.setCurrentText(self.preferences.memory_mode)
         clear = QPushButton("Clear all")
         clear.setObjectName("sidebarNewChat")
         clear.clicked.connect(self.clear_all)
         controls.addWidget(self.search_input, 1)
         controls.addWidget(self.category_filter)
         controls.addWidget(self.include_archived)
+        controls.addWidget(self.sort_order)
+        controls.addWidget(self.memory_mode)
         controls.addWidget(clear)
         self.content_layout.addLayout(controls)
 
@@ -121,6 +133,8 @@ class SettingsOverlay(QFrame):
         self.search_input.textChanged.connect(self.refresh)
         self.category_filter.currentTextChanged.connect(self.refresh)
         self.include_archived.currentTextChanged.connect(self.refresh)
+        self.sort_order.currentTextChanged.connect(self.refresh)
+        self.memory_mode.currentTextChanged.connect(self._save_memory_mode)
         self.refresh()
         apply_interaction_cursors(self)
 
@@ -152,6 +166,7 @@ class SettingsOverlay(QFrame):
             self.category_filter.currentText(),
             include_archived=self.include_archived.currentText() == "All",
         )
+        records = self._sort_records(records)
         for record in records:
             self.rows_layout.insertWidget(self.rows_layout.count() - 1, MemoryRow(record, self.store, self.refresh))
         if not records:
@@ -159,6 +174,22 @@ class SettingsOverlay(QFrame):
             empty.setObjectName("welcomeSubtitle")
             self.rows_layout.insertWidget(0, empty)
         apply_interaction_cursors(self)
+
+    def _sort_records(self, records: list[MemoryRecord]) -> list[MemoryRecord]:
+        order = self.sort_order.currentText()
+        if order == "Created":
+            return sorted(records, key=lambda record: record.created_at, reverse=True)
+        if order == "Category":
+            return sorted(records, key=lambda record: (record.category, record.subject, record.key))
+        if order == "Accessed":
+            return sorted(records, key=lambda record: (record.last_accessed_at or "", record.access_count), reverse=True)
+        return sorted(records, key=lambda record: record.updated_at, reverse=True)
+
+    def _save_memory_mode(self, mode: str) -> None:
+        if self.preferences is None or mode not in MEMORY_MODES:
+            return
+        self.preferences.memory_mode = mode
+        self.preferences.save()
 
     def clear_all(self) -> None:
         if QMessageBox.question(self, "Clear memories", "Permanently delete all memories?") == QMessageBox.StandardButton.Yes:

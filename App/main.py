@@ -254,7 +254,7 @@ class MainWindow(QMainWindow):
         self.search_overlay = SearchOverlay(self.chat_panel)
         self.search_overlay.selected.connect(self._select_from_search)
         self.search_overlay.search_changed.connect(self._rebuild_search_results)
-        self.settings_overlay = SettingsOverlay(self.memory_store, self.chat_panel)
+        self.settings_overlay = SettingsOverlay(self.memory_store, self.preferences, self.chat_panel)
 
     def _configure_model_selector(self, selector: QComboBox) -> None:
         selector.setToolTip("Select local Ollama model")
@@ -763,6 +763,7 @@ class MainWindow(QMainWindow):
             self.conversation.id,
             source_message_id,
             previous_user_text,
+            self.preferences.memory_mode,
         )
         if memory_result.handled:
             bubble = self._append_assistant_direct(memory_result.response)
@@ -772,6 +773,19 @@ class MainWindow(QMainWindow):
                 self._add_memory_confirmation(bubble, "✓ Remembered")
             elif memory_result.removed:
                 self._add_memory_confirmation(bubble, "Memory removed.")
+            self.settings_overlay.refresh()
+            self._scroll_to_bottom()
+            return
+        automatic_memory = self.memory_service.maybe_capture_automatic_memory(
+            message,
+            self.conversation.id,
+            source_message_id,
+            self.preferences.memory_mode,
+        )
+        if automatic_memory.handled:
+            bubble = self._append_assistant_direct(automatic_memory.response)
+            if automatic_memory.remembered:
+                self._add_memory_confirmation(bubble, "✓ Remembered")
             self.settings_overlay.refresh()
             self._scroll_to_bottom()
             return
@@ -822,7 +836,11 @@ class MainWindow(QMainWindow):
             (message.get("content", "") for message in reversed(self.messages) if message.get("role") == "user"),
             "",
         )
-        relevant_memories = self.memory_service.retrieve(last_user_message)
+        relevant_memories = (
+            []
+            if self.preferences.memory_mode == "Off"
+            else self.memory_service.retrieve(last_user_message)
+        )
         ollama_messages = build_ollama_messages(self.messages, relevant_memories, SYSTEM_PROMPT)
         self.worker = OllamaWorker(ollama_messages, self.active_model)
         self.worker.moveToThread(self.thread)

@@ -6,6 +6,8 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from memory_embeddings import canonical_key, embed_text, cosine_similarity
+from memory_intent import CREATE, DELETE, IGNORE, RETRIEVE, UPDATE, MemoryIntentClassifier
 from memory_models import MemoryRecord, ParsedMemory
 from memory_store import MemoryStore, normalize_key
 
@@ -16,6 +18,7 @@ WRITE_FAILED = "WRITE_FAILED"
 INVALID_MEMORY_REQUEST = "INVALID_MEMORY_REQUEST"
 
 REMEMBER_PREFIXES = (
+    "remember",
     "remember that",
     "remember this",
     "don't forget that",
@@ -70,6 +73,7 @@ CONTEXTUAL_FORGET_COMMANDS = (
 UPDATE_PATTERNS = (
     re.compile(r"^(?:update|change|edit) my (?P<key>.+?) to (?P<value>.+)$", re.IGNORECASE),
     re.compile(r"^my (?P<key>.+?) is now (?P<value>.+)$", re.IGNORECASE),
+    re.compile(r"^my (?P<key>.+?) is (?P<value>.+?) now$", re.IGNORECASE),
     re.compile(r"^(?:replace|edit) my saved (?P<key>.+?) with (?P<value>.+)$", re.IGNORECASE),
     re.compile(r"^replace my (?P<key>.+?) with (?P<value>.+)$", re.IGNORECASE),
     re.compile(
@@ -98,9 +102,27 @@ class MemoryActionResult:
 
 
 class MemoryService:
-    def __init__(self, store: MemoryStore, max_retrieved: int = 6) -> None:
+    def __init__(
+        self,
+        store: MemoryStore,
+        max_retrieved: int = 6,
+        classifier: MemoryIntentClassifier | None = None,
+    ) -> None:
         self.store = store
         self.max_retrieved = max_retrieved
+        self.classifier = classifier or MemoryIntentClassifier()
+        self.migrate_duplicates()
+
+    def migrate_duplicates(self) -> None:
+        groups: dict[tuple[str, str, str], list[MemoryRecord]] = {}
+        for record in self.store.list_memories():
+            groups.setdefault((record.category, record.subject, canonical_key(record.key)), []).append(record)
+        for records in groups.values():
+            if len(records) <= 1:
+                continue
+            records.sort(key=lambda record: record.updated_at, reverse=True)
+            for duplicate in records[1:]:
+                self.store.archive(duplicate.id)
 
     def handle_explicit_intent(
         self,
@@ -108,9 +130,15 @@ class MemoryService:
         conversation_id: str,
         source_message_id: str | None,
         previous_user_text: str | None = None,
+        memory_mode: str = "Explicit",
     ) -> MemoryActionResult:
+        if memory_mode == "Off":
+            return MemoryActionResult(False)
+        intent = self.classifier.classify(text, previous_user_text)
+        if intent.action == IGNORE:
+            return MemoryActionResult(False)
         lowered = text.casefold().strip()
-        if any(pattern in lowered for pattern in MEMORY_QUERY_PATTERNS):
+        if intent.action == RETRIEVE or any(pattern in lowered for pattern in MEMORY_QUERY_PATTERNS):
             memories = self.retrieve(text, mark_accessed=False, include_all_if_query=True)
             if not memories:
                 return MemoryActionResult(True, "I do not have any saved memories yet.", memories=[])
@@ -120,6 +148,8 @@ class MemoryService:
             return MemoryActionResult(True, "\n".join(lines), memories=memories)
 
         remember_body = self._strip_prefix(text, REMEMBER_PREFIXES)
+        if remember_body is None and intent.action == CREATE:
+            remember_body = text
         if remember_body is not None:
             if self._is_contextual_command(text, CONTEXTUAL_REMEMBER_COMMANDS):
                 if not self._suitable_reference(previous_user_text):
@@ -158,7 +188,10 @@ class MemoryService:
             return update_result
 
         forget_query = self._strip_prefix(text, FORGET_PREFIXES)
+        if forget_query is None and intent.action == DELETE:
+            forget_query = text
         if forget_query is not None:
+            forget_query = re.sub(r"\b(from|in)\s+(long[- ]term\s+)?memory\b", "", forget_query, flags=re.IGNORECASE).strip(" .")
             if self._is_contextual_command(text, CONTEXTUAL_FORGET_COMMANDS):
                 if not self._suitable_reference(previous_user_text):
                     return MemoryActionResult(
@@ -198,6 +231,45 @@ class MemoryService:
             return MemoryActionResult(True, "Memory removed.", removed=True, memories=matches)
 
         return MemoryActionResult(False)
+
+    def maybe_capture_automatic_memory(
+        self,
+        text: str,
+        conversation_id: str,
+        source_message_id: str | None,
+        memory_mode: str,
+    ) -> MemoryActionResult:
+        if memory_mode not in {"Suggest", "Automatic"}:
+            return MemoryActionResult(False)
+        parsed = self.parse_memory(text)
+        if parsed is None or parsed.confidence < 0.85:
+            return MemoryActionResult(False)
+        if not self._is_durable_user_memory(text, parsed):
+            return MemoryActionResult(False)
+        if memory_mode == "Suggest":
+            return MemoryActionResult(
+                True,
+                "Would you like me to remember that?",
+                clarification_needed=True,
+                memories=[],
+            )
+        try:
+            memory = self.remember(parsed, conversation_id, source_message_id, text)
+        except Exception as error:
+            return MemoryActionResult(True, f"I couldn't save that memory: {error}", error_code=WRITE_FAILED)
+        return MemoryActionResult(
+            True,
+            f"I'll remember that {memory.key} is {memory.value}.",
+            remembered=True,
+            memories=[memory],
+        )
+
+    def _is_durable_user_memory(self, text: str, parsed: ParsedMemory) -> bool:
+        lowered = text.casefold()
+        blocked = ("search", "according to", "quote", "article", "website", "tool", "assistant said")
+        if any(word in lowered for word in blocked):
+            return False
+        return parsed.category in {"User", "Preferences", "Projects", "People"} and parsed.subject == "user"
 
     def handle_update_intent(
         self,
@@ -284,7 +356,7 @@ class MemoryService:
     def _strip_prefix(self, text: str, prefixes: tuple[str, ...]) -> str | None:
         normalized = text.strip()
         lowered = normalized.casefold()
-        for prefix in prefixes:
+        for prefix in sorted(prefixes, key=len, reverse=True):
             if lowered.startswith(prefix):
                 body = normalized[len(prefix):].strip(" .:-")
                 return body
@@ -369,6 +441,8 @@ class MemoryService:
     ) -> MemoryRecord:
         normalized = normalize_key(parsed.category, parsed.subject, parsed.key)
         existing = self.store.active_by_normalized_key(normalized)
+        if existing is None:
+            existing = self.find_semantic_duplicate(parsed)
         if existing and existing.value.casefold() == parsed.value.casefold():
             updated = self.store.update_existing_provenance(
                 existing.id,
@@ -385,6 +459,23 @@ class MemoryService:
             supersedes_memory_id=existing.id if existing else None,
         )
 
+    def find_semantic_duplicate(self, parsed: ParsedMemory) -> MemoryRecord | None:
+        target_key = canonical_key(parsed.key)
+        target_embedding = embed_text(f"{parsed.category} {parsed.subject} {parsed.key} {parsed.value}")
+        best: tuple[float, MemoryRecord] | None = None
+        for record in self.store.list_memories():
+            if record.category != parsed.category or record.subject != parsed.subject:
+                continue
+            key_match = canonical_key(record.key) == target_key
+            similarity = cosine_similarity(
+                target_embedding,
+                embed_text(f"{record.category} {record.subject} {record.key} {record.value}"),
+            )
+            score = (0.55 if key_match else 0.0) + similarity
+            if score >= 0.82 and (best is None or score > best[0]):
+                best = (score, record)
+        return best[1] if best else None
+
     def retrieve(
         self,
         query: str,
@@ -396,8 +487,9 @@ class MemoryService:
         limit = limit or self.max_retrieved
         now = datetime.now(UTC)
         query_terms = set(re.findall(r"\w+", query.casefold()))
+        query_embedding = embed_text(query)
         records = self.store.search(category=category)
-        scored: list[tuple[int, MemoryRecord]] = []
+        scored: list[tuple[float, MemoryRecord]] = []
         for record in records:
             if record.expires_at and _parse_time(record.expires_at) <= now:
                 continue
@@ -405,24 +497,37 @@ class MemoryService:
                 [record.normalized_key, record.subject, record.key, record.value, record.content]
             ).casefold()
             terms = set(re.findall(r"\w+", haystack))
-            score = 0
+            score = 0.0
             matched = False
             if query_terms:
                 overlap = len(query_terms & terms)
-                score += 4 * overlap
+                score += 4.0 * overlap
                 matched = overlap > 0
                 if record.key.casefold() in query.casefold():
-                    score += 10
+                    score += 12.0
+                    matched = True
+                if canonical_key(record.key) and canonical_key(record.key) in canonical_key(query):
+                    score += 10.0
                     matched = True
                 if record.subject.casefold() in query.casefold():
-                    score += 6
+                    score += 4.0
                     matched = True
+                similarity = cosine_similarity(
+                    query_embedding,
+                    embed_text(f"{record.category} {record.subject} {record.key} {record.value} {record.content}"),
+                )
+                if similarity >= 0.18:
+                    score += 14.0 * similarity
+                    matched = True
+                if category and record.category == category:
+                    score += 2.0
             elif include_all_if_query:
-                score += 1
+                score += 1.0
                 matched = True
             if matched:
-                score += min(record.importance, 10)
-                score += min(record.access_count, 5)
+                score += min(record.importance, 10) * 0.75
+                score += min(record.access_count, 5) * 0.6
+                score += _recency_score(record.updated_at, now)
                 scored.append((score, record))
         scored.sort(key=lambda item: (item[0], item[1].updated_at), reverse=True)
         selected = [record for _score, record in scored[:limit]]
@@ -459,3 +564,11 @@ def _parse_time(value: str) -> datetime:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return datetime.min.replace(tzinfo=UTC)
+
+
+def _recency_score(value: str, now: datetime) -> float:
+    updated = _parse_time(value)
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=UTC)
+    age_days = max((now - updated).total_seconds() / 86400, 0)
+    return max(0.0, 2.0 - min(age_days / 30, 2.0))

@@ -22,6 +22,8 @@ from conversation_store import ConversationStore  # noqa: E402
 import design  # noqa: E402
 from design import Colors, PNG_CONTROL_ICON_SIZE, asset_icon_path, icon  # noqa: E402
 from main import MainWindow  # noqa: E402
+from memory_embeddings import EMBEDDING_MODEL_NAME, canonical_key, cosine_similarity, embed_text  # noqa: E402
+from memory_intent import CREATE, DELETE, IGNORE, RETRIEVE, UPDATE, MemoryIntentClassifier  # noqa: E402
 from memory_models import CATEGORIES, ParsedMemory  # noqa: E402
 from memory_service import (  # noqa: E402
     INVALID_REFERENCE,
@@ -234,6 +236,67 @@ class ChatFoundationTests(unittest.TestCase):
             unicode_update = service.handle_explicit_intent("Update my favorite color to blå.", "c1", "5")
             self.assertTrue(unicode_update.updated)
             self.assertEqual(service.retrieve("favorite color", mark_accessed=False)[0].value, "blå")
+
+    def test_memory_intent_classifier_routes_structured_actions(self) -> None:
+        classifier = MemoryIntentClassifier()
+        self.assertEqual(classifier.classify("Remember my favorite color is blue.").action, CREATE)
+        self.assertEqual(classifier.classify("My favorite color is blue now.").action, UPDATE)
+        self.assertEqual(classifier.classify("Change my favorite color to blue.").action, UPDATE)
+        self.assertEqual(classifier.classify("Delete the memory about my favorite color.").action, DELETE)
+        self.assertEqual(classifier.classify("What do you remember about me?").action, RETRIEVE)
+        self.assertEqual(classifier.classify("Blue is a nice color.").action, IGNORE)
+
+    def test_semantic_memory_retrieval_handles_equivalent_color_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+            service.handle_explicit_intent("Remember my favorite color is purple.", "c1", "1")
+            queries = ["favorite color", "fav color", "preferred colour", "the color I like most"]
+            for query in queries:
+                with self.subTest(query=query):
+                    records = service.retrieve(query, mark_accessed=False)
+                    self.assertEqual(records[0].value, "purple")
+            self.assertEqual(EMBEDDING_MODEL_NAME, "local-hash-ngram-v1")
+            self.assertGreater(cosine_similarity(embed_text("fav colour"), embed_text("favorite color")), 0.2)
+
+    def test_semantic_duplicate_detection_archives_superseded_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+            first = service.handle_explicit_intent("Remember my favorite color is purple.", "c1", "1")
+            second = service.handle_explicit_intent("Remember my fav colour is blue.", "c1", "2")
+            self.assertTrue(first.remembered)
+            self.assertTrue(second.remembered)
+            active = service.store.list_memories()
+            archived = service.store.list_memories(include_archived=True)
+            self.assertEqual(len(active), 1)
+            self.assertEqual(active[0].value, "blue")
+            self.assertTrue(any(record.value == "purple" and not record.active for record in archived))
+            self.assertEqual(canonical_key("fav colour"), canonical_key("favorite color"))
+
+    def test_duplicate_migration_archives_existing_duplicate_memories(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = MemoryStore(Path(temp_dir) / "memory.db")
+            store.add_memory(ParsedMemory("User", "user", "favorite color", "purple", "favorite color is purple"), "c1", "1", "old")
+            store.add_memory(ParsedMemory("User", "user", "fav colour", "blue", "fav colour is blue"), "c1", "2", "new")
+            service = MemoryService(store)
+            active = service.store.list_memories()
+            self.assertEqual(len(active), 1)
+            self.assertEqual(active[0].value, "blue")
+
+    def test_memory_modes_off_suggest_and_automatic(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+            off = service.handle_explicit_intent("Remember my favorite color is purple.", "c1", "1", memory_mode="Off")
+            self.assertFalse(off.handled)
+            self.assertEqual(service.store.list_memories(), [])
+
+            suggest = service.maybe_capture_automatic_memory("My favorite movie is Interstellar.", "c1", "2", "Suggest")
+            self.assertTrue(suggest.handled)
+            self.assertFalse(suggest.remembered)
+            self.assertIn("Would you like me to remember that?", suggest.response)
+
+            automatic = service.maybe_capture_automatic_memory("My favorite movie is Interstellar.", "c1", "3", "Automatic")
+            self.assertTrue(automatic.remembered)
+            self.assertEqual(service.retrieve("favorite film", mark_accessed=False)[0].value, "Interstellar")
 
     def test_contextual_memory_creation_uses_previous_user_message(self) -> None:
         phrases = ["Remember that.", "Save that.", "Store that."]
@@ -702,6 +765,7 @@ class ChatFoundationTests(unittest.TestCase):
     def test_settings_overlay_memory_manager_search_edit_delete(self) -> None:
         window, _temp_dir = self._window_with_temp_store()
         window.show()
+        window.preferences.memory_mode = "Explicit"
         window.memory_service.handle_explicit_intent("Remember that my favorite color is purple.", "c1", "1")
         window.open_settings_overlay()
         self.assertTrue(window.settings_overlay.isVisible())
@@ -709,6 +773,11 @@ class ChatFoundationTests(unittest.TestCase):
             [window.settings_overlay.category_filter.itemText(index) for index in range(window.settings_overlay.category_filter.count())],
             ["All", *CATEGORIES],
         )
+        window.settings_overlay.memory_mode.setCurrentText("Explicit")
+        self.assertEqual(window.settings_overlay.memory_mode.currentText(), "Explicit")
+        window.settings_overlay.memory_mode.setCurrentText("Automatic")
+        self.assertEqual(window.preferences.memory_mode, "Automatic")
+        self.assertIn("Category", [window.settings_overlay.sort_order.itemText(index) for index in range(window.settings_overlay.sort_order.count())])
         window.settings_overlay.search_input.setText("favorite")
         self.app.processEvents()
         self.assertTrue(window.settings_overlay.store.search("favorite"))
