@@ -21,7 +21,11 @@ from conversation_store import ConversationStore  # noqa: E402
 import design  # noqa: E402
 from design import Colors, PNG_CONTROL_ICON_SIZE, asset_icon_path, icon  # noqa: E402
 from main import MainWindow  # noqa: E402
+from memory_models import ParsedMemory  # noqa: E402
+from memory_service import MemoryService  # noqa: E402
+from memory_store import MemoryStore, MemoryStoreError, normalize_key  # noqa: E402
 from ollama_client import InvalidStreamError, OllamaWorker, discover_models, iter_message_chunks  # noqa: E402
+from prompts import build_ollama_messages, format_relevant_memories  # noqa: E402
 from sidebar import ChatSidebar  # noqa: E402
 from widgets import AutoGrowingInput, CodeBlock, MarkdownView, MessageActions, MessageBubble  # noqa: E402
 
@@ -34,11 +38,15 @@ class ChatFoundationTests(unittest.TestCase):
     def _window_with_temp_store(self) -> tuple[MainWindow, tempfile.TemporaryDirectory]:
         temp_dir = tempfile.TemporaryDirectory()
         store = ConversationStore(Path(temp_dir.name))
+        memory_store = MemoryStore(Path(temp_dir.name) / "memory.db")
         patcher = patch("main.ConversationStore", return_value=store)
+        memory_patcher = patch("main.MemoryStore", return_value=memory_store)
         refresh = patch.object(MainWindow, "_refresh_models")
         patcher.start()
+        memory_patcher.start()
         refresh.start()
         self.addCleanup(patcher.stop)
+        self.addCleanup(memory_patcher.stop)
         self.addCleanup(refresh.stop)
         self.addCleanup(temp_dir.cleanup)
         return MainWindow(), temp_dir
@@ -119,6 +127,100 @@ class ChatFoundationTests(unittest.TestCase):
             assert restored is not None
             self.assertEqual(restored.id, conversation.id)
             self.assertEqual(restored.messages[1]["content"], "Hello, Violet")
+
+    def test_memory_database_creation_schema_and_unicode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = MemoryStore(Path(temp_dir) / "memory.db")
+            self.assertEqual(store.schema_version(), 1)
+            record = store.add_memory(
+                ParsedMemory("preference", "user", "favorite color", "紫", "favorite color is 紫"),
+                "conversation-1",
+                "1",
+                "Remember that my favorite color is 紫.",
+            )
+            self.assertTrue((Path(temp_dir) / "memory.db").exists())
+            self.assertEqual(record.source_user_text, "Remember that my favorite color is 紫.")
+            self.assertEqual(store.get(record.id).value, "紫")
+
+    def test_explicit_memory_creation_duplicate_and_conflict_superseding(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+            first = service.handle_explicit_intent(
+                "Remember that my favorite color is purple.",
+                "c1",
+                "1",
+            )
+            self.assertTrue(first.remembered)
+            duplicate = service.handle_explicit_intent(
+                "Please remember my favorite color is purple.",
+                "c1",
+                "2",
+            )
+            self.assertTrue(duplicate.remembered)
+            self.assertEqual(len(service.store.list_memories()), 1)
+            conflict = service.handle_explicit_intent(
+                "Remember that my favorite color is blue.",
+                "c1",
+                "3",
+            )
+            self.assertTrue(conflict.remembered)
+            active = service.store.list_memories()
+            all_records = service.store.list_memories(include_archived=True)
+            self.assertEqual(len(active), 1)
+            self.assertEqual(active[0].value, "blue")
+            self.assertEqual(len(all_records), 2)
+            self.assertTrue(any(not record.active for record in all_records))
+
+    def test_no_memory_creation_without_explicit_user_intent_and_vancouver_scenario(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+            result = service.handle_explicit_intent("Search for the artist Ekkstacy.", "c1", "1")
+            self.assertFalse(result.handled)
+            self.assertEqual(service.store.list_memories(), [])
+            result = service.handle_explicit_intent("The artist is from Vancouver.", "c1", "2")
+            self.assertFalse(result.handled)
+            self.assertEqual(service.retrieve("Where am I from?"), [])
+
+    def test_memory_retrieval_limits_category_archive_and_expiration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"), max_retrieved=2)
+            service.remember(ParsedMemory("preference", "user", "favorite color", "purple", "favorite color is purple"), "c", "1", "Remember that my favorite color is purple.")
+            service.remember(ParsedMemory("profile", "user", "location", "Toronto", "I live in Toronto"), "c", "2", "Remember that I live in Toronto.")
+            expired = service.remember(ParsedMemory("temporary", "user", "snack", "tea", "snack is tea", expires_at="2000-01-01T00:00:00+00:00"), "c", "3", "Remember my snack is tea until tomorrow.")
+            service.store.archive(expired.id)
+            color = service.retrieve("favorite color", category="preference")
+            self.assertEqual(len(color), 1)
+            self.assertEqual(color[0].value, "purple")
+            self.assertLessEqual(len(service.retrieve("what do you remember about me")), 2)
+            self.assertTrue(all(record.active for record in service.retrieve("tea")))
+            self.assertEqual(service.retrieve("snack tea"), [])
+
+    def test_forgetting_manual_edit_and_prompt_construction(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+            result = service.handle_explicit_intent("Remember that my favorite color is purple.", "c1", "1")
+            memory = result.memories[0]
+            service.store.edit(memory.id, memory.category, memory.subject, memory.key, "blue", "favorite color is blue")
+            edited = service.store.get(memory.id)
+            self.assertTrue(edited.manually_edited)
+            messages = build_ollama_messages(
+                [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": "What is my favorite color?"}],
+                [edited],
+                SYSTEM_PROMPT,
+            )
+            self.assertEqual(messages[0]["role"], "system")
+            self.assertIn("[Relevant user memories]", messages[1]["content"])
+            self.assertEqual(messages[-1]["content"], "What is my favorite color?")
+            forget = service.handle_explicit_intent("Forget my favorite color.", "c1", "2")
+            self.assertTrue(forget.removed)
+            self.assertEqual(service.retrieve("favorite color"), [])
+
+    def test_memory_store_database_errors_are_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bad_path = Path(temp_dir) / "memory.db"
+            bad_path.write_text("not sqlite", encoding="utf-8")
+            with self.assertRaises(MemoryStoreError):
+                MemoryStore(bad_path)
 
     def test_conversation_grouping_search_rename_and_delete(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -371,6 +473,44 @@ class ChatFoundationTests(unittest.TestCase):
             "Image Generation",
         ])
         self.assertTrue(all(not action.isEnabled() for action in actions))
+        window.close()
+
+    def test_explicit_memory_command_shows_remembered_confirmation(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        with patch.object(window, "_start_generation") as generation:
+            window.input_box.setPlainText("Remember that my favorite color is purple.")
+            window.send_message()
+        generation.assert_not_called()
+        labels = [label.text() for label in window.findChildren(QLabel)]
+        self.assertIn("✓ Remembered", labels)
+        self.assertEqual(window.memory_service.retrieve("favorite color", mark_accessed=False)[0].value, "purple")
+        window.close()
+
+    def test_settings_overlay_memory_manager_search_edit_delete(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        window.memory_service.handle_explicit_intent("Remember that my favorite color is purple.", "c1", "1")
+        window.open_settings_overlay()
+        self.assertTrue(window.settings_overlay.isVisible())
+        window.settings_overlay.search_input.setText("favorite")
+        self.app.processEvents()
+        self.assertTrue(window.settings_overlay.store.search("favorite"))
+        record = window.settings_overlay.store.search("favorite")[0]
+        edited = window.settings_overlay.store.edit(
+            record.id,
+            record.category,
+            record.subject,
+            record.key,
+            "blue",
+            "favorite color is blue",
+        )
+        self.assertTrue(edited.manually_edited)
+        window.settings_overlay.store.archive(record.id)
+        self.assertEqual(window.memory_service.retrieve("favorite color"), [])
+        window.settings_overlay.store.restore(record.id)
+        self.assertEqual(window.memory_service.retrieve("favorite color")[0].value, "blue")
+        window.settings_overlay.store.delete(record.id)
+        self.assertEqual(window.settings_overlay.store.search("favorite", include_archived=True), [])
         window.close()
 
     def test_send_and_stop_buttons_have_identical_larger_geometry(self) -> None:

@@ -188,6 +188,7 @@ class SearchOverlay(QFrame):
 class ChatSidebar(QFrame):
     new_chat_requested = Signal()
     search_requested = Signal()
+    settings_requested = Signal()
     conversation_selected = Signal(str)
     pin_requested = Signal(str, bool)
     rename_requested = Signal(str, str)
@@ -250,6 +251,18 @@ class ChatSidebar(QFrame):
         self.scroll_area.setWidget(self.list_widget)
         expanded_layout.addWidget(self.scroll_area, 1)
 
+        footer = QFrame()
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(0, 8, 0, 0)
+        self.settings_button = QToolButton(objectName="sidebarIconButton")
+        self.settings_button.setIcon(icon("settings"))
+        self.settings_button.setToolTip("Settings")
+        self.settings_button.clicked.connect(self.settings_requested.emit)
+        footer_layout.addStretch()
+        footer_layout.addWidget(self.settings_button)
+        footer_layout.addStretch()
+        expanded_layout.addWidget(footer)
+
         self.collapsed_container = QWidget()
         collapsed_layout = QVBoxLayout(self.collapsed_container)
         collapsed_layout.setContentsMargins(0, 0, 0, 0)
@@ -266,10 +279,15 @@ class ChatSidebar(QFrame):
         self.collapsed_new_chat_button.setIcon(icon("new"))
         self.collapsed_new_chat_button.setToolTip("New chat")
         self.collapsed_new_chat_button.clicked.connect(self.new_chat_requested.emit)
+        self.collapsed_settings_button = QToolButton(objectName="collapsedSidebarButton")
+        self.collapsed_settings_button.setIcon(icon("settings"))
+        self.collapsed_settings_button.setToolTip("Settings")
+        self.collapsed_settings_button.clicked.connect(self.settings_requested.emit)
         collapsed_layout.addWidget(self.collapsed_expand_button, 0, Qt.AlignmentFlag.AlignHCenter)
         collapsed_layout.addWidget(self.collapsed_search_button, 0, Qt.AlignmentFlag.AlignHCenter)
         collapsed_layout.addWidget(self.collapsed_new_chat_button, 0, Qt.AlignmentFlag.AlignHCenter)
         collapsed_layout.addStretch(1)
+        collapsed_layout.addWidget(self.collapsed_settings_button, 0, Qt.AlignmentFlag.AlignHCenter)
         self.root_layout.addWidget(self.collapsed_container, 1)
         self.collapsed_container.hide()
         apply_interaction_cursors(self)
@@ -309,6 +327,8 @@ class ChatSidebar(QFrame):
         self.search_button.setEnabled(not generating)
         self.collapsed_new_chat_button.setEnabled(not generating)
         self.collapsed_search_button.setEnabled(not generating)
+        self.settings_button.setEnabled(not generating)
+        self.collapsed_settings_button.setEnabled(not generating)
 
     def rebuild(
         self,

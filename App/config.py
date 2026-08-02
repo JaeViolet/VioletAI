@@ -14,9 +14,9 @@ READ_TIMEOUT_SECONDS = 600
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONVERSATIONS_DIR = PROJECT_ROOT / "memory" / "conversations"
 PREFERENCES_PATH = PROJECT_ROOT / "memory" / "preferences.json"
+MEMORY_DB_PATH = PROJECT_ROOT / "memory" / "memory.db"
 APP_FOOTER_TEXT = "VioletAI can make mistakes. Check important information."
 
-SYSTEM_PROMPT = (
-    "You are a helpful local desktop AI assistant. "
-    "Be clear, accurate, concise, and practical."
-)
+from prompts import BASE_SYSTEM_PROMPT  # noqa: E402
+
+SYSTEM_PROMPT = BASE_SYSTEM_PROMPT

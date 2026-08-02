@@ -58,7 +58,10 @@ PNG_ICON_NAMES = {
     "regen": "regenerate.png",
     "regenerate": "regenerate.png",
     "send": "send.png",
+    "settings": "settings.png",
     "stop": "stop.png",
+    "theme": "theme.png",
+    "memory": "memory.png",
 }
 
 

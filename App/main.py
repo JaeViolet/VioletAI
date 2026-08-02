@@ -36,8 +36,12 @@ from PySide6.QtWidgets import (
 from config import APP_FOOTER_TEXT, APP_NAME, DEFAULT_MODEL_NAME, SYSTEM_PROMPT
 from conversation_store import Conversation, ConversationStore
 from design import Motion, PNG_CONTROL_ICON_SIZE, app_stylesheet, icon
+from memory_manager import SettingsOverlay
+from memory_service import MemoryService
+from memory_store import MemoryStore
 from ollama_client import ModelDiscoveryWorker, OllamaWorker
 from preferences import Preferences
+from prompts import build_ollama_messages
 from sidebar import ChatSidebar, SearchOverlay
 from widgets import (
     AutoGrowingInput,
@@ -59,6 +63,8 @@ class MainWindow(QMainWindow):
         self.active_model = self.preferences.selected_model or DEFAULT_MODEL_NAME
         self.available_models: list[str] = []
         self.store = ConversationStore()
+        self.memory_store = MemoryStore()
+        self.memory_service = MemoryService(self.memory_store)
         self.conversation = self._load_or_create_conversation()
         self.messages = self.conversation.messages
 
@@ -118,6 +124,7 @@ class MainWindow(QMainWindow):
         self.sidebar = ChatSidebar()
         self.sidebar.new_chat_requested.connect(self.new_chat)
         self.sidebar.search_requested.connect(self.open_search_overlay)
+        self.sidebar.settings_requested.connect(self.open_settings_overlay)
         self.sidebar.conversation_selected.connect(self.select_conversation)
         self.sidebar.pin_requested.connect(self.pin_conversation)
         self.sidebar.rename_requested.connect(self.rename_conversation)
@@ -247,6 +254,7 @@ class MainWindow(QMainWindow):
         self.search_overlay = SearchOverlay(self.chat_panel)
         self.search_overlay.selected.connect(self._select_from_search)
         self.search_overlay.search_changed.connect(self._rebuild_search_results)
+        self.settings_overlay = SettingsOverlay(self.memory_store, self.chat_panel)
 
     def _configure_model_selector(self, selector: QComboBox) -> None:
         selector.setToolTip("Select local Ollama model")
@@ -427,6 +435,13 @@ class MainWindow(QMainWindow):
                     self.search_overlay.close_overlay()
             if event.type() == QEvent.Type.Resize:
                 QTimer.singleShot(0, self._position_search_overlay)
+        if (
+            watched is self.chat_panel
+            and hasattr(self, "settings_overlay")
+            and self.settings_overlay.isVisible()
+            and event.type() == QEvent.Type.Resize
+        ):
+            QTimer.singleShot(0, self._position_settings_overlay)
         if watched is self.scroll_area.viewport() and event.type() == QEvent.Type.Resize:
             QTimer.singleShot(0, self._resize_rows)
         if watched is self.scroll_area.viewport() and event.type() == QEvent.Type.MouseButtonPress:
@@ -442,6 +457,13 @@ class MainWindow(QMainWindow):
     def _position_search_overlay(self) -> None:
         if self.search_overlay.isVisible():
             self.search_overlay.show_overlay()
+
+    def open_settings_overlay(self) -> None:
+        self.settings_overlay.show_overlay()
+
+    def _position_settings_overlay(self) -> None:
+        if self.settings_overlay.isVisible():
+            self.settings_overlay.show_overlay()
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
@@ -724,6 +746,7 @@ class MainWindow(QMainWindow):
         if not message or self.thread is not None:
             return
         self.input_box.remember_prompt(message)
+        source_message_id = str(len(self.messages))
         self._add_message(message, "user", len(self.messages))
         self.messages.append({"role": "user", "content": message})
         self.conversation.model = self.active_model
@@ -731,7 +754,38 @@ class MainWindow(QMainWindow):
         self._rebuild_sidebar()
         self.input_box.clear()
         self._scroll_to_bottom()
+        memory_result = self.memory_service.handle_explicit_intent(
+            message,
+            self.conversation.id,
+            source_message_id,
+        )
+        if memory_result.handled:
+            bubble = self._append_assistant_direct(memory_result.response)
+            if memory_result.remembered:
+                self._add_memory_confirmation(bubble, "✓ Remembered")
+            elif memory_result.removed:
+                self._add_memory_confirmation(bubble, "Memory removed.")
+            self.settings_overlay.refresh()
+            self._scroll_to_bottom()
+            return
         self._start_generation()
+
+    def _append_assistant_direct(self, answer: str) -> MessageBubble:
+        bubble = self._add_message(answer, "assistant", len(self.messages))
+        self.messages.append({"role": "assistant", "content": answer})
+        self.conversation.model = self.active_model
+        self.store.save(self.conversation)
+        self._rebuild_sidebar()
+        return bubble
+
+    def _add_memory_confirmation(self, bubble: MessageBubble, text: str) -> None:
+        column = bubble.parentWidget()
+        if not isinstance(column, QWidget) or column.layout() is None:
+            return
+        label = QLabel(text)
+        label.setObjectName("copiedLabel")
+        column.layout().addWidget(label)
+        self._finalize_message_geometry()
 
     def regenerate_response(self, message_index: int) -> None:
         if self.thread is not None:
@@ -757,7 +811,13 @@ class MainWindow(QMainWindow):
         self._set_status("Connecting")
 
         self.thread = QThread(self)
-        self.worker = OllamaWorker(self.messages.copy(), self.active_model)
+        last_user_message = next(
+            (message.get("content", "") for message in reversed(self.messages) if message.get("role") == "user"),
+            "",
+        )
+        relevant_memories = self.memory_service.retrieve(last_user_message)
+        ollama_messages = build_ollama_messages(self.messages, relevant_memories, SYSTEM_PROMPT)
+        self.worker = OllamaWorker(ollama_messages, self.active_model)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.connected.connect(lambda: self._set_status("Thinking"))
