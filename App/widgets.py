@@ -95,6 +95,7 @@ class MarkdownView(QTextBrowser):
         self.set_markdown(markdown)
 
     def set_markdown(self, markdown: str) -> None:
+        self._markdown = markdown
         self.document().setMarkdown(markdown)
         QTimer.singleShot(0, self._fit_height)
 
@@ -110,6 +111,8 @@ class MarkdownView(QTextBrowser):
         height = max(1, int(self.document().size().height()) + 2)
         if self.height() != height:
             self.setFixedHeight(height)
+            self.setMinimumHeight(height)
+            self.setMaximumHeight(height)
             self.height_changed.emit()
 
 
@@ -181,6 +184,9 @@ class CodeBlock(QFrame):
         fixed_font.setPointSize(10)
         self.editor.setFont(fixed_font)
         self.editor.document().setDocumentMargin(12)
+        self.editor.document().documentLayout().documentSizeChanged.connect(
+            lambda _size: self._fit_height()
+        )
         self.highlighter = CodeHighlighter(self.editor.document())
         self._fit_height()
         layout.addWidget(self.editor)
@@ -188,7 +194,11 @@ class CodeBlock(QFrame):
     def _fit_height(self) -> None:
         metrics = self.editor.fontMetrics()
         line_count = max(1, self.editor.document().blockCount())
-        self.editor.setFixedHeight(line_count * metrics.lineSpacing() + 26)
+        height = line_count * metrics.lineSpacing() + 28
+        self.editor.setFixedHeight(height)
+        self.editor.setMinimumHeight(height)
+        self.editor.setMaximumHeight(height)
+        self.updateGeometry()
 
     def _copy(self, button: QPushButton) -> None:
         QApplication.clipboard().setText(self.editor.toPlainText())
@@ -206,7 +216,7 @@ class MessageBubble(QFrame):
         self.role = role
         self._text = text
         self.setObjectName(f"{role}Bubble")
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         self.layout = QVBoxLayout(self)
         margins = (16, 11, 16, 11) if role == "user" else (4, 7, 4, 7)
         self.layout.setContentsMargins(*margins)
@@ -231,7 +241,44 @@ class MessageBubble(QFrame):
         remainder = text[cursor:].strip("\n")
         if remainder or not found_code:
             self.layout.addWidget(MarkdownView(remainder or " "))
+        self.adjustSize()
         self.updateGeometry()
+
+    def text(self) -> str:
+        return self._text
+
+
+class MessageActions(QFrame):
+    copy_requested = Signal()
+    regenerate_requested = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("messageActions")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(6)
+
+        self.copy_button = QPushButton("Copy")
+        self.copy_button.setObjectName("actionButton")
+        self.copy_button.setToolTip("Copy response")
+        self.copy_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.copy_button.clicked.connect(self._copy_clicked)
+
+        self.regenerate_button = QPushButton("Regenerate")
+        self.regenerate_button.setObjectName("actionButton")
+        self.regenerate_button.setToolTip("Regenerate response")
+        self.regenerate_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.regenerate_button.clicked.connect(self.regenerate_requested.emit)
+
+        layout.addWidget(self.copy_button)
+        layout.addWidget(self.regenerate_button)
+        layout.addStretch()
+
+    def _copy_clicked(self) -> None:
+        self.copy_requested.emit()
+        self.copy_button.setText("Copied")
+        QTimer.singleShot(1400, lambda: self.copy_button.setText("Copy"))
 
 
 class ThinkingBubble(QFrame):
@@ -243,7 +290,7 @@ class ThinkingBubble(QFrame):
         layout.setSpacing(4)
         label = QLabel("Thinking")
         label.setObjectName("thinkingLabel")
-        self.dots = QLabel("·")
+        self.dots = QLabel(".")
         self.dots.setObjectName("thinkingDots")
         layout.addWidget(label)
         layout.addWidget(self.dots)
@@ -255,4 +302,4 @@ class ThinkingBubble(QFrame):
 
     def _animate(self) -> None:
         self._step = (self._step + 1) % 4
-        self.dots.setText("·" * self._step)
+        self.dots.setText("." * self._step)
