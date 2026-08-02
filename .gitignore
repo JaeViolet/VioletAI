@@ -12,15 +12,10 @@ logs/
 *.log
 
 # Ollama models
-Ollama/Models/
+ollama/models/
 models/
 
-# Temporary files
-*.tmp
-*.cache
-
 # Windows
+*.lnk
 Thumbs.db
 Desktop.ini
-
-*.lnk
