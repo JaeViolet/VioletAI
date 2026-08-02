@@ -121,15 +121,17 @@ def app_stylesheet() -> str:
         #sidebar {{
             background: {Colors.BLACK}; border-right: 1px solid {Colors.BORDER};
         }}
-        #sidebarTopTitle {{ color: {Colors.TEXT}; font-size: 15px; font-weight: 650; }}
+        #sidebarTopTitle {{ color: {Colors.TEXT}; font-size: 22px; font-weight: 1; margin-left: 8px; }}
         #sidebarIconButton, #headerIconButton {{
             background: transparent; border: none; color: {Colors.TEXT_MUTED};
+            margin: 6px 4px;
             border-radius: {Radius.SM}px; padding: 5px; min-width: 28px; min-height: 28px;
         }}
         #sidebarIconButton:hover, #headerIconButton:hover {{ background: {Colors.PANEL_HOVER}; }}
         #sidebarNewChat {{
             background: transparent; color: {Colors.TEXT}; border: none;
-            border-radius: {Radius.SM}px; padding: 8px 9px; text-align: left;
+            margin-top: 40px;
+            border-radius: {Radius.SM}px; padding: 15px 15px; text-align: left;
             font-size: 13px;
         }}
         #sidebarNewChat:hover {{ background: {Colors.PANEL_HOVER}; }}
@@ -138,7 +140,7 @@ def app_stylesheet() -> str:
             color: {Colors.TEXT_MUTED}; font-size: 11px; font-weight: 600;
             padding: 14px 8px 5px 8px;
         }}
-        #conversationRow {{ background: transparent; border-radius: {Radius.SM}px; }}
+        #conversationRow {{ background: transparent; border-radius: {Radius.LG}px;}}
         #conversationRow:hover {{ background: {Colors.PANEL_HOVER}; }}
         #conversationRow[active="true"] {{ background: {Colors.PANEL_ACTIVE}; }}
         #conversationTitle {{ color: {Colors.TEXT}; font-size: 13px; }}
@@ -203,6 +205,7 @@ def app_stylesheet() -> str:
         #sendButton {{
             background: {Colors.ACCENT}; color: white; border: none;
             border-radius: 16px; min-width: 32px; min-height: 32px; max-width: 32px; max-height: 32px;
+            margin-right: 2px;
         }}
         #sendButton:hover {{ background: {Colors.ACCENT_HOVER}; }}
         #sendButton:pressed {{ background: #7947e8; }}
