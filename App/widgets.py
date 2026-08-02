@@ -33,8 +33,9 @@ from design import icon
 
 class AutoGrowingInput(QTextEdit):
     send_requested = Signal()
+    height_changed = Signal(int)
 
-    MIN_HEIGHT = 34
+    MIN_HEIGHT = 30
     MAX_HEIGHT = 180
 
     def __init__(self) -> None:
@@ -46,6 +47,7 @@ class AutoGrowingInput(QTextEdit):
         self._prompt_history: list[str] = []
         self._history_index: int | None = None
         self._draft_before_history = ""
+        self._updating_height = False
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.document().documentLayout().documentSizeChanged.connect(
@@ -57,21 +59,52 @@ class AutoGrowingInput(QTextEdit):
     def sizeHint(self) -> QSize:
         return QSize(super().sizeHint().width(), self.height())
 
+    def setPlainText(self, text: str) -> None:
+        super().setPlainText(text)
+        self._update_height()
+
     def _update_height(self) -> None:
+        if self._updating_height:
+            return
+        self._updating_height = True
         document_height = self.document().documentLayout().documentSize().height()
         frame = self.frameWidth() * 2
-        desired = int(document_height + frame + 12)
+        line_height = self.fontMetrics().lineSpacing()
+        has_multiple_blocks = self.document().blockCount() > 1
+        is_empty = not self.toPlainText()
+        if is_empty or (not has_multiple_blocks and document_height <= line_height + 12):
+            desired = self.MIN_HEIGHT
+        else:
+            block_height = self.document().blockCount() * line_height + frame + 10
+            desired = int(max(document_height + frame + 8, block_height))
         height = max(self.MIN_HEIGHT, min(desired, self.MAX_HEIGHT))
-        self.setFixedHeight(height)
-        policy = (
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
-            if desired > self.MAX_HEIGHT
-            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        self.setVerticalScrollBarPolicy(policy)
-        document_margin = int(max(0, (height - document_height - frame) / 2))
-        self.document().setDocumentMargin(document_margin)
-        self.viewport().update()
+        old_height = self.height()
+        try:
+            self.setFixedHeight(height)
+            policy = (
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded
+                if desired > self.MAX_HEIGHT
+                else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            )
+            self.setVerticalScrollBarPolicy(policy)
+            single_line_height = line_height
+            is_single_visual_line = (
+                self.document().blockCount() <= 1
+                and document_height <= single_line_height + 12
+            )
+            document_margin = int(max(0, (height - single_line_height - frame) / 2)) if is_single_visual_line else 4
+            if int(self.document().documentMargin()) != document_margin:
+                self.document().setDocumentMargin(document_margin)
+            self.viewport().update()
+            if old_height != height:
+                self.height_changed.emit(height)
+        finally:
+            self._updating_height = False
+
+    def is_visually_multiline(self) -> bool:
+        line_height = max(1, self.fontMetrics().lineSpacing())
+        document_height = self.document().documentLayout().documentSize().height()
+        return self.document().blockCount() > 1 or document_height > line_height + 14
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         is_enter = event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
@@ -367,22 +400,13 @@ class MessageBubble(QFrame):
             return max_width
         margins = self.layout.contentsMargins()
         horizontal_padding = margins.left() + margins.right()
-        available_text_width = max(80, max_width - horizontal_padding)
         metrics = QFontMetrics(self.font())
         natural = 0
         for paragraph in (self._text or " ").splitlines() or [" "]:
             if not paragraph:
                 paragraph = " "
-            rect = metrics.boundingRect(
-                0,
-                0,
-                available_text_width,
-                10_000,
-                Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextExpandTabs,
-                paragraph,
-            )
-            natural = max(natural, rect.width())
-        return min(max_width, max(46, natural + horizontal_padding + 6))
+            natural = max(natural, metrics.horizontalAdvance(paragraph.expandtabs(4)))
+        return min(max_width, max(46, natural + horizontal_padding + 8))
 
     def set_text(self, text: str) -> None:
         self._text = text

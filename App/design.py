@@ -201,13 +201,21 @@ def app_stylesheet() -> str:
         #inputPanel {{ background: {Colors.SURFACE}; }}
         #composer {{
             background: {Colors.COMPOSER}; border: 1px solid {Colors.BORDER_STRONG};
-            border-radius: {Radius.XL}px;
+            border-radius: 28px;
         }}
+        #composerToolbar {{ background: transparent; border: none; }}
         #messageInput {{
             background: transparent; color: {Colors.TEXT}; border: none;
-            padding: 1px 3px; font-size: 15px; selection-background-color: #58719a;
+            padding: 0px 3px; font-size: 15px; selection-background-color: #58719a;
         }}
         #messageInput:disabled {{ color: #8b8b8b; }}
+        #toolsButton {{
+            background: transparent; color: {Colors.TEXT_MUTED}; border: none;
+            padding: 4px; min-width: 32px; min-height: 32px; max-width: 32px; max-height: 32px;
+            border-radius: 16px;
+        }}
+        #toolsButton:hover {{ background: {Colors.PANEL_ACTIVE}; color: {Colors.TEXT}; }}
+        #toolsButton::menu-indicator {{ image: none; width: 0px; }}
         #modelSelector {{
             background: transparent; color: {Colors.TEXT_MUTED}; border: none;
             padding: 3px 4px; min-height: 28px; font-size: 13px;
@@ -227,8 +235,8 @@ def app_stylesheet() -> str:
         #modelSelector:disabled {{ color: {Colors.TEXT_FAINT}; }}
         #sendButton {{
             background: {Colors.ACCENT}; color: white; border: none;
-            border-radius: 16px; min-width: 32px; min-height: 32px; max-width: 32px; max-height: 32px;
-            margin-right: 2px;
+            border-radius: 18px; min-width: 36px; min-height: 36px; max-width: 36px; max-height: 36px;
+            margin-right: 0px;
         }}
         #sendButton:hover {{ background: {Colors.ACCENT_HOVER}; }}
         #sendButton:pressed {{ background: #7947e8; }}

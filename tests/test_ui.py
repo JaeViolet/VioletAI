@@ -200,6 +200,17 @@ class ChatFoundationTests(unittest.TestCase):
         self.assertIsNone(bubble.parentWidget().parentWidget().graphicsEffect())
         window.close()
 
+    def test_user_bubble_expands_to_two_thirds_before_wrapping(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        text = "word " * 70
+        bubble = window._add_message(text, "user")
+        window.resize(1000, 700)
+        window._resize_rows()
+        self.app.processEvents()
+        expected_max = int(window.composer.maximumWidth() * 2 / 3)
+        self.assertEqual(bubble.width(), expected_max)
+        window.close()
+
     def test_long_user_bubble_wraps_without_internal_scrollbar(self) -> None:
         window, _temp_dir = self._window_with_temp_store()
         text = "hello " * 90
@@ -311,8 +322,8 @@ class ChatFoundationTests(unittest.TestCase):
         rows = sidebar.findChildren(QWidget, "conversationRow")
         self.assertEqual(rows[0].height(), 34)
         self.assertEqual(rows[0].findChildren(QToolButton), [])
-        self.assertEqual(rows[0].x(), 8)
-        self.assertLessEqual(rows[0].geometry().right(), sidebar.list_widget.width() - 9)
+        self.assertEqual(rows[0].x(), 0)
+        self.assertEqual(rows[0].width(), sidebar.new_chat_button.width())
         sidebar.close()
 
     def test_input_placeholder_and_cursor_are_vertically_centered(self) -> None:
@@ -322,6 +333,54 @@ class ChatFoundationTests(unittest.TestCase):
         self.assertGreater(editor.document().documentMargin(), 0)
         editor.setPlainText("line one\nline two\nline three")
         self.assertGreater(editor.height(), editor.MIN_HEIGHT)
+
+    def test_composer_switches_between_compact_and_multiline_layouts(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        self.assertFalse(window._composer_multiline)
+        self.assertFalse(window.toolbar_widget.isVisible())
+        self.assertEqual(window.input_row.itemAt(0).widget(), window.tools_button)
+        self.assertEqual(window.input_row.itemAt(1).widget(), window.input_box)
+        self.assertTrue(window.tools_button.isVisible())
+        window.input_box.setPlainText("first paragraph\n\nsecond paragraph")
+        self.app.processEvents()
+        window._update_composer_mode()
+        self.assertTrue(window._composer_multiline)
+        self.assertTrue(window.toolbar_widget.isVisible())
+        self.assertFalse(window.tools_button.isVisible())
+        self.assertFalse(window.model_selector.isVisible())
+        self.assertEqual(window.input_row.itemAt(1).widget(), window.input_box)
+        self.assertEqual(window.toolbar_layout.itemAt(0).widget(), window.toolbar_tools_button)
+        self.assertEqual(window.toolbar_layout.itemAt(window.toolbar_layout.count() - 3).widget(), window.toolbar_model_selector)
+        window.input_box.setPlainText("short")
+        self.app.processEvents()
+        window._update_composer_mode()
+        self.assertFalse(window._composer_multiline)
+        window.close()
+
+    def test_tools_menu_has_independent_placeholder_actions(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        actions = window.tools_button.menu().actions()
+        self.assertEqual([action.data() for action in actions], [
+            "Web Search",
+            "Upload Files",
+            "Upload Images",
+            "Deep Research",
+            "Image Generation",
+        ])
+        self.assertTrue(all(not action.isEnabled() for action in actions))
+        window.close()
+
+    def test_send_and_stop_buttons_have_identical_larger_geometry(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        self.assertEqual(window.send_button.minimumWidth(), 36)
+        self.assertEqual(window.send_button.minimumHeight(), 36)
+        self.assertEqual(window.stop_button.minimumWidth(), window.send_button.minimumWidth())
+        self.assertEqual(window.stop_button.minimumHeight(), window.send_button.minimumHeight())
+        self.assertEqual(window.toolbar_send_button.minimumWidth(), window.send_button.minimumWidth())
+        self.assertEqual(window.toolbar_stop_button.minimumHeight(), window.send_button.minimumHeight())
+        window.close()
 
     def test_code_blocks_have_no_internal_scrollbars_and_contribute_height(self) -> None:
         code = "def demo():\n" + "\n".join("    print('hello world')" for _ in range(30))
@@ -411,11 +470,14 @@ class ChatFoundationTests(unittest.TestCase):
         window._set_model_selector([DEFAULT_MODEL_NAME, "other:1"])
         window.model_selector.setCurrentText("other:1")
         self.assertEqual(window.active_model, "other:1")
+        self.assertEqual(window.toolbar_model_selector.currentText(), "other:1")
         window._set_controls_generating(True)
         self.assertTrue(window.model_selector.isVisible())
         self.assertFalse(window.model_selector.isEnabled())
+        self.assertFalse(window.toolbar_model_selector.isEnabled())
         window._set_controls_generating(False)
         self.assertTrue(window.model_selector.isEnabled())
+        self.assertTrue(window.toolbar_model_selector.isEnabled())
         window.close()
 
 

@@ -242,7 +242,7 @@ class ChatSidebar(QFrame):
         self.list_widget = QWidget()
         self.list_widget.setObjectName("sidebarList")
         self.list_layout = QVBoxLayout(self.list_widget)
-        self.list_layout.setContentsMargins(8, 4, 8, 0)
+        self.list_layout.setContentsMargins(0, 4, 0, 0)
         self.list_layout.setSpacing(3)
         self.list_layout.addStretch(1)
         self.scroll_area.setWidget(self.list_widget)
@@ -287,6 +287,19 @@ class ChatSidebar(QFrame):
         width = self.EXPANDED_WIDTH if expanded else self.COLLAPSED_WIDTH
         self.setMinimumWidth(width)
         self.setMaximumWidth(width)
+        self._sync_list_width()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._sync_list_width()
+
+    def _sync_list_width(self) -> None:
+        if not hasattr(self, "scroll_area"):
+            return
+        margins = self.root_layout.contentsMargins()
+        content_width = max(1, self.width() - margins.left() - margins.right())
+        self.list_widget.setMinimumWidth(content_width)
+        self.list_widget.setMaximumWidth(content_width)
 
     def set_generating(self, generating: bool) -> None:
         self.new_chat_button.setEnabled(not generating)
@@ -320,3 +333,4 @@ class ChatSidebar(QFrame):
                 row.rename_requested.connect(self.rename_requested.emit)
                 row.delete_requested.connect(self.delete_requested.emit)
                 self.list_layout.insertWidget(self.list_layout.count() - 1, row)
+        self._sync_list_width()
