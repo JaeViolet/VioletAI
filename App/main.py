@@ -145,6 +145,8 @@ class MainWindow(QMainWindow):
         input_outer.addStretch()
 
         self.composer = QFrame(objectName="composer")
+        self.composer.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.composer.setFrameShape(QFrame.Shape.NoFrame)
         self.composer.setMaximumWidth(self.CONTENT_MAX_WIDTH)
         self.composer_layout = QVBoxLayout(self.composer)
         self.composer_layout.setContentsMargins(12, 4, 6, 4)
@@ -168,33 +170,31 @@ class MainWindow(QMainWindow):
         self.toolbar_tools_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.toolbar_tools_button.setMenu(self._build_tools_menu())
         self.model_selector = QComboBox(objectName="modelSelector")
-        self.model_selector.setToolTip("Select local Ollama model")
-        self.model_selector.view().setMinimumWidth(190)
+        self._configure_model_selector(self.model_selector)
         self.model_selector.currentTextChanged.connect(self._model_changed)
         self.toolbar_model_selector = QComboBox(objectName="modelSelector")
-        self.toolbar_model_selector.setToolTip("Select local Ollama model")
-        self.toolbar_model_selector.view().setMinimumWidth(190)
+        self._configure_model_selector(self.toolbar_model_selector)
         self.toolbar_model_selector.currentTextChanged.connect(self._model_changed)
         self.send_button = QToolButton(objectName="sendButton")
         self.send_button.setToolTip("Send message")
-        self.send_button.setIcon(icon("send", "white", 20))
-        self.send_button.setIconSize(QSize(20, 20))
+        self.send_button.setIcon(icon("send", "white", 21))
+        self.send_button.setIconSize(QSize(21, 21))
         self.send_button.clicked.connect(self.send_message)
         self.toolbar_send_button = QToolButton(objectName="sendButton")
         self.toolbar_send_button.setToolTip("Send message")
-        self.toolbar_send_button.setIcon(icon("send", "white", 20))
-        self.toolbar_send_button.setIconSize(QSize(20, 20))
+        self.toolbar_send_button.setIcon(icon("send", "white", 21))
+        self.toolbar_send_button.setIconSize(QSize(21, 21))
         self.toolbar_send_button.clicked.connect(self.send_message)
         self.stop_button = QToolButton(objectName="sendButton")
         self.stop_button.setToolTip("Stop generating")
-        self.stop_button.setIcon(icon("stop", "white", 20))
-        self.stop_button.setIconSize(QSize(20, 20))
+        self.stop_button.setIcon(icon("stop", "white", 21))
+        self.stop_button.setIconSize(QSize(21, 21))
         self.stop_button.clicked.connect(self.stop_generation)
         self.stop_button.hide()
         self.toolbar_stop_button = QToolButton(objectName="sendButton")
         self.toolbar_stop_button.setToolTip("Stop generating")
-        self.toolbar_stop_button.setIcon(icon("stop", "white", 20))
-        self.toolbar_stop_button.setIconSize(QSize(20, 20))
+        self.toolbar_stop_button.setIcon(icon("stop", "white", 21))
+        self.toolbar_stop_button.setIconSize(QSize(21, 21))
         self.toolbar_stop_button.clicked.connect(self.stop_generation)
         self.toolbar_stop_button.hide()
 
@@ -238,6 +238,15 @@ class MainWindow(QMainWindow):
         self.search_overlay = SearchOverlay(self.chat_panel)
         self.search_overlay.selected.connect(self._select_from_search)
         self.search_overlay.search_changed.connect(self._rebuild_search_results)
+
+    def _configure_model_selector(self, selector: QComboBox) -> None:
+        selector.setToolTip("Select local Ollama model")
+        selector.setMinimumContentsLength(9)
+        selector.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        selector.setFixedHeight(30)
+        selector.setMinimumWidth(112)
+        selector.setMaximumWidth(140)
+        selector.view().setMinimumWidth(190)
 
     def _build_tools_menu(self) -> QMenu:
         menu = QMenu(self)
@@ -285,6 +294,10 @@ class MainWindow(QMainWindow):
         finally:
             self._updating_composer_mode = False
 
+    def _set_visible_if_needed(self, widget: QWidget, visible: bool) -> None:
+        if widget.isVisible() != visible:
+            widget.setVisible(visible)
+
     def _schedule_composer_mode_update(self) -> None:
         if hasattr(self, "_composer_mode_timer") and not self._composer_mode_timer.isActive():
             self._composer_mode_timer.start(0)
@@ -299,17 +312,19 @@ class MainWindow(QMainWindow):
             self.input_box.setTextCursor(cursor)
             self.input_box.setFocus()
         else:
-            self.toolbar_widget.setVisible(multiline)
-            self.toolbar_widget.setMaximumHeight(16_777_215 if multiline else 0)
-            self.tools_button.setVisible(not multiline)
-            self.model_selector.setVisible(not multiline)
-            self.toolbar_tools_button.setVisible(multiline)
-            self.toolbar_model_selector.setVisible(multiline)
+            target_toolbar_height = 16_777_215 if multiline else 0
+            if self.toolbar_widget.maximumHeight() != target_toolbar_height:
+                self.toolbar_widget.setMaximumHeight(target_toolbar_height)
+            self._set_visible_if_needed(self.toolbar_widget, multiline)
+            self._set_visible_if_needed(self.tools_button, not multiline)
+            self._set_visible_if_needed(self.model_selector, not multiline)
+            self._set_visible_if_needed(self.toolbar_tools_button, multiline)
+            self._set_visible_if_needed(self.toolbar_model_selector, multiline)
             if self.thread is None:
-                self.send_button.setVisible(not multiline)
-                self.toolbar_send_button.setVisible(multiline)
-                self.stop_button.hide()
-                self.toolbar_stop_button.hide()
+                self._set_visible_if_needed(self.send_button, not multiline)
+                self._set_visible_if_needed(self.toolbar_send_button, multiline)
+                self._set_visible_if_needed(self.stop_button, False)
+                self._set_visible_if_needed(self.toolbar_stop_button, False)
 
     def _make_welcome(self) -> QWidget:
         welcome = QWidget(objectName="welcome")

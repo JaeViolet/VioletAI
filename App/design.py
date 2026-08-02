@@ -55,7 +55,8 @@ def icon(name: str, color: str = Colors.TEXT, size: int = ICON_SIZE) -> QIcon:
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    pen = QPen(QColor(color), 1.7)
+    stroke = max(1.45, size * 0.085)
+    pen = QPen(QColor(color), stroke)
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
     painter.setPen(pen)
@@ -75,12 +76,17 @@ def icon(name: str, color: str = Colors.TEXT, size: int = ICON_SIZE) -> QIcon:
         painter.drawLine(7, 4, 13, center.y())
         painter.drawLine(13, center.y(), 7, size - 4)
     elif name == "copy":
-        painter.drawRoundedRect(QRectF(6, 4, 8, 10), 2, 2)
-        painter.drawRoundedRect(QRectF(3, 7, 8, 8), 2, 2)
+        back = QRectF(size * 0.39, size * 0.22, size * 0.42, size * 0.52)
+        front = QRectF(size * 0.20, size * 0.38, size * 0.42, size * 0.52)
+        radius = size * 0.10
+        painter.drawRoundedRect(back, radius, radius)
+        painter.drawRoundedRect(front, radius, radius)
     elif name == "regen":
-        painter.drawArc(rect, 30 * 16, 285 * 16)
-        painter.drawLine(13, 4, 15, 8)
-        painter.drawLine(13, 4, 9, 5)
+        arc_rect = QRectF(size * 0.20, size * 0.20, size * 0.60, size * 0.60)
+        painter.drawArc(arc_rect, 35 * 16, 285 * 16)
+        tip = QPointF(size * 0.79, size * 0.31)
+        painter.drawLine(tip, QPointF(size * 0.80, size * 0.52))
+        painter.drawLine(tip, QPointF(size * 0.60, size * 0.35))
     elif name == "pin":
         painter.drawLine(8, 3, 13, 8)
         painter.drawLine(5, 9, 9, 13)
@@ -97,12 +103,18 @@ def icon(name: str, color: str = Colors.TEXT, size: int = ICON_SIZE) -> QIcon:
         painter.drawLine(11, 8, 11, 14)
         painter.drawRoundedRect(QRectF(6, 6, 6, 10), 1, 1)
     elif name == "send":
-        painter.drawLine(center.x(), 14, center.x(), 5)
-        painter.drawLine(center.x(), 5, 5, 10)
-        painter.drawLine(center.x(), 5, 13, 10)
+        painter.drawLine(center.x(), size * 0.74, center.x(), size * 0.29)
+        painter.drawLine(center.x(), size * 0.29, size * 0.30, size * 0.49)
+        painter.drawLine(center.x(), size * 0.29, size * 0.70, size * 0.49)
     elif name == "stop":
+        painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(color))
-        painter.drawRoundedRect(QRectF(5, 5, 8, 8), 2, 2)
+        radius = size * 0.06
+        painter.drawRoundedRect(
+            QRectF(size * 0.34, size * 0.34, size * 0.32, size * 0.32),
+            radius,
+            radius,
+        )
     elif name == "close":
         painter.drawLine(5, 5, 13, 13)
         painter.drawLine(13, 5, 5, 13)
@@ -218,7 +230,13 @@ def app_stylesheet() -> str:
         #toolsButton::menu-indicator {{ image: none; width: 0px; }}
         #modelSelector {{
             background: transparent; color: {Colors.TEXT_MUTED}; border: none;
-            padding: 3px 4px; min-height: 28px; font-size: 13px;
+            padding: 3px 8px 3px 4px; min-height: 24px; max-height: 24px; font-size: 13px;
+        }}
+        #modelSelector::drop-down {{
+            width: 16px; border: none;
+        }}
+        #modelSelector::down-arrow {{
+            width: 7px; height: 7px;
         }}
         #modelSelector QAbstractItemView {{
             background: {Colors.COMPOSER}; color: {Colors.TEXT};
@@ -235,7 +253,7 @@ def app_stylesheet() -> str:
         #modelSelector:disabled {{ color: {Colors.TEXT_FAINT}; }}
         #sendButton {{
             background: {Colors.ACCENT}; color: white; border: none;
-            border-radius: 18px; min-width: 36px; min-height: 36px; max-width: 36px; max-height: 36px;
+            border-radius: 19px; min-width: 38px; min-height: 38px; max-width: 38px; max-height: 38px;
             margin-right: 0px;
         }}
         #sendButton:hover {{ background: {Colors.ACCENT_HOVER}; }}

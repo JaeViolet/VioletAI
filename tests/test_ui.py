@@ -14,10 +14,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtGui import QKeyEvent  # noqa: E402
-from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QToolButton, QWidget  # noqa: E402
+from PySide6.QtWidgets import QApplication, QFrame, QLabel, QMessageBox, QToolButton, QWidget  # noqa: E402
 
 from config import DEFAULT_MODEL_NAME, SYSTEM_PROMPT  # noqa: E402
 from conversation_store import ConversationStore  # noqa: E402
+from design import icon  # noqa: E402
 from main import MainWindow  # noqa: E402
 from ollama_client import InvalidStreamError, OllamaWorker, discover_models, iter_message_chunks  # noqa: E402
 from sidebar import ChatSidebar  # noqa: E402
@@ -374,13 +375,56 @@ class ChatFoundationTests(unittest.TestCase):
     def test_send_and_stop_buttons_have_identical_larger_geometry(self) -> None:
         window, _temp_dir = self._window_with_temp_store()
         window.show()
-        self.assertEqual(window.send_button.minimumWidth(), 36)
-        self.assertEqual(window.send_button.minimumHeight(), 36)
+        self.assertEqual(window.send_button.minimumWidth(), 38)
+        self.assertEqual(window.send_button.minimumHeight(), 38)
         self.assertEqual(window.stop_button.minimumWidth(), window.send_button.minimumWidth())
         self.assertEqual(window.stop_button.minimumHeight(), window.send_button.minimumHeight())
         self.assertEqual(window.toolbar_send_button.minimumWidth(), window.send_button.minimumWidth())
         self.assertEqual(window.toolbar_stop_button.minimumHeight(), window.send_button.minimumHeight())
         window.close()
+
+    def test_model_selectors_keep_consistent_geometry_across_composer_modes(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        window._set_model_selector([DEFAULT_MODEL_NAME, "qwen3.5:9b"])
+        compact_metrics = (
+            window.model_selector.minimumWidth(),
+            window.model_selector.maximumWidth(),
+            window.model_selector.height(),
+            window.model_selector.font().pointSize(),
+        )
+        window.input_box.setPlainText("line one\nline two\nline three")
+        self.app.processEvents()
+        window._update_composer_mode()
+        expanded_metrics = (
+            window.toolbar_model_selector.minimumWidth(),
+            window.toolbar_model_selector.maximumWidth(),
+            window.toolbar_model_selector.height(),
+            window.toolbar_model_selector.font().pointSize(),
+        )
+        self.assertEqual(compact_metrics, expanded_metrics)
+        window.close()
+
+    def test_composer_keeps_pill_radius_and_styled_background(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        self.assertTrue(window.composer.testAttribute(Qt.WidgetAttribute.WA_StyledBackground))
+        self.assertEqual(window.composer.frameShape(), QFrame.Shape.NoFrame)
+        self.assertIn("border-radius: 28px", window.styleSheet())
+        window.input_box.setPlainText("one\ntwo\nthree\nfour")
+        self.app.processEvents()
+        window._update_composer_mode()
+        self.assertTrue(window.composer.testAttribute(Qt.WidgetAttribute.WA_StyledBackground))
+        self.assertIn("border-radius: 28px", window.styleSheet())
+        window.close()
+
+    def test_vector_icons_render_at_multiple_sizes(self) -> None:
+        for name in ("copy", "regen", "send", "stop"):
+            for size in (16, 18, 21, 28):
+                rendered = icon(name, "white", size)
+                self.assertFalse(rendered.isNull())
+                pixmap = rendered.pixmap(size, size)
+                self.assertFalse(pixmap.isNull(), f"{name} at {size}px did not render")
 
     def test_code_blocks_have_no_internal_scrollbars_and_contribute_height(self) -> None:
         code = "def demo():\n" + "\n".join("    print('hello world')" for _ in range(30))

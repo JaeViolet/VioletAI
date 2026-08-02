@@ -48,6 +48,7 @@ class AutoGrowingInput(QTextEdit):
         self._history_index: int | None = None
         self._draft_before_history = ""
         self._updating_height = False
+        self._last_desired_height = 0
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.document().documentLayout().documentSizeChanged.connect(
@@ -78,15 +79,14 @@ class AutoGrowingInput(QTextEdit):
             block_height = self.document().blockCount() * line_height + frame + 10
             desired = int(max(document_height + frame + 8, block_height))
         height = max(self.MIN_HEIGHT, min(desired, self.MAX_HEIGHT))
-        old_height = self.height()
         try:
-            self.setFixedHeight(height)
             policy = (
                 Qt.ScrollBarPolicy.ScrollBarAsNeeded
                 if desired > self.MAX_HEIGHT
                 else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
             )
-            self.setVerticalScrollBarPolicy(policy)
+            if self.verticalScrollBarPolicy() != policy:
+                self.setVerticalScrollBarPolicy(policy)
             single_line_height = line_height
             is_single_visual_line = (
                 self.document().blockCount() <= 1
@@ -95,8 +95,9 @@ class AutoGrowingInput(QTextEdit):
             document_margin = int(max(0, (height - single_line_height - frame) / 2)) if is_single_visual_line else 4
             if int(self.document().documentMargin()) != document_margin:
                 self.document().setDocumentMargin(document_margin)
-            self.viewport().update()
-            if old_height != height:
+            if self._last_desired_height != height:
+                self._last_desired_height = height
+                self.setFixedHeight(height)
                 self.height_changed.emit(height)
         finally:
             self._updating_height = False
