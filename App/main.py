@@ -415,7 +415,7 @@ class MainWindow(QMainWindow):
             and self.search_overlay.isVisible()
         ):
             if event.type() == QEvent.Type.MouseButtonPress:
-                if not self.search_overlay.geometry().contains(event.pos()):
+                if not self.search_overlay.geometry().contains(event.position().toPoint()):
                     self.search_overlay.close_overlay()
             if event.type() == QEvent.Type.Resize:
                 QTimer.singleShot(0, self._position_search_overlay)
@@ -423,7 +423,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._resize_rows)
         if watched is self.scroll_area.viewport() and event.type() == QEvent.Type.MouseButtonPress:
             if event.button() == Qt.MouseButton.MiddleButton:
-                self._toggle_middle_scroll(event.pos())
+                self._toggle_middle_scroll(event.position().toPoint())
                 return True
             if self._middle_scroll_timer.isActive():
                 self._stop_middle_scroll()

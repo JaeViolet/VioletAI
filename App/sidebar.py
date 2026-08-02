@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QPropertyAnimation, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, QPropertyAnimation, Qt, Signal
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QFrame,
@@ -60,7 +60,7 @@ class ConversationRow(QFrame):
         pin_action = menu.addAction("Unpin" if self.conversation.pinned else "Pin")
         rename_action = menu.addAction("Rename")
         delete_action = menu.addAction("Delete")
-        selected = menu.exec(event.globalPos())
+        selected = menu.exec(QPoint(event.globalX(), event.globalY()))
         if selected == pin_action:
             self.pin_requested.emit(self.conversation.id, not self.conversation.pinned)
         elif selected == rename_action:
