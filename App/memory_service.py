@@ -9,6 +9,12 @@ from datetime import UTC, datetime, timedelta
 from memory_models import MemoryRecord, ParsedMemory
 from memory_store import MemoryStore, normalize_key
 
+NO_MATCH = "NO_MATCH"
+MULTIPLE_MATCHES = "MULTIPLE_MATCHES"
+INVALID_REFERENCE = "INVALID_REFERENCE"
+WRITE_FAILED = "WRITE_FAILED"
+INVALID_MEMORY_REQUEST = "INVALID_MEMORY_REQUEST"
+
 REMEMBER_PREFIXES = (
     "remember that",
     "remember this",
@@ -16,15 +22,58 @@ REMEMBER_PREFIXES = (
     "dont forget that",
     "save this to memory",
     "add this to memory",
+    "add this to your memory",
     "please remember",
+    "save that",
+    "save this",
+    "save",
+    "store that",
+    "store this",
+    "store",
+    "note that",
+    "keep in mind",
+    "create a memory",
 )
-FORGET_PREFIXES = ("forget that", "forget my", "forget everything you know about", "delete the memory about")
+CONTEXTUAL_REMEMBER_COMMANDS = (
+    "remember that",
+    "remember this",
+    "save that",
+    "save this",
+    "store that",
+    "store this",
+)
+FORGET_PREFIXES = (
+    "forget that",
+    "forget my",
+    "forget everything you know about",
+    "delete the memory about",
+    "delete the memory of",
+    "remove the memory about",
+    "remove the memory of",
+    "delete",
+    "remove",
+    "erase",
+    "clear",
+)
+CONTEXTUAL_FORGET_COMMANDS = (
+    "forget that",
+    "forget this",
+    "delete that",
+    "delete this",
+    "remove that",
+    "remove this",
+    "erase that",
+    "erase this",
+    "clear that",
+    "clear this",
+)
 UPDATE_PATTERNS = (
-    re.compile(r"^(?:update|change) my (?P<key>.+?) to (?P<value>.+)$", re.IGNORECASE),
+    re.compile(r"^(?:update|change|edit) my (?P<key>.+?) to (?P<value>.+)$", re.IGNORECASE),
     re.compile(r"^my (?P<key>.+?) is now (?P<value>.+)$", re.IGNORECASE),
-    re.compile(r"^replace my saved (?P<key>.+?) with (?P<value>.+)$", re.IGNORECASE),
+    re.compile(r"^(?:replace|edit) my saved (?P<key>.+?) with (?P<value>.+)$", re.IGNORECASE),
+    re.compile(r"^replace my (?P<key>.+?) with (?P<value>.+)$", re.IGNORECASE),
     re.compile(
-        r"^in your memory it says my (?P<key>.+?) is (?P<old>.+?);?\s*change it to (?P<value>.+)$",
+        r"^in your memory it says (?:(?:my )?(?P<key>.+?) is |)(?P<old>.+?)[;,]?\s*change it to (?P<value>.+)$",
         re.IGNORECASE,
     ),
 )
@@ -40,6 +89,7 @@ AMBIGUOUS_REFERENCES = re.compile(r"\b(it|this|that|they|them)\b", re.IGNORECASE
 class MemoryActionResult:
     handled: bool
     response: str = ""
+    error_code: str | None = None
     remembered: bool = False
     updated: bool = False
     removed: bool = False
@@ -57,6 +107,7 @@ class MemoryService:
         text: str,
         conversation_id: str,
         source_message_id: str | None,
+        previous_user_text: str | None = None,
     ) -> MemoryActionResult:
         lowered = text.casefold().strip()
         if any(pattern in lowered for pattern in MEMORY_QUERY_PATTERNS):
@@ -70,14 +121,31 @@ class MemoryService:
 
         remember_body = self._strip_prefix(text, REMEMBER_PREFIXES)
         if remember_body is not None:
+            if self._is_contextual_command(text, CONTEXTUAL_REMEMBER_COMMANDS):
+                if not self._suitable_reference(previous_user_text):
+                    return MemoryActionResult(
+                        True,
+                        "I couldn't save that because 'that' doesn't refer to a previous user statement. Try:\nRemember that I'm from Montreal.",
+                        error_code=INVALID_REFERENCE,
+                        clarification_needed=True,
+                    )
+                remember_body = previous_user_text or ""
             parsed = self.parse_memory(remember_body)
             if parsed is None:
                 return MemoryActionResult(
                     True,
-                    "What should I remember specifically?",
+                    "I couldn't save that because the memory request was not specific enough.",
+                    error_code=INVALID_MEMORY_REQUEST,
                     clarification_needed=True,
                 )
-            memory = self.remember(parsed, conversation_id, source_message_id, text)
+            try:
+                memory = self.remember(parsed, conversation_id, source_message_id, text)
+            except Exception as error:
+                return MemoryActionResult(
+                    True,
+                    f"I couldn't save that memory: {error}",
+                    error_code=WRITE_FAILED,
+                )
             return MemoryActionResult(
                 True,
                 f"I'll remember that {memory.key} is {memory.value}.",
@@ -91,15 +159,42 @@ class MemoryService:
 
         forget_query = self._strip_prefix(text, FORGET_PREFIXES)
         if forget_query is not None:
+            if self._is_contextual_command(text, CONTEXTUAL_FORGET_COMMANDS):
+                if not self._suitable_reference(previous_user_text):
+                    return MemoryActionResult(
+                        True,
+                        "I couldn't remove that because 'that' doesn't refer to a previous user statement.",
+                        error_code=INVALID_REFERENCE,
+                        clarification_needed=True,
+                    )
+                forget_query = previous_user_text or ""
             matches = self.find_forget_matches(forget_query)
             if not matches:
-                return MemoryActionResult(True, "I could not find a matching memory to remove.")
+                return MemoryActionResult(
+                    True,
+                    f"I couldn't find a saved memory matching '{forget_query}'.",
+                    error_code=NO_MATCH,
+                )
             if len(matches) > 1 and not self._looks_specific(forget_query):
                 lines = ["I found multiple matching memories. Which one should I remove?"]
                 lines.extend(f"- {memory.key}: {memory.value}" for memory in matches[:5])
-                return MemoryActionResult(True, "\n".join(lines), memories=matches)
-            for memory in matches:
-                self.store.archive(memory.id)
+                return MemoryActionResult(
+                    True,
+                    "\n".join(lines),
+                    error_code=MULTIPLE_MATCHES,
+                    clarification_needed=True,
+                    memories=matches,
+                )
+            try:
+                for memory in matches:
+                    self.store.archive(memory.id)
+            except Exception as error:
+                return MemoryActionResult(
+                    True,
+                    f"I couldn't remove that memory: {error}",
+                    error_code=WRITE_FAILED,
+                    memories=matches,
+                )
             return MemoryActionResult(True, "Memory removed.", removed=True, memories=matches)
 
         return MemoryActionResult(False)
@@ -115,17 +210,32 @@ class MemoryService:
             match = pattern.match(cleaned)
             if not match:
                 continue
-            key = match.group("key").strip()
+            key = (match.groupdict().get("key") or match.groupdict().get("old") or "").strip()
             value = match.group("value").strip()
             if not key or not value:
-                return MemoryActionResult(True, "What memory should I update?", clarification_needed=True)
+                return MemoryActionResult(
+                    True,
+                    "What memory should I update?",
+                    error_code=INVALID_MEMORY_REQUEST,
+                    clarification_needed=True,
+                )
             matches = self.find_update_matches(key)
             if not matches:
-                return MemoryActionResult(True, f"I could not find a saved memory for {key}.")
+                return MemoryActionResult(
+                    True,
+                    f"I couldn't find a saved memory matching '{key}'.",
+                    error_code=NO_MATCH,
+                )
             if len(matches) > 1:
                 lines = ["I found multiple matching memories. Which one should I update?"]
                 lines.extend(f"- {memory.category} / {memory.key}: {memory.value}" for memory in matches[:5])
-                return MemoryActionResult(True, "\n".join(lines), clarification_needed=True, memories=matches)
+                return MemoryActionResult(
+                    True,
+                    "\n".join(lines),
+                    error_code=MULTIPLE_MATCHES,
+                    clarification_needed=True,
+                    memories=matches,
+                )
             existing = matches[0]
             parsed = ParsedMemory(
                 category=existing.category,
@@ -134,7 +244,15 @@ class MemoryService:
                 value=value,
                 content=f"{existing.key} is {value}",
             )
-            memory = self.remember(parsed, conversation_id, source_message_id, text)
+            try:
+                memory = self.remember(parsed, conversation_id, source_message_id, text)
+            except Exception as error:
+                return MemoryActionResult(
+                    True,
+                    f"I couldn't update that memory: {error}",
+                    error_code=WRITE_FAILED,
+                    memories=[existing],
+                )
             return MemoryActionResult(
                 True,
                 f"Memory updated: {memory.key} is {memory.value}.",
@@ -143,6 +261,25 @@ class MemoryService:
                 memories=[memory],
             )
         return MemoryActionResult(False)
+
+    def _is_contextual_command(self, text: str, commands: tuple[str, ...]) -> bool:
+        cleaned = text.casefold().strip(" .!?:;")
+        return cleaned in commands
+
+    def _suitable_reference(self, previous_user_text: str | None) -> bool:
+        if not previous_user_text or not previous_user_text.strip():
+            return False
+        previous = previous_user_text.strip()
+        if self._is_contextual_command(previous, CONTEXTUAL_REMEMBER_COMMANDS + CONTEXTUAL_FORGET_COMMANDS):
+            return False
+        lowered = previous.casefold()
+        if any(pattern in lowered for pattern in MEMORY_QUERY_PATTERNS):
+            return False
+        if self._strip_prefix(previous, REMEMBER_PREFIXES) is not None:
+            return False
+        if self._strip_prefix(previous, FORGET_PREFIXES) is not None:
+            return False
+        return not any(pattern.match(" ".join(previous.strip().strip(".").split())) for pattern in UPDATE_PATTERNS)
 
     def _strip_prefix(self, text: str, prefixes: tuple[str, ...]) -> str | None:
         normalized = text.strip()
@@ -173,7 +310,10 @@ class MemoryService:
 
         patterns = [
             (r"^my (?P<key>.+?) is (?P<value>.+)$", "User"),
+            (r"^i am from (?P<value>.+)$", "User"),
+            (r"^i'?m from (?P<value>.+)$", "User"),
             (r"^i am (?P<value>.+)$", "User"),
+            (r"^i'?m (?P<value>.+)$", "User"),
             (r"^i live in (?P<value>.+)$", "User"),
             (r"^i like (?P<value>.+)$", "Preferences"),
             (r"^i prefer (?P<value>.+)$", "Preferences"),
@@ -191,13 +331,13 @@ class MemoryService:
                     subject = f"project {key}"
                     key = "description"
             else:
-                if cleaned.casefold().startswith("i live in"):
+                if cleaned.casefold().startswith(("i live in", "i'm from", "im from")):
                     key = "location"
                 elif cleaned.casefold().startswith("i like") or cleaned.casefold().startswith("i prefer"):
                     key = "preference"
                 else:
                     key = "identity"
-            value = groups["value"].strip()
+            value = groups["value"].strip(" .")
             break
 
         if key == "note":
@@ -205,7 +345,7 @@ class MemoryService:
             if possessive:
                 category = "User"
                 key = possessive.group("key").strip()
-                value = possessive.group("value").strip()
+                value = possessive.group("value").strip(" .")
 
         if not value:
             return None
@@ -215,7 +355,7 @@ class MemoryService:
             category=category,
             subject=subject,
             key=key.strip().casefold(),
-            value=value.strip(),
+            value=value.strip(" ."),
             content=cleaned,
             expires_at=expires_at,
         )

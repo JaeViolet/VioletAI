@@ -23,7 +23,13 @@ import design  # noqa: E402
 from design import Colors, PNG_CONTROL_ICON_SIZE, asset_icon_path, icon  # noqa: E402
 from main import MainWindow  # noqa: E402
 from memory_models import CATEGORIES, ParsedMemory  # noqa: E402
-from memory_service import MemoryService  # noqa: E402
+from memory_service import (  # noqa: E402
+    INVALID_REFERENCE,
+    MULTIPLE_MATCHES,
+    NO_MATCH,
+    WRITE_FAILED,
+    MemoryService,
+)
 from memory_store import MemoryStore, MemoryStoreError, normalize_category, normalize_key  # noqa: E402
 from ollama_client import InvalidStreamError, OllamaWorker, discover_models, iter_message_chunks  # noqa: E402
 from prompts import build_ollama_messages, format_relevant_memories  # noqa: E402
@@ -174,6 +180,25 @@ class ChatFoundationTests(unittest.TestCase):
             self.assertEqual(len(all_records), 2)
             self.assertTrue(any(not record.active for record in all_records))
 
+    def test_explicit_memory_creation_supports_natural_variations(self) -> None:
+        phrases = [
+            ("Save my favorite snack is apples.", "favorite snack", "apples", "User"),
+            ("Store project VioletAI is a local assistant.", "description", "a local assistant", "Projects"),
+            ("Note that I prefer compact UI.", "preference", "compact UI", "Preferences"),
+            ("Keep in mind my birthday is June 1.", "birthday", "June 1", "User"),
+            ("Create a memory my cat is Luna.", "cat", "Luna", "User"),
+            ("Add this to your memory: my favorite city is Montreal.", "favorite city", "Montreal", "User"),
+        ]
+        for phrase, key, value, category in phrases:
+            with self.subTest(phrase=phrase), tempfile.TemporaryDirectory() as temp_dir:
+                service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+                result = service.handle_explicit_intent(phrase, "c1", "1")
+                self.assertTrue(result.remembered)
+                self.assertIsNone(result.error_code)
+                memory = service.retrieve(key, mark_accessed=False)[0]
+                self.assertEqual(memory.value, value)
+                self.assertEqual(memory.category, category)
+
     def test_explicit_memory_update_phrases_supersede_existing_value(self) -> None:
         phrases = [
             "Update my favorite color to blue.",
@@ -181,6 +206,8 @@ class ChatFoundationTests(unittest.TestCase):
             "My favorite color is now blue.",
             "In your memory it says my favorite color is purple; change it to blue.",
             "Replace my saved favorite color with blue.",
+            "Edit my favorite color to blue.",
+            "Replace my favorite color with blue.",
         ]
         for phrase in phrases:
             with self.subTest(phrase=phrase), tempfile.TemporaryDirectory() as temp_dir:
@@ -207,6 +234,81 @@ class ChatFoundationTests(unittest.TestCase):
             unicode_update = service.handle_explicit_intent("Update my favorite color to blå.", "c1", "5")
             self.assertTrue(unicode_update.updated)
             self.assertEqual(service.retrieve("favorite color", mark_accessed=False)[0].value, "blå")
+
+    def test_contextual_memory_creation_uses_previous_user_message(self) -> None:
+        phrases = ["Remember that.", "Save that.", "Store that."]
+        for phrase in phrases:
+            with self.subTest(phrase=phrase), tempfile.TemporaryDirectory() as temp_dir:
+                service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+                result = service.handle_explicit_intent(
+                    phrase,
+                    "c1",
+                    "2",
+                    previous_user_text="I'm from Montreal.",
+                )
+                self.assertTrue(result.remembered)
+                memory = service.retrieve("where am I from", mark_accessed=False)[0]
+                self.assertEqual(memory.key, "location")
+                self.assertEqual(memory.value, "Montreal")
+                self.assertEqual(memory.category, "User")
+
+    def test_contextual_memory_creation_without_previous_user_message_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+            result = service.handle_explicit_intent("Remember that.", "c1", "1")
+            self.assertTrue(result.handled)
+            self.assertFalse(result.remembered)
+            self.assertEqual(result.error_code, INVALID_REFERENCE)
+            self.assertEqual(service.store.list_memories(), [])
+
+    def test_contextual_forget_uses_previous_user_message(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+            service.handle_explicit_intent("Remember that my favorite movie is Interstellar.", "c1", "1")
+            result = service.handle_explicit_intent(
+                "Forget that.",
+                "c1",
+                "3",
+                previous_user_text="My favorite movie is Interstellar.",
+            )
+            self.assertTrue(result.removed)
+            self.assertIsNone(result.error_code)
+            self.assertEqual(service.retrieve("favorite movie", mark_accessed=False), [])
+
+    def test_delete_and_remove_memory_phrases_return_structured_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+            service.handle_explicit_intent("Remember that my favorite color is purple.", "c1", "1")
+            delete_result = service.handle_explicit_intent("Delete the memory of favorite color.", "c1", "2")
+            self.assertTrue(delete_result.removed)
+            self.assertEqual(service.retrieve("favorite color", mark_accessed=False), [])
+
+            missing = service.handle_explicit_intent("Remove the memory about favorite color.", "c1", "3")
+            self.assertFalse(missing.removed)
+            self.assertEqual(missing.error_code, NO_MATCH)
+            self.assertIn("favorite color", missing.response)
+
+    def test_multiple_matching_update_returns_structured_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+            service.handle_explicit_intent("Remember that my favorite color is purple.", "c1", "1")
+            service.handle_explicit_intent("Remember that my favorite color backup is violet.", "c1", "2")
+            result = service.handle_explicit_intent("Change my favorite color to green.", "c1", "3")
+            self.assertFalse(result.updated)
+            self.assertEqual(result.error_code, MULTIPLE_MATCHES)
+            self.assertTrue(result.clarification_needed)
+
+    def test_failed_memory_write_does_not_claim_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = MemoryStore(Path(temp_dir) / "memory.db")
+            service = MemoryService(store)
+            with patch.object(store, "add_memory", side_effect=RuntimeError("disk is read-only")):
+                result = service.handle_explicit_intent("Remember that my favorite color is purple.", "c1", "1")
+            self.assertTrue(result.handled)
+            self.assertFalse(result.remembered)
+            self.assertEqual(result.error_code, WRITE_FAILED)
+            self.assertIn("disk is read-only", result.response)
+            self.assertEqual(store.list_memories(), [])
 
     def test_profile_category_migrates_to_user_without_data_loss(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -567,6 +669,34 @@ class ChatFoundationTests(unittest.TestCase):
         labels = [label.text() for label in window.findChildren(QLabel)]
         self.assertIn("✓ Remembered", labels)
         self.assertEqual(window.memory_service.retrieve("favorite color", mark_accessed=False)[0].value, "purple")
+        window.close()
+
+    def test_contextual_memory_command_uses_previous_user_message_in_window(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        with patch.object(window, "_start_generation"):
+            window.input_box.setPlainText("I'm from Montreal.")
+            window.send_message()
+        with patch.object(window, "_start_generation") as generation:
+            window.input_box.setPlainText("Remember that.")
+            window.send_message()
+        generation.assert_not_called()
+        memory = window.memory_service.retrieve("where am I from", mark_accessed=False)[0]
+        self.assertEqual(memory.value, "Montreal")
+        labels = [label.text() for label in window.findChildren(QLabel)]
+        self.assertIn("✓ Remembered", labels)
+        window.close()
+
+    def test_failed_memory_write_does_not_show_remembered_confirmation(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        with patch.object(window.memory_store, "add_memory", side_effect=RuntimeError("disk is read-only")):
+            with patch.object(window, "_start_generation") as generation:
+                window.input_box.setPlainText("Remember that my favorite color is purple.")
+                window.send_message()
+        generation.assert_not_called()
+        labels = [label.text() for label in window.findChildren(QLabel)]
+        self.assertNotIn("✓ Remembered", labels)
+        self.assertIn("disk is read-only", window.messages[-1]["content"])
+        self.assertEqual(window.memory_store.list_memories(), [])
         window.close()
 
     def test_settings_overlay_memory_manager_search_edit_delete(self) -> None:

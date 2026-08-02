@@ -745,6 +745,10 @@ class MainWindow(QMainWindow):
         message = self.input_box.toPlainText().strip()
         if not message or self.thread is not None:
             return
+        previous_user_text = next(
+            (item.get("content", "") for item in reversed(self.messages) if item.get("role") == "user"),
+            None,
+        )
         self.input_box.remember_prompt(message)
         source_message_id = str(len(self.messages))
         self._add_message(message, "user", len(self.messages))
@@ -758,6 +762,7 @@ class MainWindow(QMainWindow):
             message,
             self.conversation.id,
             source_message_id,
+            previous_user_text,
         )
         if memory_result.handled:
             bubble = self._append_assistant_direct(memory_result.response)
