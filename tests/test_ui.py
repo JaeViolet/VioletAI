@@ -156,7 +156,7 @@ class ChatFoundationTests(unittest.TestCase):
             with patch("main.ConversationStore", return_value=store), patch.object(MainWindow, "_refresh_models"):
                 window = MainWindow()
             self.assertEqual(window.messages[-1]["content"], "Restore me")
-            self.assertEqual(window.status.text(), "Ready")
+            self.assertIn("VioletAI can make mistakes", window.footer_status.text())
             self.assertTrue(window.send_button.isEnabled())
             window.close()
 
@@ -211,6 +211,38 @@ class ChatFoundationTests(unittest.TestCase):
             store.save(conversation)
             sidebar.rebuild(store.grouped("find"), conversation.id)
             self.assertGreater(sidebar.list_layout.count(), 1)
+
+    def test_empty_chats_are_not_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ConversationStore(Path(temp_dir))
+            conversation = store.create(SYSTEM_PROMPT)
+            store.save(conversation)
+            self.assertEqual(store.list_conversations(), [])
+
+    def test_pinned_conversations_group_first(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ConversationStore(Path(temp_dir))
+            conversation = store.create(SYSTEM_PROMPT)
+            conversation.messages.append({"role": "user", "content": "Pin me"})
+            store.save(conversation)
+            store.set_pinned(conversation.id, True)
+            groups = store.grouped()
+            self.assertEqual(groups["Pinned"][0].id, conversation.id)
+
+    def test_sidebar_collapses_to_icon_rail(self) -> None:
+        sidebar = ChatSidebar()
+        sidebar.set_expanded(False)
+        self.assertEqual(sidebar.minimumWidth(), sidebar.COLLAPSED_WIDTH)
+        self.assertFalse(sidebar.brand_label.isVisible())
+
+    def test_search_overlay_filters_and_closes(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        window.open_search_overlay()
+        self.assertTrue(window.search_overlay.isVisible())
+        window.search_overlay.close_overlay()
+        self.assertFalse(window.search_overlay.isVisible())
+        window.close()
 
     @patch("ollama_client.requests.post")
     def test_ollama_worker_combines_streamed_chunks(self, post: Mock) -> None:

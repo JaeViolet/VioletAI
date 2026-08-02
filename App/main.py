@@ -9,11 +9,12 @@ from PySide6.QtCore import (
     QEvent,
     QObject,
     QPropertyAnimation,
+    QPoint,
     QThread,
     Qt,
     QTimer,
 )
-from PySide6.QtGui import QCloseEvent, QFont, QResizeEvent
+from PySide6.QtGui import QCloseEvent, QCursor, QFont, QResizeEvent
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -23,7 +24,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QScrollArea,
-    QStyle,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -31,14 +31,15 @@ from PySide6.QtWidgets import (
 
 from config import APP_FOOTER_TEXT, APP_NAME, DEFAULT_MODEL_NAME, SYSTEM_PROMPT
 from conversation_store import Conversation, ConversationStore
+from design import app_stylesheet, icon
 from ollama_client import ModelDiscoveryWorker, OllamaWorker
 from preferences import Preferences
-from sidebar import ChatSidebar
+from sidebar import ChatSidebar, SearchOverlay
 from widgets import AutoGrowingInput, MessageActions, MessageBubble, ThinkingBubble
 
 
 class MainWindow(QMainWindow):
-    CONTENT_MAX_WIDTH = 850
+    CONTENT_MAX_WIDTH = 760
     NEAR_BOTTOM_PX = 90
 
     def __init__(self) -> None:
@@ -63,6 +64,10 @@ class MainWindow(QMainWindow):
         self._scroll_animation: QPropertyAnimation | None = None
         self._programmatic_scroll = False
         self._auto_scroll_enabled = True
+        self._middle_scroll_origin: QPoint | None = None
+        self._middle_scroll_timer = QTimer(self)
+        self._middle_scroll_timer.setInterval(16)
+        self._middle_scroll_timer.timeout.connect(self._perform_middle_scroll)
 
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
@@ -83,7 +88,6 @@ class MainWindow(QMainWindow):
         conversation = self.store.load_latest()
         if conversation is None:
             conversation = self.store.create(SYSTEM_PROMPT, self.active_model)
-            self.store.save(conversation)
         if not conversation.messages or conversation.messages[0].get("role") != "system":
             conversation.messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
         if conversation.model:
@@ -94,16 +98,18 @@ class MainWindow(QMainWindow):
 
     def _build_interface(self) -> None:
         central = QWidget(objectName="centralWidget")
+        central.installEventFilter(self)
         root = QHBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
         self.sidebar = ChatSidebar()
         self.sidebar.new_chat_requested.connect(self.new_chat)
+        self.sidebar.search_requested.connect(self.open_search_overlay)
         self.sidebar.conversation_selected.connect(self.select_conversation)
+        self.sidebar.pin_requested.connect(self.pin_conversation)
         self.sidebar.rename_requested.connect(self.rename_conversation)
         self.sidebar.delete_requested.connect(self.delete_conversation)
-        self.sidebar.search_changed.connect(lambda _text: self._rebuild_sidebar())
         root.addWidget(self.sidebar)
 
         main_panel = QFrame(objectName="mainPanel")
@@ -111,22 +117,6 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
         root.addWidget(main_panel, 1)
-
-        header = QFrame(objectName="header")
-        header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(14, 13, 22, 13)
-        header_layout.setSpacing(10)
-        self.sidebar_toggle = QToolButton(objectName="headerIconButton")
-        self.sidebar_toggle.setToolTip("Toggle sidebar")
-        self.sidebar_toggle.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarMenuButton))
-        self.sidebar_toggle.clicked.connect(self.sidebar.toggle)
-        title = QLabel(APP_NAME, objectName="title")
-        self.status = QLabel("Ready", objectName="statusBadge")
-        header_layout.addWidget(self.sidebar_toggle)
-        header_layout.addWidget(title)
-        header_layout.addStretch()
-        header_layout.addWidget(self.status)
-        main_layout.addWidget(header)
 
         self.message_container = QWidget(objectName="messageContainer")
         self.message_layout = QVBoxLayout(self.message_container)
@@ -162,11 +152,11 @@ class MainWindow(QMainWindow):
         self.model_selector.currentTextChanged.connect(self._model_changed)
         self.send_button = QToolButton(objectName="sendButton")
         self.send_button.setToolTip("Send message")
-        self.send_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp))
+        self.send_button.setIcon(icon("send", "white"))
         self.send_button.clicked.connect(self.send_message)
         self.stop_button = QToolButton(objectName="sendButton")
         self.stop_button.setToolTip("Stop generating")
-        self.stop_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop))
+        self.stop_button.setIcon(icon("stop", "white"))
         self.stop_button.clicked.connect(self.stop_generation)
         self.stop_button.hide()
 
@@ -177,16 +167,20 @@ class MainWindow(QMainWindow):
         input_outer.addWidget(self.composer, 1)
         input_outer.addStretch()
 
-        footer = QLabel(APP_FOOTER_TEXT, objectName="helperText")
-        footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.footer_status = QLabel(objectName="footerStatus")
+        self.footer_status.setText(APP_FOOTER_TEXT)
+        self.footer_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         panel_layout = QVBoxLayout()
         panel_layout.setContentsMargins(0, 0, 0, 0)
         panel_layout.setSpacing(5)
         panel_layout.addWidget(input_panel)
-        panel_layout.addWidget(footer)
+        panel_layout.addWidget(self.footer_status)
         main_layout.addLayout(panel_layout)
         main_layout.addSpacing(10)
         self.setCentralWidget(central)
+        self.search_overlay = SearchOverlay(central)
+        self.search_overlay.selected.connect(self._select_from_search)
+        self.search_overlay.search_changed.connect(self._rebuild_search_results)
 
     def _make_welcome(self) -> QWidget:
         welcome = QWidget(objectName="welcome")
@@ -227,14 +221,49 @@ class MainWindow(QMainWindow):
 
     def _rebuild_sidebar(self) -> None:
         self.sidebar.rebuild(
-            self.store.grouped(self.sidebar.search.text()),
+            self.store.grouped(),
             self.conversation.id,
         )
 
+    def open_search_overlay(self) -> None:
+        self._rebuild_search_results("")
+        self.search_overlay.show_overlay()
+
+    def _rebuild_search_results(self, query: str) -> None:
+        self.search_overlay.rebuild(self.store.search(query))
+
+    def _select_from_search(self, conversation_id: str) -> None:
+        self.search_overlay.close_overlay()
+        self.select_conversation(conversation_id)
+
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if not hasattr(self, "scroll_area"):
+            return super().eventFilter(watched, event)
+        if (
+            watched is self.centralWidget()
+            and hasattr(self, "search_overlay")
+            and self.search_overlay.isVisible()
+        ):
+            if event.type() == QEvent.Type.MouseButtonPress:
+                if not self.search_overlay.geometry().contains(event.pos()):
+                    self.search_overlay.close_overlay()
+            if event.type() == QEvent.Type.Resize:
+                QTimer.singleShot(0, self._position_search_overlay)
         if watched is self.scroll_area.viewport() and event.type() == QEvent.Type.Resize:
             QTimer.singleShot(0, self._resize_rows)
+        if watched is self.scroll_area.viewport() and event.type() == QEvent.Type.MouseButtonPress:
+            if event.button() == Qt.MouseButton.MiddleButton:
+                self._toggle_middle_scroll(event.pos())
+                return True
+            if self._middle_scroll_timer.isActive():
+                self._stop_middle_scroll()
+        if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Escape:
+            self._stop_middle_scroll()
         return super().eventFilter(watched, event)
+
+    def _position_search_overlay(self) -> None:
+        if self.search_overlay.isVisible():
+            self.search_overlay.show_overlay()
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
@@ -242,16 +271,16 @@ class MainWindow(QMainWindow):
 
     def _resize_rows(self) -> None:
         viewport_width = self.scroll_area.viewport().width()
-        available = max(280, min(self.CONTENT_MAX_WIDTH, viewport_width - 48))
+        available = max(280, min(self.CONTENT_MAX_WIDTH, viewport_width - 96))
         self.composer.setMaximumWidth(available)
         for index in range(self.message_layout.count() - 1):
             row = self.message_layout.itemAt(index).widget()
             if row and row.property("messageRow"):
                 bubble = row.property("bubble")
                 if isinstance(bubble, MessageBubble):
-                    max_width = int(available * 0.82) if bubble.role == "user" else available
+                    max_width = int(available * 0.74) if bubble.role == "user" else available
                     bubble.setMaximumWidth(max_width)
-                    bubble.setMinimumWidth(min(260, max_width))
+                    bubble.setMinimumWidth(0 if bubble.role == "user" else min(260, max_width))
                     bubble.updateGeometry()
 
     def _add_message(self, text: str, role: str, message_index: int | None = None) -> MessageBubble:
@@ -280,6 +309,29 @@ class MainWindow(QMainWindow):
         self._animate_appearance(row)
         self._resize_rows()
         return bubble
+
+    def _toggle_middle_scroll(self, position: QPoint) -> None:
+        if self._middle_scroll_timer.isActive():
+            self._stop_middle_scroll()
+            return
+        self._middle_scroll_origin = position
+        self.scroll_area.viewport().setCursor(Qt.CursorShape.SizeVerCursor)
+        self._middle_scroll_timer.start()
+
+    def _perform_middle_scroll(self) -> None:
+        if self._middle_scroll_origin is None:
+            return
+        local_pos = self.scroll_area.viewport().mapFromGlobal(QCursor.pos())
+        delta = local_pos.y() - self._middle_scroll_origin.y()
+        if abs(delta) < 8:
+            return
+        bar = self.scroll_area.verticalScrollBar()
+        bar.setValue(bar.value() + int(delta / 8))
+
+    def _stop_middle_scroll(self) -> None:
+        self._middle_scroll_timer.stop()
+        self._middle_scroll_origin = None
+        self.scroll_area.viewport().unsetCursor()
 
     def _animate_appearance(self, row: QWidget) -> None:
         effect = QGraphicsOpacityEffect(row)
@@ -353,7 +405,6 @@ class MainWindow(QMainWindow):
             self.stop_generation()
             return
         self.conversation = self.store.create(SYSTEM_PROMPT, self.active_model)
-        self.store.save(self.conversation)
         self.messages = self.conversation.messages
         self.input_box.clear()
         self.streamed_answer = ""
@@ -386,13 +437,20 @@ class MainWindow(QMainWindow):
                 self.messages = current.messages
         self._rebuild_sidebar()
 
+    def pin_conversation(self, conversation_id: str, pinned: bool) -> None:
+        self.store.set_pinned(conversation_id, pinned)
+        if conversation_id == self.conversation.id:
+            current = self.store.load_by_id(conversation_id)
+            if current is not None:
+                self.conversation = current
+                self.messages = current.messages
+        self._rebuild_sidebar()
+
     def delete_conversation(self, conversation_id: str) -> None:
         self.store.delete(conversation_id)
         if conversation_id == self.conversation.id:
             latest = self.store.load_latest()
             self.conversation = latest or self.store.create(SYSTEM_PROMPT, self.active_model)
-            if latest is None:
-                self.store.save(self.conversation)
             self.messages = self.conversation.messages
             self._rebuild_messages()
         self._rebuild_sidebar()
@@ -540,7 +598,7 @@ class MainWindow(QMainWindow):
         self.pending_bubble = None
         self.pending_row = None
         self._set_controls_generating(False)
-        if self.status.text() in {"Connecting", "Thinking", "Generating"}:
+        if self.footer_status.text() in {"Connecting...", "Thinking...", "Generating..."}:
             self._set_status("Ready")
         self.input_box.setFocus()
 
@@ -600,10 +658,12 @@ class MainWindow(QMainWindow):
         self.store.save(self.conversation)
 
     def _set_status(self, text: str) -> None:
-        self.status.setText(text)
-        self.status.setProperty("state", text.lower())
-        self.status.style().unpolish(self.status)
-        self.status.style().polish(self.status)
+        if text == "Ready":
+            self.footer_status.setText(APP_FOOTER_TEXT)
+        elif text == "Error":
+            self.footer_status.setText("Error - check the latest message.")
+        else:
+            self.footer_status.setText(f"{text}...")
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.worker is not None:
@@ -617,111 +677,11 @@ class MainWindow(QMainWindow):
         if self.model_thread is not None:
             self.model_thread.quit()
             self.model_thread.wait(1000)
+        self._stop_middle_scroll()
         event.accept()
 
     def _apply_style(self) -> None:
-        self.setStyleSheet("""
-            * { font-family: "Segoe UI Variable", "Segoe UI"; }
-            QMainWindow, #centralWidget, #mainPanel, #messageContainer {
-                background: #212121; color: #ececec;
-            }
-            #sidebar {
-                background: #171717; border-right: 1px solid #2f2f2f;
-            }
-            #sidebarNewChat {
-                background: #242424; color: #f1f1f1; border: 1px solid #3b3b3b;
-                border-radius: 8px; padding: 8px 10px; text-align: left;
-            }
-            #sidebarNewChat:hover { background: #2d2d2d; }
-            #chatSearch {
-                background: #222; color: #ececec; border: 1px solid #3b3b3b;
-                border-radius: 8px; padding: 7px 9px;
-            }
-            #sidebarScroll { background: transparent; border: none; }
-            #conversationGroup {
-                color: #8c8c8c; font-size: 11px; padding: 12px 6px 4px 6px;
-            }
-            #conversationRow {
-                background: transparent; border-radius: 7px;
-            }
-            #conversationRow:hover { background: #252525; }
-            #conversationRow[active="true"] { background: #303030; }
-            #conversationTitle { color: #e4e4e4; font-size: 13px; }
-            #sidebarIconButton, #headerIconButton {
-                background: transparent; border: none; color: #c7c7c7;
-                border-radius: 6px; padding: 4px;
-            }
-            #sidebarIconButton:hover, #headerIconButton:hover { background: #333; }
-            #header { background: #212121; border-bottom: 1px solid #2f2f2f; }
-            #title { color: #f5f5f5; font-size: 16px; font-weight: 600; }
-            #statusBadge {
-                color: #b4b4b4; background: #2f2f2f; border-radius: 10px;
-                padding: 3px 9px; font-size: 11px;
-            }
-            #statusBadge[state="ready"] { color: #cfcfcf; background: #2f2f2f; }
-            #statusBadge[state="connecting"], #statusBadge[state="thinking"] {
-                color: #f5d38b; background: #47391f;
-            }
-            #statusBadge[state="generating"] { color: #b9f5d3; background: #1f4735; }
-            #statusBadge[state="stopped"] { color: #d2d2d2; background: #3a3a3a; }
-            #statusBadge[state="error"] { color: #ffb4ab; background: #4a2424; }
-            #chatScroll { background: #212121; border: none; }
-            QScrollBar:vertical { background: transparent; width: 9px; margin: 3px; }
-            QScrollBar::handle:vertical { background: #4c4c4c; border-radius: 4px; min-height: 36px; }
-            QScrollBar::handle:vertical:hover { background: #666; }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
-            #welcomeIcon { color: #f2f2f2; font-size: 28px; font-weight: 650; }
-            #welcomeTitle { color: #f2f2f2; font-size: 25px; font-weight: 600; }
-            #welcomeSubtitle { color: #8d8d8d; font-size: 13px; }
-            #userBubble {
-                background: #303030; border: 1px solid #3a3a3a; border-radius: 18px;
-            }
-            #assistantBubble, #errorBubble { background: transparent; border: none; }
-            #errorBubble { color: #ffb4ab; }
-            #markdownView {
-                background: transparent; color: #ececec; border: none;
-                font-size: 15px; selection-background-color: #5b78a6;
-            }
-            #thinkingDots { color: #aaa; font-size: 24px; letter-spacing: 2px; }
-            #codeBlock { background: #171717; border: 1px solid #353535; border-radius: 8px; }
-            #codeHeader { background: #2a2a2a; border-top-left-radius: 8px; border-top-right-radius: 8px; }
-            #codeLanguage { color: #aaa; font-size: 11px; }
-            #copiedLabel { color: #aaa; font-size: 11px; padding-right: 4px; }
-            #copyButton, #actionButton {
-                background: transparent; border: none; color: #c7c7c7;
-                padding: 3px; min-width: 24px; min-height: 24px;
-            }
-            #copyButton:hover, #actionButton:hover {
-                color: white; background: #3c3c3c; border-radius: 4px;
-            }
-            #codeEditor {
-                background: #171717; color: #e6e6e6; border: none;
-                padding: 0; selection-background-color: #425775;
-            }
-            #inputPanel { background: #212121; }
-            #composer {
-                background: #111214; border: 1px solid #3f4145; border-radius: 22px;
-            }
-            #messageInput {
-                background: transparent; color: #f1f1f1; border: none;
-                padding: 4px 3px; font-size: 15px; selection-background-color: #58719a;
-            }
-            #messageInput:disabled { color: #8b8b8b; }
-            #modelSelector {
-                background: #2b2c30; color: #e3e3e3; border: 1px solid #44464c;
-                border-radius: 16px; padding: 4px 9px; min-height: 28px;
-            }
-            #modelSelector:disabled { color: #838383; background: #252525; border-color: #343434; }
-            #sendButton {
-                background: #8b5cf6; color: white; border: none;
-                border-radius: 17px; min-width: 34px; min-height: 34px;
-            }
-            #sendButton:hover { background: #9b6dff; }
-            #sendButton:pressed { background: #7947e8; }
-            #sendButton:disabled { background: #555; color: #8c8c8c; }
-            #helperText { color: #777; font-size: 10px; }
-        """)
+        self.setStyleSheet(app_stylesheet())
 
 
 def main() -> int:

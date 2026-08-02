@@ -19,15 +19,15 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
-    QPushButton,
     QSizePolicy,
-    QStyle,
     QTextBrowser,
     QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
+
+from design import icon
 
 
 class AutoGrowingInput(QTextEdit):
@@ -168,6 +168,7 @@ class MarkdownView(QTextBrowser):
             self.setMinimumHeight(height)
             self.setMaximumHeight(height)
             self.height_changed.emit()
+        self.updateGeometry()
 
 
 class CodeHighlighter(QSyntaxHighlighter):
@@ -229,20 +230,14 @@ class CodeBlock(QFrame):
         self.collapse_button = QToolButton()
         self.collapse_button.setObjectName("copyButton")
         self.collapse_button.setToolTip("Expand code" if self._collapsed else "Collapse code")
-        self.collapse_button.setIcon(
-            self.style().standardIcon(
-                QStyle.StandardPixmap.SP_ArrowRight
-                if self._collapsed
-                else QStyle.StandardPixmap.SP_ArrowDown
-            )
-        )
+        self.collapse_button.setIcon(icon("expand" if self._collapsed else "collapse"))
         self.collapse_button.clicked.connect(self.toggle_collapsed)
         self.collapse_button.setVisible(self._line_count() > self.COLLAPSED_LINES)
 
         copy_button = QToolButton()
         copy_button.setObjectName("copyButton")
         copy_button.setToolTip("Copy code")
-        copy_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView))
+        copy_button.setIcon(icon("copy"))
         copy_button.clicked.connect(self._copy)
         header_layout.addWidget(language_label)
         header_layout.addStretch()
@@ -297,13 +292,7 @@ class CodeBlock(QFrame):
     def toggle_collapsed(self) -> None:
         self._collapsed = not self._collapsed
         self.collapse_button.setToolTip("Expand code" if self._collapsed else "Collapse code")
-        self.collapse_button.setIcon(
-            self.style().standardIcon(
-                QStyle.StandardPixmap.SP_ArrowRight
-                if self._collapsed
-                else QStyle.StandardPixmap.SP_ArrowDown
-            )
-        )
+        self.collapse_button.setIcon(icon("expand" if self._collapsed else "collapse"))
         self._fit_height()
 
     def _copy(self) -> None:
@@ -347,7 +336,17 @@ class MessageBubble(QFrame):
         remainder = text[cursor:].strip("\n")
         if remainder or not found_code:
             self.layout.addWidget(MarkdownView(remainder or " "))
+        self.layout.invalidate()
         self.adjustSize()
+        self.updateGeometry()
+
+    def resizeEvent(self, event: QEvent) -> None:
+        super().resizeEvent(event)
+        for index in range(self.layout.count()):
+            widget = self.layout.itemAt(index).widget()
+            if isinstance(widget, MarkdownView):
+                widget._fit_height()
+        self.layout.invalidate()
         self.updateGeometry()
 
     def text(self) -> str:
@@ -368,14 +367,14 @@ class MessageActions(QFrame):
         self.copy_button = QToolButton()
         self.copy_button.setObjectName("actionButton")
         self.copy_button.setToolTip("Copy response")
-        self.copy_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView))
+        self.copy_button.setIcon(icon("copy"))
         self.copy_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.copy_button.clicked.connect(self._copy_clicked)
 
         self.regenerate_button = QToolButton()
         self.regenerate_button.setObjectName("actionButton")
         self.regenerate_button.setToolTip("Regenerate response")
-        self.regenerate_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self.regenerate_button.setIcon(icon("regen"))
         self.regenerate_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.regenerate_button.clicked.connect(self.regenerate_requested.emit)
         self.copied_label = QLabel("")

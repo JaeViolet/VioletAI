@@ -40,6 +40,7 @@ class Conversation:
     updated_at: str = field(default_factory=utc_now)
     title: str = "New chat"
     model: str = DEFAULT_MODEL_NAME
+    pinned: bool = False
     messages: list[dict[str, str]] = field(default_factory=list)
 
     @classmethod
@@ -62,8 +63,12 @@ class Conversation:
             updated_at=str(data.get("updated_at") or utc_now()),
             title=title,
             model=str(data.get("model") or DEFAULT_MODEL_NAME),
+            pinned=bool(data.get("pinned", False)),
             messages=cleaned_messages,
         )
+
+    def has_user_content(self) -> bool:
+        return any(message.get("role") == "user" for message in self.messages)
 
     def refresh_title(self) -> None:
         if self.title == "New chat":
@@ -76,6 +81,7 @@ class Conversation:
             "updated_at": self.updated_at,
             "title": self.title,
             "model": self.model,
+            "pinned": self.pinned,
             "messages": self.messages,
         }
 
@@ -92,6 +98,8 @@ class ConversationStore:
         )
 
     def save(self, conversation: Conversation) -> None:
+        if not conversation.has_user_content():
+            return
         conversation.refresh_title()
         conversation.updated_at = utc_now()
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -129,6 +137,7 @@ class ConversationStore:
 
     def grouped(self, query: str = "") -> dict[str, list[Conversation]]:
         groups = {
+            "Pinned": [],
             "Today": [],
             "Yesterday": [],
             "Previous 7 days": [],
@@ -137,6 +146,9 @@ class ConversationStore:
         now = datetime.now(UTC)
         today = now.date()
         for conversation in self.search(query):
+            if conversation.pinned:
+                groups["Pinned"].append(conversation)
+                continue
             updated = parse_timestamp(conversation.updated_at)
             day = updated.date()
             if day == today:
@@ -164,6 +176,14 @@ class ConversationStore:
         if conversation is None:
             return None
         conversation.title = title.strip() or "New chat"
+        self.save(conversation)
+        return conversation
+
+    def set_pinned(self, conversation_id: str, pinned: bool) -> Conversation | None:
+        conversation = self.load_by_id(conversation_id)
+        if conversation is None:
+            return None
+        conversation.pinned = pinned
         self.save(conversation)
         return conversation
 
