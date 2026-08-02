@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, Qt, Signal
+from PySide6.QtCore import QEvent, QPropertyAnimation, Qt, Signal
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QFrame,
@@ -201,11 +201,6 @@ class ChatSidebar(QFrame):
         self.setMaximumWidth(self.EXPANDED_WIDTH)
         self._expanded = True
 
-        self._animation = QPropertyAnimation(self, b"maximumWidth", self)
-        self._animation.setDuration(Motion.NORMAL)
-        self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._animation.valueChanged.connect(lambda value: self.setMinimumWidth(int(value)))
-
         self.root_layout = QVBoxLayout(self)
         self.root_layout.setContentsMargins(8, 12, 8, 12)
         self.root_layout.setSpacing(8)
@@ -247,7 +242,7 @@ class ChatSidebar(QFrame):
         self.list_widget = QWidget()
         self.list_widget.setObjectName("sidebarList")
         self.list_layout = QVBoxLayout(self.list_widget)
-        self.list_layout.setContentsMargins(0, 4, 0, 0)
+        self.list_layout.setContentsMargins(8, 4, 8, 0)
         self.list_layout.setSpacing(3)
         self.list_layout.addStretch(1)
         self.scroll_area.setWidget(self.list_widget)
@@ -257,21 +252,21 @@ class ChatSidebar(QFrame):
         collapsed_layout = QVBoxLayout(self.collapsed_container)
         collapsed_layout.setContentsMargins(0, 0, 0, 0)
         collapsed_layout.setSpacing(10)
-        self.collapsed_search_button = QToolButton(objectName="sidebarIconButton")
+        self.collapsed_expand_button = QToolButton(objectName="collapsedSidebarButton")
+        self.collapsed_expand_button.setIcon(icon("expand"))
+        self.collapsed_expand_button.setToolTip("Open sidebar")
+        self.collapsed_expand_button.clicked.connect(self.toggle)
+        self.collapsed_search_button = QToolButton(objectName="collapsedSidebarButton")
         self.collapsed_search_button.setIcon(icon("search"))
         self.collapsed_search_button.setToolTip("Search chats")
         self.collapsed_search_button.clicked.connect(self.search_requested.emit)
-        self.collapsed_new_chat_button = QToolButton(objectName="sidebarIconButton")
+        self.collapsed_new_chat_button = QToolButton(objectName="collapsedSidebarButton")
         self.collapsed_new_chat_button.setIcon(icon("new"))
         self.collapsed_new_chat_button.setToolTip("New chat")
         self.collapsed_new_chat_button.clicked.connect(self.new_chat_requested.emit)
-        self.collapsed_expand_button = QToolButton(objectName="sidebarIconButton")
-        self.collapsed_expand_button.setIcon(icon("expand"))
-        self.collapsed_expand_button.setToolTip("Expand sidebar")
-        self.collapsed_expand_button.clicked.connect(self.toggle)
+        collapsed_layout.addWidget(self.collapsed_expand_button, 0, Qt.AlignmentFlag.AlignHCenter)
         collapsed_layout.addWidget(self.collapsed_search_button, 0, Qt.AlignmentFlag.AlignHCenter)
         collapsed_layout.addWidget(self.collapsed_new_chat_button, 0, Qt.AlignmentFlag.AlignHCenter)
-        collapsed_layout.addWidget(self.collapsed_expand_button, 0, Qt.AlignmentFlag.AlignHCenter)
         collapsed_layout.addStretch(1)
         self.root_layout.addWidget(self.collapsed_container, 1)
         self.collapsed_container.hide()
@@ -283,14 +278,15 @@ class ChatSidebar(QFrame):
         self._expanded = expanded
         self.expanded_container.setVisible(expanded)
         self.collapsed_container.setVisible(not expanded)
+        if expanded:
+            self.root_layout.setContentsMargins(8, 12, 8, 12)
+        else:
+            self.root_layout.setContentsMargins(0, 14, 0, 12)
         self.collapse_button.setIcon(icon("collapse" if expanded else "expand"))
         self.collapse_button.setToolTip("Collapse sidebar" if expanded else "Expand sidebar")
-        self._animation.stop()
-        self._animation.setStartValue(self.maximumWidth())
-        self._animation.setEndValue(self.EXPANDED_WIDTH if expanded else self.COLLAPSED_WIDTH)
-        self._animation.start()
-        if not expanded:
-            self.setMinimumWidth(self.COLLAPSED_WIDTH)
+        width = self.EXPANDED_WIDTH if expanded else self.COLLAPSED_WIDTH
+        self.setMinimumWidth(width)
+        self.setMaximumWidth(width)
 
     def set_generating(self, generating: bool) -> None:
         self.new_chat_button.setEnabled(not generating)

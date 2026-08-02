@@ -21,7 +21,7 @@ from conversation_store import ConversationStore  # noqa: E402
 from main import MainWindow  # noqa: E402
 from ollama_client import InvalidStreamError, OllamaWorker, discover_models, iter_message_chunks  # noqa: E402
 from sidebar import ChatSidebar  # noqa: E402
-from widgets import AutoGrowingInput, MarkdownView, MessageBubble  # noqa: E402
+from widgets import AutoGrowingInput, CodeBlock, MarkdownView, MessageBubble  # noqa: E402
 
 
 class ChatFoundationTests(unittest.TestCase):
@@ -193,8 +193,50 @@ class ChatFoundationTests(unittest.TestCase):
         self.app.processEvents()
         content = bubble.parentWidget().parentWidget()
         self.assertLess(bubble.width(), 220)
-        self.assertEqual(bubble.geometry().right(), bubble.parentWidget().geometry().right())
+        self.assertLessEqual(bubble.width(), int(window.composer.maximumWidth() * 2 / 3))
+        self.assertEqual(bubble.width(), bubble.parentWidget().width())
+        self.assertEqual(bubble.parentWidget().geometry().right(), content.width() - 1)
         self.assertEqual(content.maximumWidth(), window.composer.maximumWidth())
+        self.assertIsNone(bubble.parentWidget().parentWidget().graphicsEffect())
+        window.close()
+
+    def test_long_user_bubble_wraps_without_internal_scrollbar(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        text = "hello " * 90
+        bubble = window._add_message(text, "user")
+        window.resize(1000, 700)
+        window._resize_rows()
+        self.app.processEvents()
+        markdown = bubble.findChild(MarkdownView)
+        self.assertIsNotNone(markdown)
+        assert markdown is not None
+        self.assertLessEqual(bubble.width(), int(window.composer.maximumWidth() * 2 / 3))
+        self.assertGreater(bubble.height(), 60)
+        self.assertEqual(markdown.verticalScrollBar().maximum(), 0)
+        window.close()
+
+    def test_mixed_long_messages_do_not_overlap_or_clip(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        messages = [
+            ("# Heading\n\n" + "Assistant markdown paragraph. " * 80, "assistant"),
+            ("hello " * 120, "user"),
+            ("- one\n- two\n- three\n\n| A | B |\n| - | - |\n| 1 | 2 |\n\n" + "More text. " * 60, "assistant"),
+            ("```python\n" + "\n".join(f"print({index})" for index in range(30)) + "\n```", "assistant"),
+        ]
+        rows = []
+        for text, role in messages:
+            bubble = window._add_message(text, role)
+            rows.append(bubble.parentWidget().parentWidget().parentWidget())
+        window._resize_rows()
+        self.app.processEvents()
+        last_bottom = -1
+        for row in rows:
+            self.assertGreaterEqual(row.y(), last_bottom)
+            self.assertGreater(row.height(), 0)
+            last_bottom = row.geometry().bottom()
+        for bubble in window.findChildren(MessageBubble):
+            self.assertGreaterEqual(bubble.parentWidget().height(), bubble.height())
         window.close()
 
     def test_auto_scroll_pauses_and_resumes_near_bottom(self) -> None:
@@ -250,6 +292,10 @@ class ChatFoundationTests(unittest.TestCase):
         self.assertFalse(sidebar.brand_label.isVisible())
         self.assertFalse(sidebar.expanded_container.isVisible())
         self.assertFalse(sidebar.collapsed_container.isHidden())
+        layout = sidebar.collapsed_container.layout()
+        self.assertIs(layout.itemAt(0).widget(), sidebar.collapsed_expand_button)
+        self.assertIs(layout.itemAt(1).widget(), sidebar.collapsed_search_button)
+        self.assertIs(layout.itemAt(2).widget(), sidebar.collapsed_new_chat_button)
 
     def test_conversation_rows_are_compact_without_permanent_action_buttons(self) -> None:
         sidebar = ChatSidebar()
@@ -259,9 +305,34 @@ class ChatFoundationTests(unittest.TestCase):
             conversation.messages.append({"role": "user", "content": "A very long row title that should be elided neatly"})
             store.save(conversation)
             sidebar.rebuild(store.grouped(), conversation.id)
+            sidebar.resize(sidebar.EXPANDED_WIDTH, 500)
+            sidebar.show()
+            self.app.processEvents()
         rows = sidebar.findChildren(QWidget, "conversationRow")
         self.assertEqual(rows[0].height(), 34)
         self.assertEqual(rows[0].findChildren(QToolButton), [])
+        self.assertEqual(rows[0].x(), 8)
+        self.assertLessEqual(rows[0].geometry().right(), sidebar.list_widget.width() - 9)
+        sidebar.close()
+
+    def test_input_placeholder_and_cursor_are_vertically_centered(self) -> None:
+        editor = AutoGrowingInput()
+        editor.resize(500, editor.MIN_HEIGHT)
+        editor._update_height()
+        self.assertGreater(editor.document().documentMargin(), 0)
+        editor.setPlainText("line one\nline two\nline three")
+        self.assertGreater(editor.height(), editor.MIN_HEIGHT)
+
+    def test_code_blocks_have_no_internal_scrollbars_and_contribute_height(self) -> None:
+        code = "def demo():\n" + "\n".join("    print('hello world')" for _ in range(30))
+        block = CodeBlock("python", code)
+        block.resize(420, 100)
+        block.show()
+        self.app.processEvents()
+        self.assertEqual(block.editor.verticalScrollBar().maximum(), 0)
+        self.assertEqual(block.editor.horizontalScrollBar().maximum(), 0)
+        self.assertGreater(block.height(), 300)
+        block.close()
 
     def test_search_overlay_filters_and_closes(self) -> None:
         window, _temp_dir = self._window_with_temp_store()

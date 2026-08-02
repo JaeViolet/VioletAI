@@ -123,12 +123,16 @@ def app_stylesheet() -> str:
             background: {Colors.BLACK}; border-right: 1px solid {Colors.BORDER};
         }}
         #sidebarTopTitle {{ color: {Colors.TEXT}; font-size: 22px; font-weight: 1; margin-left: 8px; }}
-        #sidebarIconButton, #headerIconButton {{
+        #sidebarIconButton, #headerIconButton, #collapsedSidebarButton {{
             background: transparent; border: none; color: {Colors.TEXT_MUTED};
             margin: 6px 4px;
             border-radius: {Radius.SM}px; padding: 5px; min-width: 28px; min-height: 28px;
         }}
-        #sidebarIconButton:hover, #headerIconButton:hover {{ background: {Colors.PANEL_HOVER}; }}
+        #collapsedSidebarButton {{
+            margin: 0; padding: 5px; min-width: 32px; min-height: 32px;
+            max-width: 32px; max-height: 32px;
+        }}
+        #sidebarIconButton:hover, #headerIconButton:hover, #collapsedSidebarButton:hover {{ background: {Colors.PANEL_HOVER}; }}
         QMenu {{
             background: {Colors.COMPOSER}; color: {Colors.TEXT};
             border: 1px solid {Colors.BORDER_STRONG}; border-radius: {Radius.SM}px;

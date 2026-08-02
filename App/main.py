@@ -19,11 +19,11 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QFrame,
-    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QLayout,
     QScrollArea,
     QSizePolicy,
     QToolButton,
@@ -120,6 +120,7 @@ class MainWindow(QMainWindow):
         self.message_layout = QVBoxLayout(self.message_container)
         self.message_layout.setContentsMargins(24, 28, 24, 24)
         self.message_layout.setSpacing(22)
+        self.message_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinAndMaxSize)
         self.message_layout.addStretch(1)
 
         self.scroll_area = QScrollArea(objectName="chatScroll")
@@ -284,13 +285,14 @@ class MainWindow(QMainWindow):
                     content.setMaximumWidth(available)
                 bubble = row.property("bubble")
                 if isinstance(bubble, MessageBubble):
-                    max_width = int(available * 0.74) if bubble.role == "user" else available
+                    max_width = int(available * 2 / 3) if bubble.role == "user" else available
                     if bubble.role == "user":
                         compact_width = bubble.preferred_width(max_width)
                         bubble.setFixedWidth(compact_width)
                         parent = bubble.parentWidget()
                         if parent is not None:
-                            parent.setFixedWidth(compact_width)
+                            parent.setMinimumWidth(compact_width)
+                            parent.setMaximumWidth(compact_width)
                     else:
                         parent = bubble.parentWidget()
                         if parent is not None:
@@ -299,6 +301,28 @@ class MainWindow(QMainWindow):
                         bubble.setMinimumWidth(min(260, max_width))
                         bubble.setMaximumWidth(max_width)
                     bubble.updateGeometry()
+                    self._settle_message_row(row, bubble)
+        self.message_layout.activate()
+        self.message_container.setMinimumHeight(self.message_layout.sizeHint().height())
+        self.message_container.updateGeometry()
+
+    def _settle_message_row(self, row: QWidget, bubble: MessageBubble) -> None:
+        column = bubble.parentWidget()
+        content = row.property("contentColumn")
+        if column is not None:
+            if column.layout() is not None:
+                column.layout().activate()
+            column.setMinimumHeight(column.sizeHint().height())
+            column.updateGeometry()
+        if isinstance(content, QWidget):
+            if content.layout() is not None:
+                content.layout().activate()
+            content.setMinimumHeight(content.sizeHint().height())
+            content.updateGeometry()
+        if row.layout() is not None:
+            row.layout().activate()
+        row.setMinimumHeight(row.sizeHint().height())
+        row.updateGeometry()
 
     def _add_message(self, text: str, role: str, message_index: int | None = None) -> MessageBubble:
         row = QWidget()
@@ -321,6 +345,8 @@ class MainWindow(QMainWindow):
         column_layout = QVBoxLayout(column)
         column_layout.setContentsMargins(0, 0, 0, 0)
         column_layout.setSpacing(6)
+        if role == "user":
+            column_layout.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
         bubble = MessageBubble(text, role)
         row.setProperty("bubble", bubble)
         row.setProperty("contentColumn", content)
@@ -366,13 +392,7 @@ class MainWindow(QMainWindow):
         self.scroll_area.viewport().unsetCursor()
 
     def _animate_appearance(self, row: QWidget) -> None:
-        effect = QGraphicsOpacityEffect(row)
-        row.setGraphicsEffect(effect)
-        animation = QPropertyAnimation(effect, b"opacity", row)
-        animation.setDuration(120)
-        animation.setStartValue(0.0)
-        animation.setEndValue(1.0)
-        animation.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+        row.setGraphicsEffect(None)
 
     def _attach_actions(self, layout: QVBoxLayout, bubble: MessageBubble, message_index: int) -> None:
         actions = MessageActions()

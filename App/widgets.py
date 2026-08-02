@@ -69,6 +69,9 @@ class AutoGrowingInput(QTextEdit):
             else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
         self.setVerticalScrollBarPolicy(policy)
+        document_margin = int(max(0, (height - document_height - frame) / 2))
+        self.document().setDocumentMargin(document_margin)
+        self.viewport().update()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         is_enter = event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
@@ -154,6 +157,19 @@ class MarkdownView(QTextBrowser):
         self.document().setMarkdown(markdown)
         self._fit_height()
 
+    def sizeHint(self) -> QSize:
+        return QSize(super().sizeHint().width(), self._document_height())
+
+    def minimumSizeHint(self) -> QSize:
+        return self.sizeHint()
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        self.document().setTextWidth(max(1, width))
+        return self._document_height()
+
     def resizeEvent(self, event: QEvent) -> None:
         super().resizeEvent(event)
         self.document().setTextWidth(self.viewport().width())
@@ -163,13 +179,16 @@ class MarkdownView(QTextBrowser):
         width = max(1, self.viewport().width())
         if self.document().textWidth() != width:
             self.document().setTextWidth(width)
-        height = max(1, int(self.document().size().height()) + 2)
+        height = self._document_height()
         if self.height() != height:
             self.setFixedHeight(height)
             self.setMinimumHeight(height)
             self.setMaximumHeight(height)
             self.height_changed.emit()
         self.updateGeometry()
+
+    def _document_height(self) -> int:
+        return max(1, int(self.document().size().height()) + 4)
 
 
 class CodeHighlighter(QSyntaxHighlighter):
@@ -214,7 +233,7 @@ class CodeBlock(QFrame):
         super().__init__()
         self.setObjectName("codeBlock")
         self._code = code.rstrip()
-        self._collapsed = self._line_count() > self.COLLAPSED_LINES
+        self._collapsed = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -233,7 +252,7 @@ class CodeBlock(QFrame):
         self.collapse_button.setToolTip("Expand code" if self._collapsed else "Collapse code")
         self.collapse_button.setIcon(icon("expand" if self._collapsed else "collapse"))
         self.collapse_button.clicked.connect(self.toggle_collapsed)
-        self.collapse_button.setVisible(self._line_count() > self.COLLAPSED_LINES)
+        self.collapse_button.setVisible(False)
 
         copy_button = QToolButton()
         copy_button.setObjectName("copyButton")
@@ -250,9 +269,9 @@ class CodeBlock(QFrame):
         self.editor = QPlainTextEdit(self._code)
         self.editor.setObjectName("codeEditor")
         self.editor.setReadOnly(True)
-        self.editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
         self.editor.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.editor.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.editor.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         fixed_font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
         fixed_font.setPointSize(10)
         self.editor.setFont(fixed_font)
@@ -264,14 +283,37 @@ class CodeBlock(QFrame):
         self._fit_height()
         layout.addWidget(self.editor)
 
+    def sizeHint(self) -> QSize:
+        margins = self.layout().contentsMargins()
+        header_height = self.layout().itemAt(0).widget().sizeHint().height()
+        return QSize(
+            super().sizeHint().width(),
+            header_height + self._editor_height() + margins.top() + margins.bottom(),
+        )
+
+    def minimumSizeHint(self) -> QSize:
+        return self.sizeHint()
+
+    def resizeEvent(self, event: QEvent) -> None:
+        super().resizeEvent(event)
+        self._fit_height()
+
     def _fit_height(self) -> None:
-        metrics = self.editor.fontMetrics()
-        line_count = self._visible_line_count()
-        height = line_count * metrics.lineSpacing() + 28
+        height = self._editor_height()
         self.editor.setFixedHeight(height)
         self.editor.setMinimumHeight(height)
         self.editor.setMaximumHeight(height)
         self.updateGeometry()
+
+    def _editor_height(self) -> int:
+        if self._collapsed:
+            metrics = self.editor.fontMetrics()
+            return self._visible_line_count() * metrics.lineSpacing() + 28
+        self.editor.document().setTextWidth(max(1, self.editor.viewport().width()))
+        metrics = self.editor.fontMetrics()
+        line_height = self.editor.document().blockCount() * metrics.lineSpacing() + 42
+        document_height = int(self.editor.document().size().height()) + 80
+        return max(1, line_height, document_height)
 
     def _line_count(self) -> int:
         return max(1, self._code.count("\n") + 1)
