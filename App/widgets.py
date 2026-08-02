@@ -9,6 +9,7 @@ from PySide6.QtGui import (
     QColor,
     QFont,
     QFontDatabase,
+    QFontMetrics,
     QKeyEvent,
     QSyntaxHighlighter,
     QTextCharFormat,
@@ -33,7 +34,7 @@ from design import icon
 class AutoGrowingInput(QTextEdit):
     send_requested = Signal()
 
-    MIN_HEIGHT = 38
+    MIN_HEIGHT = 34
     MAX_HEIGHT = 180
 
     def __init__(self) -> None:
@@ -59,7 +60,7 @@ class AutoGrowingInput(QTextEdit):
     def _update_height(self) -> None:
         document_height = self.document().documentLayout().documentSize().height()
         frame = self.frameWidth() * 2
-        desired = int(document_height + frame + 18)
+        desired = int(document_height + frame + 12)
         height = max(self.MIN_HEIGHT, min(desired, self.MAX_HEIGHT))
         self.setFixedHeight(height)
         policy = (
@@ -151,7 +152,7 @@ class MarkdownView(QTextBrowser):
     def set_markdown(self, markdown: str) -> None:
         self._markdown = markdown
         self.document().setMarkdown(markdown)
-        QTimer.singleShot(0, self._fit_height)
+        self._fit_height()
 
     def resizeEvent(self, event: QEvent) -> None:
         super().resizeEvent(event)
@@ -318,8 +319,40 @@ class MessageBubble(QFrame):
         self.layout.setSpacing(10)
         self.set_text(text)
 
+    def preferred_width(self, max_width: int) -> int:
+        """Return a compact width for user bubbles without exceeding max_width."""
+        if self.role != "user":
+            return max_width
+        margins = self.layout.contentsMargins()
+        horizontal_padding = margins.left() + margins.right()
+        available_text_width = max(80, max_width - horizontal_padding)
+        metrics = QFontMetrics(self.font())
+        natural = 0
+        for paragraph in (self._text or " ").splitlines() or [" "]:
+            if not paragraph:
+                paragraph = " "
+            rect = metrics.boundingRect(
+                0,
+                0,
+                available_text_width,
+                10_000,
+                Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextExpandTabs,
+                paragraph,
+            )
+            natural = max(natural, rect.width())
+        return min(max_width, max(46, natural + horizontal_padding + 6))
+
     def set_text(self, text: str) -> None:
         self._text = text
+        if not self._FENCE.search(text) and self.layout.count() == 1:
+            widget = self.layout.itemAt(0).widget()
+            if isinstance(widget, MarkdownView):
+                widget.set_markdown(text or " ")
+                self.layout.invalidate()
+                self.adjustSize()
+                self.updateGeometry()
+                return
+
         while self.layout.count():
             item = self.layout.takeAt(0)
             if item.widget():

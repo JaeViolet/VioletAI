@@ -44,6 +44,7 @@ class Spacing:
 class Motion:
     FAST = 110
     NORMAL = 160
+    STREAM_INTERVAL = 40
 
 
 ICON_SIZE = 18
@@ -128,6 +129,13 @@ def app_stylesheet() -> str:
             border-radius: {Radius.SM}px; padding: 5px; min-width: 28px; min-height: 28px;
         }}
         #sidebarIconButton:hover, #headerIconButton:hover {{ background: {Colors.PANEL_HOVER}; }}
+        QMenu {{
+            background: {Colors.COMPOSER}; color: {Colors.TEXT};
+            border: 1px solid {Colors.BORDER_STRONG}; border-radius: {Radius.SM}px;
+            padding: 6px;
+        }}
+        QMenu::item {{ padding: 7px 28px 7px 10px; border-radius: 5px; }}
+        QMenu::item:selected {{ background: {Colors.PANEL_ACTIVE}; }}
         #sidebarNewChat {{
             background: transparent; color: {Colors.TEXT}; border: none;
             margin-top: 40px;
@@ -140,7 +148,7 @@ def app_stylesheet() -> str:
             color: {Colors.TEXT_MUTED}; font-size: 11px; font-weight: 600;
             padding: 14px 8px 5px 8px;
         }}
-        #conversationRow {{ background: transparent; border-radius: {Radius.LG}px;}}
+        #conversationRow {{ background: transparent; border-radius: {Radius.MD}px;}}
         #conversationRow:hover {{ background: {Colors.PANEL_HOVER}; }}
         #conversationRow[active="true"] {{ background: {Colors.PANEL_ACTIVE}; }}
         #conversationTitle {{ color: {Colors.TEXT}; font-size: 13px; }}
@@ -193,12 +201,23 @@ def app_stylesheet() -> str:
         }}
         #messageInput {{
             background: transparent; color: {Colors.TEXT}; border: none;
-            padding: 3px 3px; font-size: 15px; selection-background-color: #58719a;
+            padding: 1px 3px; font-size: 15px; selection-background-color: #58719a;
         }}
         #messageInput:disabled {{ color: #8b8b8b; }}
         #modelSelector {{
             background: transparent; color: {Colors.TEXT_MUTED}; border: none;
             padding: 3px 4px; min-height: 28px; font-size: 13px;
+        }}
+        #modelSelector QAbstractItemView {{
+            background: {Colors.COMPOSER}; color: {Colors.TEXT};
+            border: 1px solid {Colors.BORDER_STRONG}; outline: none;
+            padding: 5px; selection-background-color: {Colors.PANEL_ACTIVE};
+        }}
+        #modelSelector QAbstractItemView::item {{
+            min-height: 30px; padding: 7px 12px;
+        }}
+        #modelSelector QAbstractItemView::item:hover {{
+            background: {Colors.PANEL_HOVER};
         }}
         #modelSelector:hover {{ color: {Colors.TEXT}; }}
         #modelSelector:disabled {{ color: {Colors.TEXT_FAINT}; }}

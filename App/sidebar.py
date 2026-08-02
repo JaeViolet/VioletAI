@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QPropertyAnimation, Qt, Signal
+from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, Qt, Signal
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QFrame,
     QGraphicsOpacityEffect,
@@ -10,6 +11,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLineEdit,
     QLabel,
+    QMenu,
     QPushButton,
     QScrollArea,
     QToolButton,
@@ -34,39 +36,45 @@ class ConversationRow(QFrame):
         self.setObjectName("conversationRow")
         self.setProperty("active", active)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight(34)
+        self._full_title = conversation.title
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 7, 6, 7)
-        layout.setSpacing(3)
+        layout.setContentsMargins(10, 0, 10, 0)
+        layout.setSpacing(0)
 
         self.title = QLabel(conversation.title)
         self.title.setObjectName("conversationTitle")
         self.title.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
 
-        pin_button = QToolButton(objectName="sidebarIconButton")
-        pin_button.setIcon(icon("pin"))
-        pin_button.setToolTip("Unpin conversation" if conversation.pinned else "Pin conversation")
-        pin_button.clicked.connect(lambda: self.pin_requested.emit(conversation.id, not conversation.pinned))
-
-        rename_button = QToolButton(objectName="sidebarIconButton")
-        rename_button.setIcon(icon("rename"))
-        rename_button.setToolTip("Rename conversation")
-        rename_button.clicked.connect(self._rename)
-
-        delete_button = QToolButton(objectName="sidebarIconButton")
-        delete_button.setIcon(icon("delete"))
-        delete_button.setToolTip("Delete conversation")
-        delete_button.clicked.connect(lambda: self.delete_requested.emit(conversation.id))
-
         layout.addWidget(self.title, 1)
-        layout.addWidget(pin_button)
-        layout.addWidget(rename_button)
-        layout.addWidget(delete_button)
+        self._update_elided_title()
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self.selected.emit(self.conversation.id)
         super().mousePressEvent(event)
+
+    def contextMenuEvent(self, event) -> None:
+        menu = QMenu(self)
+        pin_action = menu.addAction("Unpin" if self.conversation.pinned else "Pin")
+        rename_action = menu.addAction("Rename")
+        delete_action = menu.addAction("Delete")
+        selected = menu.exec(event.globalPos())
+        if selected == pin_action:
+            self.pin_requested.emit(self.conversation.id, not self.conversation.pinned)
+        elif selected == rename_action:
+            self._rename()
+        elif selected == delete_action:
+            self.delete_requested.emit(self.conversation.id)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._update_elided_title()
+
+    def _update_elided_title(self) -> None:
+        metrics = QFontMetrics(self.title.font())
+        self.title.setText(metrics.elidedText(self._full_title, Qt.TextElideMode.ElideRight, max(24, self.width() - 20)))
 
     def _rename(self) -> None:
         title, accepted = QInputDialog.getText(
@@ -195,10 +203,18 @@ class ChatSidebar(QFrame):
 
         self._animation = QPropertyAnimation(self, b"maximumWidth", self)
         self._animation.setDuration(Motion.NORMAL)
+        self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._animation.valueChanged.connect(lambda value: self.setMinimumWidth(int(value)))
 
         self.root_layout = QVBoxLayout(self)
         self.root_layout.setContentsMargins(8, 12, 8, 12)
         self.root_layout.setSpacing(8)
+
+        self.expanded_container = QWidget()
+        expanded_layout = QVBoxLayout(self.expanded_container)
+        expanded_layout.setContentsMargins(0, 0, 0, 0)
+        expanded_layout.setSpacing(8)
+        self.root_layout.addWidget(self.expanded_container, 1)
 
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
@@ -215,13 +231,13 @@ class ChatSidebar(QFrame):
         top.addWidget(self.brand_label, 1)
         top.addWidget(self.search_button)
         top.addWidget(self.collapse_button)
-        self.root_layout.addLayout(top)
+        expanded_layout.addLayout(top)
 
         self.new_chat_button = QPushButton("New chat")
         self.new_chat_button.setObjectName("sidebarNewChat")
         self.new_chat_button.setIcon(icon("new"))
         self.new_chat_button.clicked.connect(self.new_chat_requested.emit)
-        self.root_layout.addWidget(self.new_chat_button)
+        expanded_layout.addWidget(self.new_chat_button)
 
         self.scroll_area = QScrollArea()
         self.scroll_area.setObjectName("sidebarScroll")
@@ -235,27 +251,52 @@ class ChatSidebar(QFrame):
         self.list_layout.setSpacing(3)
         self.list_layout.addStretch(1)
         self.scroll_area.setWidget(self.list_widget)
-        self.root_layout.addWidget(self.scroll_area, 1)
+        expanded_layout.addWidget(self.scroll_area, 1)
+
+        self.collapsed_container = QWidget()
+        collapsed_layout = QVBoxLayout(self.collapsed_container)
+        collapsed_layout.setContentsMargins(0, 0, 0, 0)
+        collapsed_layout.setSpacing(10)
+        self.collapsed_search_button = QToolButton(objectName="sidebarIconButton")
+        self.collapsed_search_button.setIcon(icon("search"))
+        self.collapsed_search_button.setToolTip("Search chats")
+        self.collapsed_search_button.clicked.connect(self.search_requested.emit)
+        self.collapsed_new_chat_button = QToolButton(objectName="sidebarIconButton")
+        self.collapsed_new_chat_button.setIcon(icon("new"))
+        self.collapsed_new_chat_button.setToolTip("New chat")
+        self.collapsed_new_chat_button.clicked.connect(self.new_chat_requested.emit)
+        self.collapsed_expand_button = QToolButton(objectName="sidebarIconButton")
+        self.collapsed_expand_button.setIcon(icon("expand"))
+        self.collapsed_expand_button.setToolTip("Expand sidebar")
+        self.collapsed_expand_button.clicked.connect(self.toggle)
+        collapsed_layout.addWidget(self.collapsed_search_button, 0, Qt.AlignmentFlag.AlignHCenter)
+        collapsed_layout.addWidget(self.collapsed_new_chat_button, 0, Qt.AlignmentFlag.AlignHCenter)
+        collapsed_layout.addWidget(self.collapsed_expand_button, 0, Qt.AlignmentFlag.AlignHCenter)
+        collapsed_layout.addStretch(1)
+        self.root_layout.addWidget(self.collapsed_container, 1)
+        self.collapsed_container.hide()
 
     def toggle(self) -> None:
         self.set_expanded(not self._expanded)
 
     def set_expanded(self, expanded: bool) -> None:
         self._expanded = expanded
-        self.brand_label.setVisible(expanded)
-        self.scroll_area.setVisible(expanded)
-        self.new_chat_button.setText("New chat" if expanded else "")
+        self.expanded_container.setVisible(expanded)
+        self.collapsed_container.setVisible(not expanded)
         self.collapse_button.setIcon(icon("collapse" if expanded else "expand"))
         self.collapse_button.setToolTip("Collapse sidebar" if expanded else "Expand sidebar")
         self._animation.stop()
         self._animation.setStartValue(self.maximumWidth())
         self._animation.setEndValue(self.EXPANDED_WIDTH if expanded else self.COLLAPSED_WIDTH)
         self._animation.start()
-        self.setMinimumWidth(self.EXPANDED_WIDTH if expanded else self.COLLAPSED_WIDTH)
+        if not expanded:
+            self.setMinimumWidth(self.COLLAPSED_WIDTH)
 
     def set_generating(self, generating: bool) -> None:
         self.new_chat_button.setEnabled(not generating)
         self.search_button.setEnabled(not generating)
+        self.collapsed_new_chat_button.setEnabled(not generating)
+        self.collapsed_search_button.setEnabled(not generating)
 
     def rebuild(
         self,

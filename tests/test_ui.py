@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtGui import QKeyEvent  # noqa: E402
-from PySide6.QtWidgets import QApplication, QLabel  # noqa: E402
+from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QToolButton, QWidget  # noqa: E402
 
 from config import DEFAULT_MODEL_NAME, SYSTEM_PROMPT  # noqa: E402
 from conversation_store import ConversationStore  # noqa: E402
@@ -147,15 +147,17 @@ class ChatFoundationTests(unittest.TestCase):
             assert conversation is not None
             self.assertEqual(conversation.title, "First prompt here")
 
-    def test_window_restores_latest_conversation(self) -> None:
+    def test_window_starts_empty_without_deleting_saved_conversations(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = ConversationStore(Path(temp_dir))
             conversation = store.create(SYSTEM_PROMPT)
-            conversation.messages.append({"role": "user", "content": "Restore me"})
+            conversation.messages.append({"role": "user", "content": "Keep me in sidebar"})
             store.save(conversation)
             with patch("main.ConversationStore", return_value=store), patch.object(MainWindow, "_refresh_models"):
                 window = MainWindow()
-            self.assertEqual(window.messages[-1]["content"], "Restore me")
+            self.assertEqual(len(window.messages), 1)
+            self.assertEqual(window.messages[0]["role"], "system")
+            self.assertEqual(store.load_by_id(conversation.id).messages[-1]["content"], "Keep me in sidebar")
             self.assertIn("VioletAI can make mistakes", window.footer_status.text())
             self.assertTrue(window.send_button.isEnabled())
             window.close()
@@ -181,6 +183,18 @@ class ChatFoundationTests(unittest.TestCase):
             self.app.processEvents()
             bar = window.scroll_area.verticalScrollBar()
             self.assertEqual(bar.value(), bar.maximum())
+        window.close()
+
+    def test_user_bubble_is_compact_and_right_aligned_in_content_column(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        bubble = window._add_message("short", "user")
+        window.resize(1000, 700)
+        window._resize_rows()
+        self.app.processEvents()
+        content = bubble.parentWidget().parentWidget()
+        self.assertLess(bubble.width(), 220)
+        self.assertEqual(bubble.geometry().right(), bubble.parentWidget().geometry().right())
+        self.assertEqual(content.maximumWidth(), window.composer.maximumWidth())
         window.close()
 
     def test_auto_scroll_pauses_and_resumes_near_bottom(self) -> None:
@@ -234,14 +248,47 @@ class ChatFoundationTests(unittest.TestCase):
         sidebar.set_expanded(False)
         self.assertEqual(sidebar.minimumWidth(), sidebar.COLLAPSED_WIDTH)
         self.assertFalse(sidebar.brand_label.isVisible())
+        self.assertFalse(sidebar.expanded_container.isVisible())
+        self.assertFalse(sidebar.collapsed_container.isHidden())
+
+    def test_conversation_rows_are_compact_without_permanent_action_buttons(self) -> None:
+        sidebar = ChatSidebar()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ConversationStore(Path(temp_dir))
+            conversation = store.create(SYSTEM_PROMPT)
+            conversation.messages.append({"role": "user", "content": "A very long row title that should be elided neatly"})
+            store.save(conversation)
+            sidebar.rebuild(store.grouped(), conversation.id)
+        rows = sidebar.findChildren(QWidget, "conversationRow")
+        self.assertEqual(rows[0].height(), 34)
+        self.assertEqual(rows[0].findChildren(QToolButton), [])
 
     def test_search_overlay_filters_and_closes(self) -> None:
         window, _temp_dir = self._window_with_temp_store()
         window.show()
         window.open_search_overlay()
         self.assertTrue(window.search_overlay.isVisible())
+        self.assertIs(window.search_overlay.parentWidget(), window.chat_panel)
+        parent_rect = window.chat_panel.rect()
+        self.assertAlmostEqual(
+            window.search_overlay.geometry().center().x(),
+            parent_rect.center().x(),
+            delta=2,
+        )
         window.search_overlay.close_overlay()
         self.assertFalse(window.search_overlay.isVisible())
+        window.close()
+
+    def test_delete_active_conversation_confirms_and_returns_to_empty_chat(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.messages.append({"role": "user", "content": "delete me"})
+        window.store.save(window.conversation)
+        deleted_id = window.conversation.id
+        with patch("main.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
+            window.delete_conversation(deleted_id)
+        self.assertIsNone(window.store.load_by_id(deleted_id))
+        self.assertEqual(len(window.messages), 1)
+        self.assertEqual(window.messages[0]["role"], "system")
         window.close()
 
     @patch("ollama_client.requests.post")

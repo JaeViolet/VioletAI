@@ -23,7 +23,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QScrollArea,
+    QSizePolicy,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -31,7 +33,7 @@ from PySide6.QtWidgets import (
 
 from config import APP_FOOTER_TEXT, APP_NAME, DEFAULT_MODEL_NAME, SYSTEM_PROMPT
 from conversation_store import Conversation, ConversationStore
-from design import app_stylesheet, icon
+from design import Motion, app_stylesheet, icon
 from ollama_client import ModelDiscoveryWorker, OllamaWorker
 from preferences import Preferences
 from sidebar import ChatSidebar, SearchOverlay
@@ -57,6 +59,7 @@ class MainWindow(QMainWindow):
         self.model_worker: ModelDiscoveryWorker | None = None
         self.pending_bubble: MessageBubble | None = None
         self.pending_row: QWidget | None = None
+        self.pending_column: QWidget | None = None
         self.thinking_row: QWidget | None = None
         self.streamed_answer = ""
         self._finalized_current_response = False
@@ -71,7 +74,7 @@ class MainWindow(QMainWindow):
 
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
-        self._render_timer.setInterval(24)
+        self._render_timer.setInterval(Motion.STREAM_INTERVAL)
         self._render_timer.timeout.connect(self._render_stream)
 
         self.setWindowTitle(APP_NAME)
@@ -85,15 +88,9 @@ class MainWindow(QMainWindow):
         self.input_box.setFocus()
 
     def _load_or_create_conversation(self) -> Conversation:
-        conversation = self.store.load_latest()
-        if conversation is None:
-            conversation = self.store.create(SYSTEM_PROMPT, self.active_model)
+        conversation = self.store.create(SYSTEM_PROMPT, self.active_model)
         if not conversation.messages or conversation.messages[0].get("role") != "system":
             conversation.messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
-        if conversation.model:
-            self.active_model = conversation.model
-            self.preferences.selected_model = self.active_model
-            self.preferences.save()
         return conversation
 
     def _build_interface(self) -> None:
@@ -112,11 +109,12 @@ class MainWindow(QMainWindow):
         self.sidebar.delete_requested.connect(self.delete_conversation)
         root.addWidget(self.sidebar)
 
-        main_panel = QFrame(objectName="mainPanel")
-        main_layout = QVBoxLayout(main_panel)
+        self.chat_panel = QFrame(objectName="mainPanel")
+        self.chat_panel.installEventFilter(self)
+        main_layout = QVBoxLayout(self.chat_panel)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
-        root.addWidget(main_panel, 1)
+        root.addWidget(self.chat_panel, 1)
 
         self.message_container = QWidget(objectName="messageContainer")
         self.message_layout = QVBoxLayout(self.message_container)
@@ -149,6 +147,7 @@ class MainWindow(QMainWindow):
         self.input_box.send_requested.connect(self.send_message)
         self.model_selector = QComboBox(objectName="modelSelector")
         self.model_selector.setToolTip("Select local Ollama model")
+        self.model_selector.view().setMinimumWidth(190)
         self.model_selector.currentTextChanged.connect(self._model_changed)
         self.send_button = QToolButton(objectName="sendButton")
         self.send_button.setToolTip("Send message")
@@ -178,14 +177,14 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(panel_layout)
         main_layout.addSpacing(10)
         self.setCentralWidget(central)
-        self.search_overlay = SearchOverlay(central)
+        self.search_overlay = SearchOverlay(self.chat_panel)
         self.search_overlay.selected.connect(self._select_from_search)
         self.search_overlay.search_changed.connect(self._rebuild_search_results)
 
     def _make_welcome(self) -> QWidget:
         welcome = QWidget(objectName="welcome")
         layout = QVBoxLayout(welcome)
-        layout.setContentsMargins(0, 50, 0, 25)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(7)
         icon = QLabel(APP_NAME, objectName="welcomeIcon")
         title = QLabel("How can I help you today?", objectName="welcomeTitle")
@@ -202,6 +201,7 @@ class MainWindow(QMainWindow):
                 item.widget().deleteLater()
         self.pending_bubble = None
         self.pending_row = None
+        self.pending_column = None
         self.thinking_row = None
 
     def _rebuild_messages(self) -> None:
@@ -212,7 +212,9 @@ class MainWindow(QMainWindow):
             if message.get("role") != "system"
         ]
         if not visible_messages:
-            self.message_layout.insertWidget(0, self._make_welcome())
+            self.message_layout.insertStretch(0, 2)
+            self.message_layout.insertWidget(1, self._make_welcome())
+            self.message_layout.insertStretch(2, 4)
         else:
             for index, message in visible_messages:
                 self._add_message(message.get("content", ""), message.get("role", "assistant"), index)
@@ -240,7 +242,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "scroll_area"):
             return super().eventFilter(watched, event)
         if (
-            watched is self.centralWidget()
+            watched is self.chat_panel
             and hasattr(self, "search_overlay")
             and self.search_overlay.isVisible()
         ):
@@ -276,11 +278,26 @@ class MainWindow(QMainWindow):
         for index in range(self.message_layout.count() - 1):
             row = self.message_layout.itemAt(index).widget()
             if row and row.property("messageRow"):
+                content = row.property("contentColumn")
+                if isinstance(content, QWidget):
+                    content.setMinimumWidth(available)
+                    content.setMaximumWidth(available)
                 bubble = row.property("bubble")
                 if isinstance(bubble, MessageBubble):
                     max_width = int(available * 0.74) if bubble.role == "user" else available
-                    bubble.setMaximumWidth(max_width)
-                    bubble.setMinimumWidth(0 if bubble.role == "user" else min(260, max_width))
+                    if bubble.role == "user":
+                        compact_width = bubble.preferred_width(max_width)
+                        bubble.setFixedWidth(compact_width)
+                        parent = bubble.parentWidget()
+                        if parent is not None:
+                            parent.setFixedWidth(compact_width)
+                    else:
+                        parent = bubble.parentWidget()
+                        if parent is not None:
+                            parent.setMinimumWidth(min(260, max_width))
+                            parent.setMaximumWidth(max_width)
+                        bubble.setMinimumWidth(min(260, max_width))
+                        bubble.setMaximumWidth(max_width)
                     bubble.updateGeometry()
 
     def _add_message(self, text: str, role: str, message_index: int | None = None) -> MessageBubble:
@@ -290,21 +307,36 @@ class MainWindow(QMainWindow):
         row_layout.setContentsMargins(0, 0, 0, 0)
         row_layout.setSpacing(0)
 
+        content = QWidget()
+        content.setObjectName("messageContentColumn")
+        content_layout = QHBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+
         column = QWidget()
+        if role == "user":
+            column.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Minimum)
+        else:
+            column.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         column_layout = QVBoxLayout(column)
         column_layout.setContentsMargins(0, 0, 0, 0)
         column_layout.setSpacing(6)
         bubble = MessageBubble(text, role)
         row.setProperty("bubble", bubble)
+        row.setProperty("contentColumn", content)
         column_layout.addWidget(bubble)
         if role == "assistant" and message_index is not None:
             self._attach_actions(column_layout, bubble, message_index)
 
         if role == "user":
-            row_layout.addStretch()
-            row_layout.addWidget(column)
+            content_layout.addStretch()
+            content_layout.addWidget(column)
         else:
-            row_layout.addWidget(column, 1)
+            content_layout.addWidget(column, 1)
+            content_layout.addStretch()
+        row_layout.addStretch(1)
+        row_layout.addWidget(content)
+        row_layout.addStretch(1)
         self.message_layout.insertWidget(self.message_layout.count() - 1, row)
         self._animate_appearance(row)
         self._resize_rows()
@@ -354,10 +386,19 @@ class MainWindow(QMainWindow):
         row.setProperty("messageRow", True)
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(ThinkingBubble())
-        layout.addStretch()
+        content = QWidget()
+        content.setObjectName("messageContentColumn")
+        content_layout = QHBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.addWidget(ThinkingBubble())
+        content_layout.addStretch()
+        row.setProperty("contentColumn", content)
+        layout.addStretch(1)
+        layout.addWidget(content)
+        layout.addStretch(1)
         self.message_layout.insertWidget(self.message_layout.count() - 1, row)
         self.thinking_row = row
+        self._resize_rows()
         self._scroll_to_bottom()
 
     def _remove_thinking(self) -> None:
@@ -376,7 +417,6 @@ class MainWindow(QMainWindow):
         return bar.maximum() - bar.value() <= self.NEAR_BOTTOM_PX
 
     def _scroll_to_bottom(self, smooth: bool = False) -> None:
-        self._auto_scroll_enabled = True
         QTimer.singleShot(0, lambda: self._perform_scroll(smooth))
 
     def _perform_scroll(self, smooth: bool) -> None:
@@ -447,10 +487,18 @@ class MainWindow(QMainWindow):
         self._rebuild_sidebar()
 
     def delete_conversation(self, conversation_id: str) -> None:
+        response = QMessageBox.question(
+            self,
+            "Delete conversation",
+            "Delete this conversation? This removes the saved JSON file.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if response != QMessageBox.StandardButton.Yes:
+            return
         self.store.delete(conversation_id)
         if conversation_id == self.conversation.id:
-            latest = self.store.load_latest()
-            self.conversation = latest or self.store.create(SYSTEM_PROMPT, self.active_model)
+            self.conversation = self.store.create(SYSTEM_PROMPT, self.active_model)
             self.messages = self.conversation.messages
             self._rebuild_messages()
         self._rebuild_sidebar()
@@ -522,16 +570,16 @@ class MainWindow(QMainWindow):
             self._remove_thinking()
             self.pending_bubble = self._add_message("", "assistant")
             self.pending_row = self.pending_bubble.parentWidget().parentWidget()
+            self.pending_column = self.pending_bubble.parentWidget()
         self.streamed_answer += chunk
         self._set_status("Generating")
         if not self._render_timer.isActive():
             self._render_timer.start()
-        if self._auto_scroll_enabled:
-            self._scroll_to_bottom(smooth=True)
 
     def _render_stream(self, force: bool = False) -> None:
         if self.pending_bubble is not None:
             self.pending_bubble.set_text(self.streamed_answer)
+            self._finalize_message_geometry()
             if self._auto_scroll_enabled or force:
                 self._scroll_to_bottom(smooth=True)
 
@@ -543,9 +591,13 @@ class MainWindow(QMainWindow):
         if self.pending_bubble is None:
             self.pending_bubble = self._add_message(answer, "assistant")
             self.pending_row = self.pending_bubble.parentWidget().parentWidget()
+            self.pending_column = self.pending_bubble.parentWidget()
         else:
             self.pending_bubble.set_text(answer)
+        self._finalize_message_geometry()
         self._append_assistant_message(answer)
+        if self._auto_scroll_enabled:
+            self._scroll_to_bottom(smooth=True)
         self._set_status("Ready")
 
     def _receive_cancelled(self) -> None:
@@ -574,9 +626,19 @@ class MainWindow(QMainWindow):
         self._finalized_current_response = True
         self._rebuild_sidebar()
         if self.pending_row is not None and self.pending_bubble is not None:
-            row_index = self.message_layout.indexOf(self.pending_row)
-            if row_index >= 0:
-                self._rebuild_messages()
+            message_index = len(self.messages) - 1
+            column = self.pending_bubble.parentWidget()
+            if isinstance(column, QWidget) and column.layout() is not None:
+                self._attach_actions(column.layout(), self.pending_bubble, message_index)
+        self._finalize_message_geometry()
+
+    def _finalize_message_geometry(self) -> None:
+        if self.pending_bubble is not None:
+            self.pending_bubble.layout.invalidate()
+            self.pending_bubble.adjustSize()
+        self.message_container.layout().activate()
+        self.message_container.adjustSize()
+        self._resize_rows()
 
     def _finalize_partial_response(self, stopped: bool = False) -> None:
         answer = self.streamed_answer.strip()
@@ -597,6 +659,7 @@ class MainWindow(QMainWindow):
         self.thread = None
         self.pending_bubble = None
         self.pending_row = None
+        self.pending_column = None
         self._set_controls_generating(False)
         if self.footer_status.text() in {"Connecting...", "Thinking...", "Generating..."}:
             self._set_status("Ready")
