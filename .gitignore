@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# VS Code
+.vscode/
+
+# Logs
+logs/
+*.log
+
+# Ollama models
+Ollama/Models/
+models/
+
+# Temporary files
+*.tmp
+*.cache
+
+# Windows
+Thumbs.db
+Desktop.ini
