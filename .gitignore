@@ -22,3 +22,5 @@ models/
 # Windows
 Thumbs.db
 Desktop.ini
+
+*.lnk
