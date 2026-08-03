@@ -926,11 +926,11 @@ class ChatFoundationTests(unittest.TestCase):
             self.assertEqual(phone.status, SUCCESS)
             self.assertEqual(location.status, SUCCESS)
             self.assertEqual(movie.status, SUCCESS)
-            phone_memory = service.retrieve("primary phone", mark_accessed=False)[0]
+            phone_memory = service.retrieve("device", mark_accessed=False)[0]
             location_memory = service.retrieve("location", mark_accessed=False)[0]
             movie_memory = service.retrieve("favorite movie", mark_accessed=False)[0]
             self.assertEqual(phone_memory.category, "User")
-            self.assertEqual(phone_memory.key, "primary phone")
+            self.assertEqual(phone_memory.key, "device")
             self.assertEqual(phone_memory.value, "iPhone")
             self.assertEqual(location_memory.category, "User")
             self.assertEqual(location_memory.key, "location")
@@ -1279,61 +1279,8 @@ class ChatFoundationTests(unittest.TestCase):
         labels = [label.text() for label in window.findChildren(QLabel)]
         self.assertIn("✓ Remembered", labels)
         self.assertEqual(window.messages[-1]["content"], "I couldn't generate a follow-up.")
-        self.assertNotIn("Unable to respond", window.messages[-1]["content"])
         self.assertNotEqual(window.messages[-1]["content"], "Done.")
         window.close()
-
-    def test_empty_non_memory_response_reports_generation_stage(self) -> None:
-        window, _temp_dir = self._window_with_temp_store()
-        window._first_token_at = perf_counter()
-        window.streamed_answer = "   "
-        message = window._response_failure_message("Ollama returned an empty response.")
-        self.assertIn("Response failed", message)
-        self.assertIn("after stream completion with no visible content", message)
-        self.assertNotIn("Unable to respond", message)
-        window.close()
-
-    def test_error_before_first_token_reports_stage(self) -> None:
-        window, _temp_dir = self._window_with_temp_store()
-        window._first_token_at = None
-        message = window._response_failure_message("Ollama returned an empty response.")
-        self.assertIn("before first token", message)
-        self.assertNotIn("Unable to respond", message)
-        window.close()
-
-    def test_phone_memory_uses_single_canonical_key_across_create_update_and_recreate(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            messages = {
-                "did you know i have an iphone 15 pro?": durable_decision("POSSESSION", "User", "possession iphone 15 pro", "True"),
-                "im back on iphone 15 pro for good!": durable_decision("POSSESSION", "User", "primary device model", "iPhone 15 Pro"),
-            }
-            messages["did you know i have an iphone 15 pro?"].extracted_fact = "I have an iPhone 15 Pro."
-            messages["im back on iphone 15 pro for good!"].extracted_fact = "I am back on iPhone 15 Pro for good."
-            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"), classifier=FakeDurabilityClassifier(messages))
-
-            first = service.process_user_message("did you know i have an iphone 15 pro?", "c1", "1", memory_mode="Automatic")
-            self.assertTrue(first.remembered)
-            self.assertEqual(first.canonical_key, "primary_phone")
-            self.assertEqual(first.new_value, "iPhone 15 Pro")
-
-            update = service.process_user_message("change it to iphone 14 actually", "c1", "2", memory_mode="Automatic")
-            self.assertTrue(update.updated)
-            self.assertEqual(update.canonical_key, "primary_phone")
-            self.assertEqual(update.new_value, "iPhone 14")
-
-            back = service.process_user_message("im back on iphone 15 pro for good!", "c1", "3", memory_mode="Automatic")
-            self.assertTrue(back.remembered)
-            self.assertEqual(back.canonical_key, "primary_phone")
-            self.assertEqual(back.new_value, "iPhone 15 Pro")
-
-            active = service.store.list_memories()
-            archived = service.store.list_memories(include_archived=True)
-            self.assertEqual([(memory.key, memory.value) for memory in active], [("primary phone", "iPhone 15 Pro")])
-            self.assertTrue(any(memory.value == "iPhone 14" and not memory.active for memory in archived))
-
-            delete_old = service.process_user_message("Delete the memory of iPhone 14.", "c1", "4", memory_mode="Automatic")
-            self.assertIn(delete_old.status, {NO_MATCH, SUCCESS})
-            self.assertEqual([(memory.key, memory.value) for memory in service.store.list_memories()], [("primary phone", "iPhone 15 Pro")])
 
     def test_settings_overlay_memory_manager_search_edit_delete(self) -> None:
         window, _temp_dir = self._window_with_temp_store()

@@ -1100,27 +1100,12 @@ class MainWindow(QMainWindow):
         if self.pending_bubble is not None and self.streamed_answer.strip():
             self.pending_bubble.set_text(self.streamed_answer)
             self._finalize_partial_response()
-        self._add_message(self._response_failure_message(error), "error")
+        self._add_message(f"**Unable to respond**\n\n{error}", "error")
         self.store.save(self.conversation)
         self._set_status("Error")
         self._scroll_to_bottom()
         self._record_diagnostics_elapsed("render_ms", render_started)
         self._finalize_diagnostics(error, "Generation", error)
-
-    def _response_failure_message(self, error: str) -> str:
-        return f"**Response failed**\n\nStage: {self._response_failure_stage(error)}\n\nError: {error}"
-
-    def _response_failure_stage(self, error: str) -> str:
-        lowered = error.casefold()
-        if self._generation_cancel_requested:
-            return "cancelled"
-        if self._first_token_at is None:
-            return "before first token"
-        if "empty response" in lowered and not self.streamed_answer.strip():
-            return "after stream completion with no visible content"
-        if self.streamed_answer.strip():
-            return "during streaming or finalization"
-        return "generation"
 
     def _append_assistant_message(self, answer: str) -> None:
         if self._finalized_current_response:
