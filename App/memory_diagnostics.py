@@ -103,8 +103,10 @@ def _format_record(data: dict[str, Any]) -> str:
         "",
     ]
 
-    if kind == "Memory":
-        lines.extend(["Memory", _memory_summary(data), ""])
+    classifier = _classifier_line(data)
+    if classifier:
+        lines.append(classifier)
+    lines.extend([f"{'Memory':<12} {_memory_summary(data)}", ""])
 
     timing_lines = _timing_lines(data)
     if timing_lines:
@@ -126,6 +128,8 @@ def _format_record(data: dict[str, Any]) -> str:
 def _record_kind(data: dict[str, Any]) -> str:
     action = str(data.get("action") or data.get("operation_executed") or "")
     operation = str(data.get("operation_executed") or "")
+    if operation == "SKIPPED":
+        return "Chat"
     if action and action != "NONE" and operation != "Normal Chat":
         return "Memory"
     return "Chat"
@@ -141,12 +145,35 @@ def _quote(value: object) -> str:
 
 
 def _memory_summary(data: dict[str, Any]) -> str:
-    action = str(data.get("operation_executed") or data.get("action") or "MEMORY")
-    status = str(data.get("structured_result") or data.get("database_result") or "")
-    if status and status not in {"SUCCESS", "NORMAL_CHAT"}:
-        return f"{action} • FAILED ({status})"
-    detail = _memory_detail(data)
-    return f"{action} • {detail}" if detail else action
+    if data.get("memory_decision"):
+        return str(data.get("memory_decision"))
+    action_for_summary = str(data.get("operation_executed") or data.get("action") or "")
+    status_for_summary = str(data.get("structured_result") or data.get("database_result") or "")
+    if not action_for_summary or action_for_summary in {"NONE", "Normal Chat"} or status_for_summary == "NORMAL_CHAT":
+        return "NONE"
+    if status_for_summary and status_for_summary not in {"SUCCESS", "NORMAL_CHAT"}:
+        if action_for_summary == "SKIPPED":
+            return f"SKIPPED • {status_for_summary}"
+        return f"{action_for_summary} • FAILED ({status_for_summary})"
+    detail_for_summary = _memory_detail(data)
+    return f"{action_for_summary} • {detail_for_summary}" if detail_for_summary else action_for_summary
+
+
+def _classifier_line(data: dict[str, Any]) -> str:
+    source = str(data.get("classifier_source") or "")
+    if not source:
+        return ""
+    latency = _format_duration(data.get("classifier_latency_ms"))
+    rejection = str(data.get("rejection_reason") or "")
+    if source == "FALLBACK" and rejection == "CLASSIFIER_FAILED":
+        detail = str(data.get("error") or "CLASSIFIER_FAILED")
+        return f"{'Classifier':<13} FAILED • {detail} • {latency}"
+    klass = str(data.get("durability_class") or "NONE")
+    try:
+        confidence = f"{float(data.get('durability_confidence') or 0):.2f}"
+    except (TypeError, ValueError):
+        confidence = "0.00"
+    return f"{'Classifier':<13} {source} • {klass} • {confidence} • {latency}"
 
 
 def _memory_detail(data: dict[str, Any]) -> str:

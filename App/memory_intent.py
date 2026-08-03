@@ -10,10 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import re
+from time import perf_counter
 
 import requests
 
-from config import DEFAULT_MODEL_NAME, OLLAMA_URL
+from config import AUTOMATIC_MEMORY_CLASSIFIER_TIMEOUT_SECONDS, DEFAULT_MODEL_NAME, OLLAMA_URL
 from memory_embeddings import canonical_key
 
 
@@ -44,6 +45,23 @@ class MemoryAnalysis:
     referenced_previous_user_message: str | None = None
     diagnostic_reasoning: str = ""
     original_text: str = ""
+
+
+@dataclass(slots=True)
+class DurableMemoryDecision:
+    is_user_fact: bool = False
+    durability_class: str = "NONE"
+    durability_confidence: float = 0.0
+    extracted_fact: str = ""
+    category: str = ""
+    subject: str = "user"
+    canonical_key: str = ""
+    value: str = ""
+    save_automatically: bool = False
+    rejection_reason: str = "LOW_CONFIDENCE"
+    classifier_source: str = "FALLBACK"
+    classifier_latency_ms: float = 0.0
+    error: str = ""
 
 
 class MemoryIntentClassifier:
@@ -173,6 +191,93 @@ class MemoryIntentClassifier:
             return MemoryAnalysis(False, NONE, confidence, diagnostic_reasoning="local LLM classification", original_text=text)
         return self._analysis(text, action, confidence, key=key, value=value, referenced=previous_user_text, reason="local LLM classification")
 
+    def classify_durable_memory(self, text: str) -> DurableMemoryDecision:
+        started = perf_counter()
+        prompt = (
+            "Decide if this user message contains a durable personal fact worth storing in long-term memory. "
+            "Return only strict JSON with keys: is_user_fact boolean, durability_class string, "
+            "durability_confidence number 0-1, extracted_fact string, category string, subject string, "
+            "canonical_key string, value string, save_automatically boolean, rejection_reason string. "
+            "Durable classes: IDENTITY, PREFERENCE, POSSESSION, RELATIONSHIP, LONG_TERM_INTEREST, SKILL, "
+            "LONG_TERM_PROJECT, LOCATION. Reject classes: TEMPORARY_STATE, CURRENT_ACTIVITY, SHORT_TERM_PLAN, "
+            "CASUAL_STATEMENT, NONE. Store only durable facts likely useful for weeks or months. "
+            "Do not save current activities like playing a game right now, drinking water, brushing teeth, "
+            "temporary feelings, short-term plans, greetings, or casual opinions. "
+            "Use categories only: User, Preferences, Projects, People, Facts, Temporary. "
+            "Examples: 'My favorite color is violet' => PREFERENCE favorite_color violet save true. "
+            "'I am playing Archero 2' => CURRENT_ACTIVITY save false. "
+            "'I play Archero 2 regularly' => LONG_TERM_INTEREST save true. "
+            f"User message: {text}"
+        )
+        if not self.use_llm:
+            return self._fallback_durable_decision(text, started)
+        try:
+            response = requests.post(
+                OLLAMA_URL,
+                json={
+                    "model": self.model,
+                    "stream": False,
+                    "messages": [
+                        {"role": "system", "content": "You classify durable long-term memory facts and output only strict JSON."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "options": {"temperature": 0, "num_predict": 180},
+                    "think": False,
+                },
+                timeout=AUTOMATIC_MEMORY_CLASSIFIER_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            content = response.json().get("message", {}).get("content", "")
+            data = json.loads(_extract_json(content))
+            decision = _decision_from_data(data)
+            decision.classifier_source = "LLM"
+            decision.classifier_latency_ms = round((perf_counter() - started) * 1000, 3)
+            return decision
+        except requests.Timeout:
+            return DurableMemoryDecision(
+                durability_class="CLASSIFIER_FAILED",
+                rejection_reason="CLASSIFIER_FAILED",
+                classifier_source="FALLBACK",
+                classifier_latency_ms=round((perf_counter() - started) * 1000, 3),
+                error="timeout",
+            )
+        except Exception as error:
+            return DurableMemoryDecision(
+                durability_class="CLASSIFIER_FAILED",
+                rejection_reason="CLASSIFIER_FAILED",
+                classifier_source="FALLBACK",
+                classifier_latency_ms=round((perf_counter() - started) * 1000, 3),
+                error=str(error),
+            )
+
+    def _fallback_durable_decision(self, text: str, started: float) -> DurableMemoryDecision:
+        body = _extract_create_body(text)
+        key, value = _extract_key_value(body or text)
+        if key and value:
+            category = _category_for_key(key)
+            return DurableMemoryDecision(
+                is_user_fact=True,
+                durability_class=_class_for_key(key),
+                durability_confidence=0.9,
+                extracted_fact=body or text,
+                category=category,
+                subject="user",
+                canonical_key=canonical_key(key),
+                value=value,
+                save_automatically=True,
+                rejection_reason="",
+                classifier_source="DETERMINISTIC",
+                classifier_latency_ms=round((perf_counter() - started) * 1000, 3),
+            )
+        return DurableMemoryDecision(
+            is_user_fact=False,
+            durability_class=_fallback_rejection_class(text),
+            durability_confidence=0.9,
+            rejection_reason=_fallback_rejection_class(text),
+            classifier_source="DETERMINISTIC",
+            classifier_latency_ms=round((perf_counter() - started) * 1000, 3),
+        )
+
 
 def _extract_json(text: str) -> str:
     start = text.find("{")
@@ -199,9 +304,27 @@ def _extract_key_value(text: str) -> tuple[str, str]:
     match = re.search(r"\bi have an? (?P<value>iphone|android phone|phone|ipad|tablet|macbook|laptop|desktop|pc|computer)$", cleaned, flags=re.IGNORECASE)
     if match:
         return "device", _normalize_device_value(match.group("value"))
+    match = re.search(r"\bi own an? (?P<value>iphone|android phone|phone|ipad|tablet|macbook|laptop|desktop|pc|computer)$", cleaned, flags=re.IGNORECASE)
+    if match:
+        return "device", _normalize_device_value(match.group("value"))
     match = re.search(r"\b(?:i live in|i am from|i'?m from) (?P<value>.+)$", cleaned, flags=re.IGNORECASE)
     if match:
         return "location", _clean_value(match.group("value"))
+    match = re.search(r"\bi(?:'m| am) left[- ]handed$", cleaned, flags=re.IGNORECASE)
+    if match:
+        return "handedness", "left-handed"
+    match = re.search(r"\bi love (?P<value>.+)$", cleaned, flags=re.IGNORECASE)
+    if match:
+        return "interest", _clean_value(match.group("value"))
+    match = re.search(r"\bi(?:'m| am) learning (?P<value>.+)$", cleaned, flags=re.IGNORECASE)
+    if match:
+        return "learning", _clean_value(match.group("value"))
+    match = re.search(r"\bi(?:'m| am) building (?P<value>.+)$", cleaned, flags=re.IGNORECASE)
+    if match:
+        return "project", _clean_value(match.group("value"))
+    match = re.search(r"\bi play (?P<value>.+?) regularly$", cleaned, flags=re.IGNORECASE)
+    if match:
+        return "interest", _clean_value(match.group("value"))
     match = re.search(r"\bthe (?P<key>color|colour) i like most is (?P<value>.+?)(?: now)?$", cleaned, flags=re.IGNORECASE)
     if match:
         return "favorite color", _clean_value(match.group("value"))
@@ -246,6 +369,60 @@ def _clean_value(value: str) -> str:
         if cleaned == previous:
             break
     return cleaned
+
+
+def _decision_from_data(data: object) -> DurableMemoryDecision:
+    if not isinstance(data, dict):
+        raise ValueError("classifier output was not an object")
+    return DurableMemoryDecision(
+        is_user_fact=bool(data.get("is_user_fact")),
+        durability_class=str(data.get("durability_class") or "NONE").upper(),
+        durability_confidence=float(data.get("durability_confidence") or 0.0),
+        extracted_fact=str(data.get("extracted_fact") or ""),
+        category=str(data.get("category") or ""),
+        subject=str(data.get("subject") or "user"),
+        canonical_key=canonical_key(str(data.get("canonical_key") or "")),
+        value=_clean_value(str(data.get("value") or "")),
+        save_automatically=bool(data.get("save_automatically")),
+        rejection_reason=str(data.get("rejection_reason") or ""),
+    )
+
+
+def _category_for_key(key: str) -> str:
+    normalized = canonical_key(key)
+    if normalized in {"favorite_color", "favorite_movie", "favorite_drink", "preference"}:
+        return "Preferences"
+    if normalized in {"project"}:
+        return "Projects"
+    return "User"
+
+
+def _class_for_key(key: str) -> str:
+    normalized = canonical_key(key)
+    if normalized.startswith("favorite") or normalized in {"interest"}:
+        return "PREFERENCE"
+    if normalized == "device":
+        return "POSSESSION"
+    if normalized == "location":
+        return "LOCATION"
+    if normalized == "project":
+        return "LONG_TERM_PROJECT"
+    if normalized == "learning":
+        return "SKILL"
+    return "IDENTITY"
+
+
+def _fallback_rejection_class(text: str) -> str:
+    lowered = text.casefold()
+    if re.search(r"\bi(?:'m| am)\s+(playing|drinking|brushing)\b", lowered):
+        return "CURRENT_ACTIVITY"
+    if re.search(r"\bi(?:'m| am)\s+(tired|hungry)\b", lowered):
+        return "TEMPORARY_STATE"
+    if re.search(r"\b(i(?:'m| am) going to|i'll be back)\b", lowered):
+        return "SHORT_TERM_PLAN"
+    if lowered.strip(" .!?") in {"hello", "hi", "how are you", "how are you today"}:
+        return "CASUAL_STATEMENT"
+    return "LOW_CONFIDENCE"
 
 
 def _normalize_device_value(value: str) -> str:

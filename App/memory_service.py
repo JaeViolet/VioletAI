@@ -9,7 +9,8 @@ from time import perf_counter
 
 from memory_diagnostics import MemoryDiagnostics
 from memory_embeddings import canonical_key, embed_text, cosine_similarity
-from memory_intent import CREATE, DELETE, NONE, RETRIEVE, UPDATE, MemoryAnalysis, MemoryIntentClassifier
+from config import AUTOMATIC_MEMORY_CONFIDENCE_THRESHOLD
+from memory_intent import CREATE, DELETE, NONE, RETRIEVE, UPDATE, DurableMemoryDecision, MemoryAnalysis, MemoryIntentClassifier
 from memory_models import MemoryRecord, ParsedMemory
 from memory_store import MemoryStore, normalize_key
 
@@ -21,6 +22,7 @@ INVALID_MEMORY_REQUEST = "INVALID_MEMORY_REQUEST"
 SUCCESS = "SUCCESS"
 RETRIEVAL_EMPTY = "RETRIEVAL_EMPTY"
 DISABLED_BY_MODE = "DISABLED_BY_MODE"
+PENDING_CONFIRMATION = "PENDING_CONFIRMATION"
 
 REMEMBER_PREFIXES = (
     "remember",
@@ -101,6 +103,28 @@ CREATE_COMMAND_WRAPPER = re.compile(
     r"[:\s]*(?P<body>.+)$",
     re.IGNORECASE,
 )
+SUGGEST_CONFIRMATIONS = {
+    "yes",
+    "yeah",
+    "yep",
+    "sure",
+    "ok",
+    "okay",
+    "do that",
+    "remember it",
+    "save it",
+    "store it",
+}
+DURABLE_CLASSES = {
+    "IDENTITY",
+    "PREFERENCE",
+    "POSSESSION",
+    "RELATIONSHIP",
+    "LONG_TERM_INTEREST",
+    "SKILL",
+    "LONG_TERM_PROJECT",
+    "LOCATION",
+}
 
 
 @dataclass(slots=True)
@@ -135,6 +159,8 @@ class MemoryService:
         self.store = store
         self.max_retrieved = max_retrieved
         self.classifier = classifier or MemoryIntentClassifier()
+        self._pending_suggestion: ParsedMemory | None = None
+        self._pending_suggestion_source: str = ""
         self.migrate_duplicates()
 
     def migrate_duplicates(self) -> None:
@@ -171,6 +197,7 @@ class MemoryService:
         diagnostics = diagnostics or MemoryDiagnostics(diagnostics_enabled)
         diagnostics.record(user_message=text, memory_mode=memory_mode)
         if memory_mode == "Off":
+            self._pending_suggestion = None
             result = MemoryActionResult(
                 False,
                 status=DISABLED_BY_MODE,
@@ -182,11 +209,15 @@ class MemoryService:
                 action=NONE,
                 validation_result=DISABLED_BY_MODE,
                 structured_result=DISABLED_BY_MODE,
+                memory_decision="SKIPPED • MEMORY_MODE_DISABLED",
                 ui_confirmation="SKIPPED",
                 assistant_response="Normal chat",
             )
             diagnostics.emit()
             return result
+        suggested = self._handle_suggest_confirmation(text, conversation_id, source_message_id, diagnostics, memory_mode)
+        if suggested is not None:
+            return suggested
         analysis_started = perf_counter()
         analysis = self.classifier.analyze(text, previous_user_text)
         diagnostics.record_elapsed("analysis_ms", analysis_started)
@@ -216,6 +247,7 @@ class MemoryService:
                 validation_result="NOT_MEMORY_RELATED",
                 operation_executed="Normal Chat",
                 structured_result="NORMAL_CHAT",
+                memory_decision=diagnostics.data.get("memory_decision") or "NONE",
                 ui_confirmation="SKIPPED",
                 assistant_response="Normal chat",
             )
@@ -243,6 +275,7 @@ class MemoryService:
                     operation_executed=RETRIEVE,
                     database_result=RETRIEVAL_EMPTY,
                     structured_result=RETRIEVAL_EMPTY,
+                    memory_decision=f"SKIPPED • {RETRIEVAL_EMPTY}",
                     failed_stage="Candidate Retrieval",
                     failure_reason=result.failure_reason,
                     ui_confirmation="SKIPPED",
@@ -269,6 +302,7 @@ class MemoryService:
                 operation_executed=RETRIEVE,
                 database_result=SUCCESS,
                 structured_result=SUCCESS,
+                memory_decision=RETRIEVE,
                 ui_confirmation="SKIPPED",
                 assistant_response=result.response,
             )
@@ -453,6 +487,7 @@ class MemoryService:
             validation_result="NO_EXECUTABLE_MEMORY_OPERATION",
             operation_executed="Normal Chat",
             structured_result="NORMAL_CHAT",
+            memory_decision="NONE",
             ui_confirmation="SKIPPED",
             assistant_response="Normal chat",
         )
@@ -479,16 +514,28 @@ class MemoryService:
     ) -> MemoryActionResult | None:
         if memory_mode not in {"Suggest", "Automatic"}:
             return None
-        parsed = self.parse_memory(text)
-        if parsed is None or parsed.confidence < 0.85:
-            return None
-        if not self._is_durable_user_memory(text, parsed):
+        classifier_started = perf_counter()
+        decision = self.classifier.classify_durable_memory(text)
+        diagnostics.record_elapsed("analysis_ms", classifier_started)
+        self._record_classifier_diagnostics(diagnostics, decision)
+        parsed, rejection = self._validated_automatic_decision(decision)
+        if parsed is None:
+            diagnostics.record(
+                validation_result=rejection,
+                operation_executed="SKIPPED",
+                structured_result=rejection,
+                memory_decision=f"SKIPPED • {rejection}",
+                ui_confirmation="SKIPPED",
+                assistant_response="Normal chat",
+            )
             return None
         if memory_mode == "Suggest":
+            self._pending_suggestion = parsed
+            self._pending_suggestion_source = text
             result = MemoryActionResult(
                 True,
                 "Would you like me to remember that?",
-                status=SUCCESS,
+                status=PENDING_CONFIRMATION,
                 action=CREATE,
                 confirmation="SKIPPED",
                 analysis=analysis,
@@ -531,12 +578,135 @@ class MemoryService:
         self._emit_success_diagnostics(diagnostics, result, memory, CREATE)
         return result
 
+    def _handle_suggest_confirmation(
+        self,
+        text: str,
+        conversation_id: str,
+        source_message_id: str | None,
+        diagnostics: MemoryDiagnostics,
+        memory_mode: str,
+    ) -> MemoryActionResult | None:
+        if memory_mode != "Suggest" or self._pending_suggestion is None:
+            return None
+        cleaned = text.casefold().strip(" .!?:;")
+        if cleaned not in SUGGEST_CONFIRMATIONS:
+            return None
+        parsed = self._pending_suggestion
+        source_text = self._pending_suggestion_source or text
+        self._pending_suggestion = None
+        self._pending_suggestion_source = ""
+        try:
+            execute_started = perf_counter()
+            memory = self.remember(parsed, conversation_id, source_message_id, source_text)
+            diagnostics.record_elapsed("execute_ms", execute_started)
+        except Exception as error:
+            diagnostics.record_elapsed("execute_ms", execute_started)
+            result = MemoryActionResult(
+                True,
+                f"I couldn't save that memory: {error}",
+                status=WRITE_FAILED,
+                action=CREATE,
+                error_code=WRITE_FAILED,
+                failure_reason=str(error),
+            )
+            self._emit_failure_diagnostics(diagnostics, result, "Database Execution")
+            return result
+        result = MemoryActionResult(
+            True,
+            f"I'll remember that {memory.key} is {memory.value}.",
+            status=SUCCESS,
+            action=CREATE,
+            memory_id=memory.id,
+            canonical_key=canonical_key(memory.key),
+            new_value=memory.value,
+            affected_records=[memory.id],
+            confirmation="✓ Remembered",
+            remembered=True,
+            memories=[memory],
+        )
+        self._emit_success_diagnostics(diagnostics, result, memory, CREATE)
+        return result
+
     def _is_durable_user_memory(self, text: str, parsed: ParsedMemory) -> bool:
         lowered = text.casefold()
         blocked = ("search", "according to", "quote", "article", "website", "tool", "assistant said")
         if any(word in lowered for word in blocked):
             return False
         return parsed.category in {"User", "Preferences", "Projects", "People"} and parsed.subject == "user"
+
+    def _validated_automatic_decision(self, decision: DurableMemoryDecision) -> tuple[ParsedMemory | None, str]:
+        rejection = (decision.rejection_reason or decision.durability_class or "LOW_CONFIDENCE").upper()
+        if decision.classifier_source == "FALLBACK" and decision.error:
+            return None, "CLASSIFIER_FAILED"
+        if not decision.is_user_fact:
+            return None, rejection if rejection not in {"", "NONE"} else "NOT_USER_FACT"
+        if not decision.save_automatically:
+            return None, rejection if rejection not in {"", "NONE"} else "LOW_CONFIDENCE"
+        if decision.durability_class not in DURABLE_CLASSES:
+            return None, decision.durability_class or "LOW_CONFIDENCE"
+        if decision.durability_confidence < AUTOMATIC_MEMORY_CONFIDENCE_THRESHOLD:
+            return None, "LOW_CONFIDENCE"
+        if decision.category and decision.category not in {"User", "Preferences", "Projects", "People", "Facts"}:
+            return None, "INVALID_CLASSIFIER_OUTPUT"
+        parsed_hint = self.parse_memory(decision.extracted_fact or "")
+        category = self._automatic_category(decision, parsed_hint)
+        key = decision.canonical_key
+        value = clean_memory_value(decision.value)
+        if parsed_hint is not None and parsed_hint.key != "note" and (
+            value.casefold() in {"true", "false", "yes", "no"}
+            or not value
+            or not key
+            or len(key.split()) > 3
+            or parsed_hint.key in {"name", "location", "device", "handedness", "learning", "project"}
+            or parsed_hint.key.startswith("favorite ")
+        ):
+            key = parsed_hint.key
+            value = parsed_hint.value
+            category = self._automatic_category(decision, parsed_hint)
+        if category not in {"User", "Preferences", "Projects", "People", "Facts"}:
+            return None, "INVALID_CLASSIFIER_OUTPUT"
+        if not key or not value:
+            return None, "INVALID_CLASSIFIER_OUTPUT"
+        parsed = ParsedMemory(
+            category=category,
+            subject="user",
+            key=key.replace("_", " "),
+            value=clean_memory_value(value),
+            content=decision.extracted_fact or f"{key} is {value}",
+            confidence=decision.durability_confidence,
+        )
+        if not self._is_durable_user_memory(decision.extracted_fact or parsed.content, parsed):
+            return None, "LOW_CONFIDENCE"
+        return parsed, ""
+
+    def _automatic_category(self, decision: DurableMemoryDecision, parsed_hint: ParsedMemory | None) -> str:
+        if parsed_hint is not None and parsed_hint.category != "Facts":
+            if parsed_hint.key.casefold().startswith(("favorite ", "favourite ", "fav ")):
+                return "Preferences"
+            return parsed_hint.category
+        if decision.category in {"User", "Preferences", "Projects", "People"}:
+            return decision.category
+        mapping = {
+            "PREFERENCE": "Preferences",
+            "LONG_TERM_INTEREST": "Preferences",
+            "LONG_TERM_PROJECT": "Projects",
+            "RELATIONSHIP": "People",
+            "IDENTITY": "User",
+            "POSSESSION": "User",
+            "SKILL": "User",
+            "LOCATION": "User",
+        }
+        return mapping.get(decision.durability_class, decision.category)
+
+    def _record_classifier_diagnostics(self, diagnostics: MemoryDiagnostics, decision: DurableMemoryDecision) -> None:
+        diagnostics.record(
+            classifier_source=decision.classifier_source,
+            durability_class=decision.durability_class,
+            durability_confidence=round(decision.durability_confidence, 3),
+            classifier_latency_ms=round(decision.classifier_latency_ms, 3),
+            rejection_reason=decision.rejection_reason,
+            error=decision.error,
+        )
 
     def _emit_success_diagnostics(
         self,
@@ -552,6 +722,7 @@ class MemoryService:
             operation_executed=operation,
             database_result=SUCCESS,
             structured_result=result.status,
+            memory_decision=f"{operation} • {memory.key} = {memory.value}",
             ui_confirmation=result.confirmation or "SKIPPED",
             assistant_response=result.response,
             selected_memory_value=memory.value,
@@ -572,6 +743,7 @@ class MemoryService:
             operation_executed=result.action,
             database_result=result.status,
             structured_result=result.status or result.error_code,
+            memory_decision=f"{result.action} • FAILED ({result.status or result.error_code})",
             failed_stage=failed_stage,
             failure_reason=result.failure_reason or result.response,
             ui_confirmation="SKIPPED",
@@ -591,6 +763,11 @@ class MemoryService:
                 new_value=result.new_value,
                 database_result=SUCCESS,
                 structured_result=SUCCESS,
+                memory_decision=(
+                    f"UPDATE • {result.canonical_key.replace('_', ' ')}: {result.previous_value} → {result.new_value}"
+                    if result.action == UPDATE and result.previous_value and result.new_value
+                    else f"{result.action} • {result.new_value or result.canonical_key.replace('_', ' ')}"
+                ),
                 ui_confirmation=result.confirmation or "SKIPPED",
                 assistant_response=result.response,
             )
@@ -603,6 +780,7 @@ class MemoryService:
                 operation_executed=result.action,
                 database_result=result.status,
                 structured_result=result.status or result.error_code,
+                memory_decision=f"{result.action} • FAILED ({result.status or result.error_code})",
                 failed_stage="Validation" if result.status == MULTIPLE_MATCHES else "Memory Pipeline",
                 failure_reason=result.failure_reason or result.response,
                 ui_confirmation="SKIPPED",
@@ -758,13 +936,19 @@ class MemoryService:
         patterns = [
             (r"^my (?P<key>.+?) is (?P<value>.+)$", "User"),
             (r"^i have an? (?P<value>iphone|android phone|phone|ipad|tablet|macbook|laptop|desktop|pc|computer)$", "User"),
+            (r"^i own an? (?P<value>iphone|android phone|phone|ipad|tablet|macbook|laptop|desktop|pc|computer)$", "User"),
             (r"^i am from (?P<value>.+)$", "User"),
             (r"^i'?m from (?P<value>.+)$", "User"),
+            (r"^i(?: am|'?m) left[- ]handed$", "User"),
+            (r"^i(?: am|'?m) learning (?P<value>.+)$", "User"),
+            (r"^i(?: am|'?m) building (?P<value>.+)$", "Projects"),
             (r"^i am (?P<value>.+)$", "User"),
             (r"^i'?m (?P<value>.+)$", "User"),
             (r"^i live in (?P<value>.+)$", "User"),
             (r"^i like (?P<value>.+)$", "Preferences"),
             (r"^i prefer (?P<value>.+)$", "Preferences"),
+            (r"^i love (?P<value>.+)$", "Preferences"),
+            (r"^i play (?P<value>.+?) regularly$", "Preferences"),
             (r"^project (?P<key>.+?) is (?P<value>.+)$", "Projects"),
         ]
         for pattern, detected_category in patterns:
@@ -781,10 +965,17 @@ class MemoryService:
             else:
                 if match_text.casefold().startswith(("i live in", "i am from", "i'm from", "im from")):
                     key = "location"
-                elif match_text.casefold().startswith("i have"):
+                elif match_text.casefold().startswith(("i have", "i own")):
                     key = "device"
-                elif match_text.casefold().startswith("i like") or match_text.casefold().startswith("i prefer"):
-                    key = "preference"
+                elif match_text.casefold().startswith(("i am left", "i'm left", "im left")):
+                    key = "handedness"
+                    groups["value"] = "left-handed"
+                elif match_text.casefold().startswith(("i like", "i prefer", "i love", "i play")):
+                    key = "interest" if not match_text.casefold().startswith(("i like", "i prefer")) else "preference"
+                elif "learning" in match_text.casefold():
+                    key = "learning"
+                elif "building" in match_text.casefold():
+                    key = "project"
                 else:
                     key = "identity"
             value = normalize_memory_value(key, groups["value"])

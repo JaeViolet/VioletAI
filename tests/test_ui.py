@@ -25,7 +25,7 @@ import memory_diagnostics  # noqa: E402
 from design import Colors, PNG_CONTROL_ICON_SIZE, asset_icon_path, icon  # noqa: E402
 from main import MainWindow  # noqa: E402
 from memory_embeddings import EMBEDDING_MODEL_NAME, canonical_key, cosine_similarity, embed_text  # noqa: E402
-from memory_intent import CREATE, DELETE, IGNORE, NONE, RETRIEVE, UPDATE, MemoryAnalysis, MemoryIntentClassifier  # noqa: E402
+from memory_intent import CREATE, DELETE, IGNORE, NONE, RETRIEVE, UPDATE, DurableMemoryDecision, MemoryAnalysis, MemoryIntentClassifier  # noqa: E402
 from memory_models import CATEGORIES, ParsedMemory  # noqa: E402
 from memory_service import (  # noqa: E402
     INVALID_REFERENCE,
@@ -41,6 +41,54 @@ from ollama_client import InvalidStreamError, OllamaWorker, discover_models, ite
 from prompts import build_memory_result_response_messages, build_ollama_messages, format_relevant_memories  # noqa: E402
 from sidebar import ChatSidebar  # noqa: E402
 from widgets import AutoGrowingInput, CodeBlock, MarkdownView, MessageActions, MessageBubble  # noqa: E402
+
+
+class FakeDurabilityClassifier(MemoryIntentClassifier):
+    def __init__(self, decisions: dict[str, DurableMemoryDecision]) -> None:
+        super().__init__(use_llm=False)
+        self.decisions = decisions
+        self.calls: list[str] = []
+
+    def classify_durable_memory(self, text: str) -> DurableMemoryDecision:
+        self.calls.append(text)
+        decision = self.decisions[text]
+        decision.classifier_latency_ms = decision.classifier_latency_ms or 12.0
+        return decision
+
+
+def durable_decision(
+    durability_class: str,
+    category: str,
+    key: str,
+    value: str,
+    confidence: float = 0.96,
+) -> DurableMemoryDecision:
+    return DurableMemoryDecision(
+        is_user_fact=True,
+        durability_class=durability_class,
+        durability_confidence=confidence,
+        extracted_fact=f"{key} is {value}",
+        category=category,
+        subject="user",
+        canonical_key=canonical_key(key),
+        value=value,
+        save_automatically=True,
+        rejection_reason="",
+        classifier_source="LLM",
+        classifier_latency_ms=12.0,
+    )
+
+
+def rejected_decision(durability_class: str, confidence: float = 0.97) -> DurableMemoryDecision:
+    return DurableMemoryDecision(
+        is_user_fact=False,
+        durability_class=durability_class,
+        durability_confidence=confidence,
+        save_automatically=False,
+        rejection_reason=durability_class,
+        classifier_source="LLM",
+        classifier_latency_ms=12.0,
+    )
 
 
 class ChatFoundationTests(unittest.TestCase):
@@ -333,7 +381,9 @@ class ChatFoundationTests(unittest.TestCase):
                 log_text = log_path.read_text(encoding="utf-8")
             self.assertIn("Memory", log_text)
             self.assertIn("User\n\"Change it to red.\"", log_text)
-            self.assertIn("UPDATE • favorite color = red", log_text)
+            self.assertIn("UPDATE", log_text)
+            self.assertIn("favorite color", log_text)
+            self.assertIn("red", log_text)
             self.assertIn("Assistant\n\"Memory updated: favorite color is red.\"", log_text)
             self.assertIn("Total", log_text)
             self.assertNotIn("Structured Result", log_text)
@@ -521,7 +571,10 @@ class ChatFoundationTests(unittest.TestCase):
 
     def test_memory_modes_off_suggest_and_automatic(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+            classifier = FakeDurabilityClassifier({
+                "My favorite movie is Interstellar.": durable_decision("PREFERENCE", "Preferences", "favorite movie", "Interstellar"),
+            })
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"), classifier=classifier)
             off = service.handle_explicit_intent("Remember my favorite color is purple.", "c1", "1", memory_mode="Off")
             self.assertFalse(off.handled)
             self.assertEqual(service.store.list_memories(), [])
@@ -534,6 +587,120 @@ class ChatFoundationTests(unittest.TestCase):
             automatic = service.maybe_capture_automatic_memory("My favorite movie is Interstellar.", "c1", "3", "Automatic")
             self.assertTrue(automatic.remembered)
             self.assertEqual(service.retrieve("favorite film", mark_accessed=False)[0].value, "Interstellar")
+
+    def test_automatic_mode_saves_only_high_confidence_durable_facts(self) -> None:
+        cases = {
+            "My name is Jae.": durable_decision("IDENTITY", "User", "name", "Jae"),
+            "My favorite color is violet.": durable_decision("PREFERENCE", "Preferences", "favorite color", "violet"),
+            "I own an iPhone.": durable_decision("POSSESSION", "User", "device", "iPhone"),
+            "I live in Montreal.": durable_decision("LOCATION", "User", "location", "Montreal"),
+            "I'm left-handed.": durable_decision("IDENTITY", "User", "handedness", "left-handed"),
+            "I love art films.": durable_decision("LONG_TERM_INTEREST", "Preferences", "art films", "art films"),
+            "I'm learning Japanese.": durable_decision("SKILL", "User", "learning", "Japanese"),
+            "I'm building VioletAI.": durable_decision("LONG_TERM_PROJECT", "Projects", "project", "VioletAI"),
+            "I play Archero 2 regularly.": durable_decision("LONG_TERM_INTEREST", "Preferences", "archero 2", "Archero 2"),
+            "My favorite drink is water.": durable_decision("PREFERENCE", "Preferences", "favorite drink", "water"),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            classifier = FakeDurabilityClassifier(cases)
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"), classifier=classifier)
+            for index, message in enumerate(cases, start=1):
+                with self.subTest(message=message):
+                    result = service.maybe_capture_automatic_memory(message, "c1", str(index), "Automatic")
+                    self.assertTrue(result.remembered)
+            self.assertEqual(len(service.store.list_memories()), len(cases))
+            self.assertEqual(service.retrieve("favorite colour", mark_accessed=False)[0].value, "violet")
+            self.assertEqual(classifier.calls, list(cases))
+
+    def test_automatic_mode_rejects_temporary_current_and_casual_statements(self) -> None:
+        cases = {
+            "I'm playing Archero 2.": rejected_decision("CURRENT_ACTIVITY"),
+            "I'm drinking water.": rejected_decision("CURRENT_ACTIVITY"),
+            "I'm brushing my teeth.": rejected_decision("CURRENT_ACTIVITY"),
+            "I'm tired.": rejected_decision("TEMPORARY_STATE"),
+            "I'm hungry.": rejected_decision("TEMPORARY_STATE"),
+            "I'm going to work.": rejected_decision("SHORT_TERM_PLAN"),
+            "I'll be back in ten minutes.": rejected_decision("SHORT_TERM_PLAN"),
+            "That movie was good.": rejected_decision("CASUAL_STATEMENT"),
+            "Hello.": rejected_decision("CASUAL_STATEMENT"),
+            "How are you today?": rejected_decision("CASUAL_STATEMENT"),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            classifier = FakeDurabilityClassifier(cases)
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"), classifier=classifier)
+            for index, message in enumerate(cases, start=1):
+                with self.subTest(message=message):
+                    result = service.maybe_capture_automatic_memory(message, "c1", str(index), "Automatic")
+                    self.assertFalse(result.handled)
+            self.assertEqual(service.store.list_memories(), [])
+            self.assertEqual(classifier.calls, list(cases))
+
+    def test_automatic_validation_blocks_invalid_timeout_and_low_confidence_classifier_results(self) -> None:
+        decisions = {
+            "Invalid category": durable_decision("PREFERENCE", "Temporary", "favorite color", "violet"),
+            "Low confidence": durable_decision("PREFERENCE", "Preferences", "favorite color", "violet", confidence=0.42),
+            "Classifier failed": DurableMemoryDecision(
+                durability_class="CLASSIFIER_FAILED",
+                rejection_reason="CLASSIFIER_FAILED",
+                classifier_source="FALLBACK",
+                classifier_latency_ms=2500,
+                error="timeout",
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"), classifier=FakeDurabilityClassifier(decisions))
+            for message in decisions:
+                with self.subTest(message=message):
+                    self.assertFalse(service.maybe_capture_automatic_memory(message, "c1", message, "Automatic").handled)
+            self.assertEqual(service.store.list_memories(), [])
+
+    def test_suggest_mode_waits_for_confirmation_then_saves_pending_memory(self) -> None:
+        message = "My favorite drink is water."
+        with tempfile.TemporaryDirectory() as temp_dir:
+            classifier = FakeDurabilityClassifier({
+                message: durable_decision("PREFERENCE", "Preferences", "favorite drink", "water"),
+            })
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"), classifier=classifier)
+            suggest = service.maybe_capture_automatic_memory(message, "c1", "1", "Suggest")
+            self.assertTrue(suggest.handled)
+            self.assertFalse(suggest.remembered)
+            self.assertEqual(service.store.list_memories(), [])
+            confirmed = service.process_user_message("Yes.", "c1", "2", memory_mode="Suggest")
+            self.assertTrue(confirmed.remembered)
+            self.assertEqual(service.retrieve("favorite drink", mark_accessed=False)[0].value, "water")
+
+    def test_explicit_mode_can_save_temporary_information_when_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+            result = service.process_user_message("Remember that I'm brushing my teeth.", "c1", "1", memory_mode="Explicit")
+            self.assertTrue(result.remembered)
+            self.assertNotEqual(service.store.list_memories(), [])
+
+    def test_memory_diagnostics_show_classifier_and_skipped_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "memory.log"
+            classifier = FakeDurabilityClassifier({
+                "I'm playing Archero 2.": rejected_decision("CURRENT_ACTIVITY", 0.98),
+            })
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"), classifier=classifier)
+            with patch.object(memory_diagnostics, "MEMORY_LOG_PATH", log_path):
+                diagnostics = memory_diagnostics.MemoryDiagnostics(True, auto_emit=False)
+                result = service.process_user_message(
+                    "I'm playing Archero 2.",
+                    "c1",
+                    "1",
+                    memory_mode="Automatic",
+                    diagnostics_enabled=True,
+                    diagnostics=diagnostics,
+                )
+                self.assertFalse(result.handled)
+                diagnostics.finalize("Sounds fun.")
+                log_text = log_path.read_text(encoding="utf-8")
+            self.assertIn("Classifier", log_text)
+            self.assertIn("LLM", log_text)
+            self.assertIn("CURRENT_ACTIVITY", log_text)
+            self.assertIn("Memory       SKIPPED", log_text)
+            self.assertNotIn("Execute", log_text)
 
     def test_contextual_memory_creation_uses_previous_user_message(self) -> None:
         phrases = ["Remember that.", "Save that.", "Store that."]
@@ -1062,8 +1229,12 @@ class ChatFoundationTests(unittest.TestCase):
     def test_automatic_memory_creation_uses_post_memory_response_path(self) -> None:
         window, _temp_dir = self._window_with_temp_store()
         window.preferences.memory_mode = "Automatic"
+        message = "my favorite chapstick brand is nivea"
+        window.memory_service.classifier = FakeDurabilityClassifier({
+            message: durable_decision("PREFERENCE", "Preferences", "favorite chapstick brand", "nivea"),
+        })
         with patch.object(window, "_start_memory_response_generation") as memory_generation:
-            window.input_box.setPlainText("my favorite chapstick brand is nivea")
+            window.input_box.setPlainText(message)
             window.send_message()
         memory_generation.assert_called_once()
         memory = window.memory_service.retrieve("favorite chapstick brand", mark_accessed=False)[0]
