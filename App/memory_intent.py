@@ -184,7 +184,7 @@ def _extract_json(text: str) -> str:
 
 def _extract_create_body(text: str) -> str:
     return re.sub(
-        r"^.*?\b(?:please\s+)?(?:remember(?: that)?|save(?: that)?|store(?: that)?|note that|keep in mind|create a memory|add this to(?: your)? memory)\b[:\s]*",
+        r"^.*?\b(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:remember(?: that)?|save(?: that)?|store(?: that)?|note that|keep in mind|create a memory|add this to(?: your)? memory)\b[:\s]*",
         "",
         text,
         flags=re.IGNORECASE,
@@ -196,6 +196,12 @@ def _extract_key_value(text: str) -> tuple[str, str]:
     match = re.search(r"\bmy (?P<key>.+?) is (?P<value>.+)$", cleaned, flags=re.IGNORECASE)
     if match:
         return match.group("key").strip(), _clean_value(match.group("value"))
+    match = re.search(r"\bi have an? (?P<value>iphone|android phone|phone|ipad|tablet|macbook|laptop|desktop|pc|computer)$", cleaned, flags=re.IGNORECASE)
+    if match:
+        return "device", _normalize_device_value(match.group("value"))
+    match = re.search(r"\b(?:i live in|i am from|i'?m from) (?P<value>.+)$", cleaned, flags=re.IGNORECASE)
+    if match:
+        return "location", _clean_value(match.group("value"))
     match = re.search(r"\bthe (?P<key>color|colour) i like most is (?P<value>.+?)(?: now)?$", cleaned, flags=re.IGNORECASE)
     if match:
         return "favorite color", _clean_value(match.group("value"))
@@ -240,3 +246,15 @@ def _clean_value(value: str) -> str:
         if cleaned == previous:
             break
     return cleaned
+
+
+def _normalize_device_value(value: str) -> str:
+    cleaned = _clean_value(value)
+    normalized = cleaned.casefold()
+    replacements = {
+        "iphone": "iPhone",
+        "ipad": "iPad",
+        "macbook": "MacBook",
+        "pc": "PC",
+    }
+    return replacements.get(normalized, cleaned)

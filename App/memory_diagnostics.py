@@ -271,13 +271,36 @@ def _post_memory_debug_lines(data: dict[str, Any]) -> list[str]:
         elif kind == "http_status":
             lines.append(f"HTTP          {event.get('status_code')}")
         elif kind == "ndjson_event":
-            lines.append(
-                f"NDJSON        {event.get('event_type')} done={event.get('done')} "
-                f"chunk={event.get('chunk_length', 0)} total={event.get('accumulated_content_length', 0)} "
-                f"cancelled={event.get('cancellation_requested')}"
-            )
+            continue
         elif kind == "error":
             lines.append(f"Error Source  {event.get('source')} {_quote(event.get('message', ''))}")
         elif kind == "cancel_requested":
             lines.append(f"Cancel        requested={event.get('cancellation_requested')}")
+    stream = _post_memory_stream_summary(data.get("post_memory_events") or [])
+    if stream:
+        lines.append(stream)
     return lines
+
+
+def _post_memory_stream_summary(events: object) -> str:
+    if not isinstance(events, list):
+        return ""
+    saw_stream = False
+    done = False
+    content_length = 0
+    cancelled = False
+    event_count = 0
+    for event in events:
+        if not isinstance(event, dict) or event.get("event") != "ndjson_event":
+            continue
+        saw_stream = True
+        event_count += 1
+        done = bool(event.get("done"))
+        cancelled = bool(event.get("cancellation_requested"))
+        try:
+            content_length = max(content_length, int(event.get("accumulated_content_length") or 0))
+        except (TypeError, ValueError):
+            pass
+    if not saw_stream:
+        return ""
+    return f"Stream        events={event_count} content_length={content_length} done={done} cancelled={cancelled}"

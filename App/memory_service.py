@@ -95,6 +95,12 @@ MEMORY_QUERY_PATTERNS = (
 )
 AMBIGUOUS_REFERENCES = re.compile(r"\b(it|this|that|they|them)\b", re.IGNORECASE)
 TRAILING_EMOTICON = re.compile(r"\s*(?:[:;=8xX][-']?[)(DPpOo/\\]|[🙂😊😉😄😃😂🤣😅🥲]+)\s*$")
+CREATE_COMMAND_WRAPPER = re.compile(
+    r"^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?"
+    r"(?P<command>remember(?: that| this)?|don't forget that|dont forget that|save(?: that| this)?|store(?: that| this)?|note that|keep in mind|create a memory|add this to(?: your)? memory)"
+    r"[:\s]*(?P<body>.+)$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -719,6 +725,10 @@ class MemoryService:
     def _strip_prefix(self, text: str, prefixes: tuple[str, ...]) -> str | None:
         normalized = text.strip()
         lowered = normalized.casefold()
+        if prefixes is REMEMBER_PREFIXES:
+            wrapper_match = CREATE_COMMAND_WRAPPER.match(normalized)
+            if wrapper_match:
+                return wrapper_match.group("body").strip(" .:-")
         for prefix in sorted(prefixes, key=len, reverse=True):
             if lowered.startswith(prefix):
                 body = normalized[len(prefix):].strip(" .:-")
@@ -726,7 +736,8 @@ class MemoryService:
         return None
 
     def parse_memory(self, body: str) -> ParsedMemory | None:
-        cleaned = " ".join(body.strip().split())
+        stripped_body = self._strip_prefix(body, REMEMBER_PREFIXES)
+        cleaned = " ".join((stripped_body if stripped_body is not None else body).strip().split())
         if not cleaned:
             return None
         if AMBIGUOUS_REFERENCES.fullmatch(cleaned) or cleaned.casefold() in {"i like it", "i like this", "i like that"}:
@@ -737,6 +748,7 @@ class MemoryService:
         if until_match:
             expires_at = (datetime.now(UTC) + timedelta(days=1)).isoformat(timespec="seconds")
             cleaned = re.sub(r"\buntil tomorrow\b", "", cleaned, flags=re.IGNORECASE).strip()
+        match_text = cleaned.strip(" .!?")
 
         category = "Facts"
         subject = "user"
@@ -745,6 +757,7 @@ class MemoryService:
 
         patterns = [
             (r"^my (?P<key>.+?) is (?P<value>.+)$", "User"),
+            (r"^i have an? (?P<value>iphone|android phone|phone|ipad|tablet|macbook|laptop|desktop|pc|computer)$", "User"),
             (r"^i am from (?P<value>.+)$", "User"),
             (r"^i'?m from (?P<value>.+)$", "User"),
             (r"^i am (?P<value>.+)$", "User"),
@@ -755,7 +768,7 @@ class MemoryService:
             (r"^project (?P<key>.+?) is (?P<value>.+)$", "Projects"),
         ]
         for pattern, detected_category in patterns:
-            match = re.match(pattern, cleaned, flags=re.IGNORECASE)
+            match = re.match(pattern, match_text, flags=re.IGNORECASE)
             if not match:
                 continue
             category = detected_category
@@ -766,13 +779,15 @@ class MemoryService:
                     subject = f"project {key}"
                     key = "description"
             else:
-                if cleaned.casefold().startswith(("i live in", "i am from", "i'm from", "im from")):
+                if match_text.casefold().startswith(("i live in", "i am from", "i'm from", "im from")):
                     key = "location"
-                elif cleaned.casefold().startswith("i like") or cleaned.casefold().startswith("i prefer"):
+                elif match_text.casefold().startswith("i have"):
+                    key = "device"
+                elif match_text.casefold().startswith("i like") or match_text.casefold().startswith("i prefer"):
                     key = "preference"
                 else:
                     key = "identity"
-            value = clean_memory_value(groups["value"])
+            value = normalize_memory_value(key, groups["value"])
             break
 
         if key == "note":
@@ -949,3 +964,17 @@ def clean_memory_value(value: str) -> str:
         if cleaned == previous:
             break
     return cleaned
+
+
+def normalize_memory_value(key: str, value: str) -> str:
+    cleaned = clean_memory_value(value)
+    if canonical_key(key) != "device":
+        return cleaned
+    normalized = cleaned.casefold()
+    replacements = {
+        "iphone": "iPhone",
+        "ipad": "iPad",
+        "macbook": "MacBook",
+        "pc": "PC",
+    }
+    return replacements.get(normalized, cleaned)

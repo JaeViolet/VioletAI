@@ -462,6 +462,15 @@ class ChatFoundationTests(unittest.TestCase):
                     "accumulated_content_length": 5,
                     "cancellation_requested": False,
                 })
+                window._record_ollama_diagnostic_event({
+                    "request_kind": "post_memory",
+                    "event": "ndjson_event",
+                    "event_type": "done",
+                    "done": True,
+                    "chunk_length": 0,
+                    "accumulated_content_length": 5,
+                    "cancellation_requested": False,
+                })
                 window._finalize_diagnostics("Nice choice.")
                 log_text = log_path.read_text(encoding="utf-8")
             self.assertIn("Post-memory Ollama", log_text)
@@ -469,7 +478,8 @@ class ChatFoundationTests(unittest.TestCase):
             self.assertIn('preview="[user message redacted]"', log_text)
             self.assertIn("Options       think=False options={'num_predict': 64}", log_text)
             self.assertIn("HTTP          200", log_text)
-            self.assertIn("NDJSON        chunk done=False chunk=5 total=5 cancelled=False", log_text)
+            self.assertIn("Stream        events=2 content_length=5 done=True cancelled=False", log_text)
+            self.assertNotIn("NDJSON        chunk", log_text)
             self.assertNotIn("memory_id", log_text)
         window.close()
 
@@ -738,6 +748,30 @@ class ChatFoundationTests(unittest.TestCase):
             result = service.process_user_message("remember that my favorite snack is popcorn :)", "c1", "2")
             self.assertEqual(result.status, SUCCESS)
             self.assertEqual(service.retrieve("favorite snack", mark_accessed=False)[0].value, "popcorn")
+
+    def test_explicit_memory_create_strips_command_before_structured_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+            phone = service.process_user_message("Can you remember that I have an iPhone?", "c1", "1")
+            location = service.process_user_message("Can you remember that I live in Montreal?", "c1", "2")
+            movie = service.process_user_message("Remember that my favorite movie is Interstellar.", "c1", "3")
+
+            self.assertEqual(phone.status, SUCCESS)
+            self.assertEqual(location.status, SUCCESS)
+            self.assertEqual(movie.status, SUCCESS)
+            phone_memory = service.retrieve("device", mark_accessed=False)[0]
+            location_memory = service.retrieve("location", mark_accessed=False)[0]
+            movie_memory = service.retrieve("favorite movie", mark_accessed=False)[0]
+            self.assertEqual(phone_memory.category, "User")
+            self.assertEqual(phone_memory.key, "device")
+            self.assertEqual(phone_memory.value, "iPhone")
+            self.assertEqual(location_memory.category, "User")
+            self.assertEqual(location_memory.key, "location")
+            self.assertEqual(location_memory.value, "Montreal")
+            self.assertEqual(movie_memory.category, "User")
+            self.assertEqual(movie_memory.key, "favorite movie")
+            self.assertEqual(movie_memory.value, "Interstellar")
+            self.assertNotEqual(phone_memory.key, "note")
 
     def test_memory_store_database_errors_are_reported(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
