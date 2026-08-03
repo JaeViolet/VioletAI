@@ -6,8 +6,9 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from memory_diagnostics import MemoryDiagnostics
 from memory_embeddings import canonical_key, embed_text, cosine_similarity
-from memory_intent import CREATE, DELETE, IGNORE, RETRIEVE, UPDATE, MemoryIntentClassifier
+from memory_intent import CREATE, DELETE, NONE, RETRIEVE, UPDATE, MemoryAnalysis, MemoryIntentClassifier
 from memory_models import MemoryRecord, ParsedMemory
 from memory_store import MemoryStore, normalize_key
 
@@ -16,6 +17,9 @@ MULTIPLE_MATCHES = "MULTIPLE_MATCHES"
 INVALID_REFERENCE = "INVALID_REFERENCE"
 WRITE_FAILED = "WRITE_FAILED"
 INVALID_MEMORY_REQUEST = "INVALID_MEMORY_REQUEST"
+SUCCESS = "SUCCESS"
+RETRIEVAL_EMPTY = "RETRIEVAL_EMPTY"
+DISABLED_BY_MODE = "DISABLED_BY_MODE"
 
 REMEMBER_PREFIXES = (
     "remember",
@@ -71,6 +75,8 @@ CONTEXTUAL_FORGET_COMMANDS = (
     "clear this",
 )
 UPDATE_PATTERNS = (
+    re.compile(r"^change it to (?P<value>.+)$", re.IGNORECASE),
+    re.compile(r"^the color i like most is (?P<value>.+?) now$", re.IGNORECASE),
     re.compile(r"^(?:update|change|edit) my (?P<key>.+?) to (?P<value>.+)$", re.IGNORECASE),
     re.compile(r"^my (?P<key>.+?) is now (?P<value>.+)$", re.IGNORECASE),
     re.compile(r"^my (?P<key>.+?) is (?P<value>.+?) now$", re.IGNORECASE),
@@ -93,7 +99,17 @@ AMBIGUOUS_REFERENCES = re.compile(r"\b(it|this|that|they|them)\b", re.IGNORECASE
 class MemoryActionResult:
     handled: bool
     response: str = ""
+    status: str | None = None
+    action: str = NONE
     error_code: str | None = None
+    memory_id: str | None = None
+    canonical_key: str = ""
+    previous_value: str = ""
+    new_value: str = ""
+    affected_records: list[str] | None = None
+    failure_reason: str = ""
+    confirmation: str = ""
+    analysis: MemoryAnalysis | None = None
     remembered: bool = False
     updated: bool = False
     removed: bool = False
@@ -132,105 +148,292 @@ class MemoryService:
         previous_user_text: str | None = None,
         memory_mode: str = "Explicit",
     ) -> MemoryActionResult:
+        return self.process_user_message(text, conversation_id, source_message_id, previous_user_text, memory_mode)
+
+    def process_user_message(
+        self,
+        text: str,
+        conversation_id: str,
+        source_message_id: str | None,
+        previous_user_text: str | None = None,
+        memory_mode: str = "Explicit",
+        diagnostics_enabled: bool = False,
+    ) -> MemoryActionResult:
+        diagnostics = MemoryDiagnostics(diagnostics_enabled)
+        diagnostics.record(user_message=text, memory_mode=memory_mode)
         if memory_mode == "Off":
-            return MemoryActionResult(False)
-        intent = self.classifier.classify(text, previous_user_text)
-        if intent.action == IGNORE:
-            return MemoryActionResult(False)
+            result = MemoryActionResult(
+                False,
+                status=DISABLED_BY_MODE,
+                action=NONE,
+                failure_reason="Long-term memory is disabled by mode.",
+            )
+            diagnostics.record(
+                memory_related=False,
+                action=NONE,
+                validation_result=DISABLED_BY_MODE,
+                structured_result=DISABLED_BY_MODE,
+                ui_confirmation="SKIPPED",
+                assistant_response="Normal chat",
+            )
+            diagnostics.emit()
+            return result
+        analysis = self.classifier.analyze(text, previous_user_text)
+        diagnostics.record(
+            memory_related="YES" if analysis.memory_related else "NO",
+            action=analysis.action,
+            confidence=analysis.confidence,
+            diagnostic_reasoning=analysis.diagnostic_reasoning,
+            subject=analysis.subject,
+            canonical_key=analysis.canonical_key,
+            value=analysis.value,
+            referenced_previous_user_message=analysis.referenced_previous_user_message,
+        )
+        if not analysis.memory_related:
+            automatic = self._automatic_from_unrelated_message(
+                text,
+                conversation_id,
+                source_message_id,
+                memory_mode,
+                analysis,
+                diagnostics,
+            )
+            if automatic is not None:
+                return automatic
+            result = MemoryActionResult(False, status=None, action=NONE, analysis=analysis)
+            diagnostics.record(
+                validation_result="NOT_MEMORY_RELATED",
+                operation_executed="Normal Chat",
+                structured_result="NORMAL_CHAT",
+                ui_confirmation="SKIPPED",
+                assistant_response="Normal chat",
+            )
+            diagnostics.emit()
+            return result
         lowered = text.casefold().strip()
-        if intent.action == RETRIEVE or any(pattern in lowered for pattern in MEMORY_QUERY_PATTERNS):
+        if analysis.action == RETRIEVE or any(pattern in lowered for pattern in MEMORY_QUERY_PATTERNS):
             memories = self.retrieve(text, mark_accessed=False, include_all_if_query=True)
             if not memories:
-                return MemoryActionResult(True, "I do not have any saved memories yet.", memories=[])
+                result = MemoryActionResult(
+                    True,
+                    "I do not have any saved memories yet.",
+                    status=RETRIEVAL_EMPTY,
+                    action=RETRIEVE,
+                    error_code=RETRIEVAL_EMPTY,
+                    failure_reason="No active memories matched retrieval request.",
+                    analysis=analysis,
+                    memories=[],
+                )
+                diagnostics.record(
+                    candidate_memories=[],
+                    validation_result=RETRIEVAL_EMPTY,
+                    operation_executed=RETRIEVE,
+                    database_result=RETRIEVAL_EMPTY,
+                    structured_result=RETRIEVAL_EMPTY,
+                    failed_stage="Candidate Retrieval",
+                    failure_reason=result.failure_reason,
+                    ui_confirmation="SKIPPED",
+                    assistant_response=result.response,
+                )
+                diagnostics.emit()
+                return result
             lines = ["Here is what I remember:"]
             lines.extend(f"- {memory.key}: {memory.value}" for memory in memories)
             self.store.mark_accessed([memory.id for memory in memories])
-            return MemoryActionResult(True, "\n".join(lines), memories=memories)
+            result = MemoryActionResult(
+                True,
+                "\n".join(lines),
+                status=SUCCESS,
+                action=RETRIEVE,
+                affected_records=[memory.id for memory in memories],
+                analysis=analysis,
+                memories=memories,
+            )
+            diagnostics.record(
+                candidate_memories=[f"{memory.key}={memory.value}" for memory in memories],
+                selected_memory=memories[0].id if memories else "",
+                validation_result="VALID",
+                operation_executed=RETRIEVE,
+                database_result=SUCCESS,
+                structured_result=SUCCESS,
+                ui_confirmation="SKIPPED",
+                assistant_response=result.response,
+            )
+            diagnostics.emit()
+            return result
 
         remember_body = self._strip_prefix(text, REMEMBER_PREFIXES)
-        if remember_body is None and intent.action == CREATE:
+        if remember_body is None and analysis.action == CREATE:
             remember_body = text
         if remember_body is not None:
             if self._is_contextual_command(text, CONTEXTUAL_REMEMBER_COMMANDS):
                 if not self._suitable_reference(previous_user_text):
-                    return MemoryActionResult(
+                    result = MemoryActionResult(
                         True,
                         "I couldn't save that because 'that' doesn't refer to a previous user statement. Try:\nRemember that I'm from Montreal.",
+                        status=INVALID_REFERENCE,
+                        action=CREATE,
                         error_code=INVALID_REFERENCE,
+                        failure_reason="'that' did not resolve to a previous user statement.",
+                        analysis=analysis,
                         clarification_needed=True,
                     )
+                    self._emit_failure_diagnostics(diagnostics, result, "Context Resolution")
+                    return result
                 remember_body = previous_user_text or ""
-            parsed = self.parse_memory(remember_body)
+            parsed = (
+                ParsedMemory(
+                    "User",
+                    "user",
+                    analysis.canonical_key,
+                    analysis.value,
+                    f"{analysis.canonical_key} is {analysis.value}",
+                )
+                if analysis.canonical_key and analysis.value and remember_body == text
+                else self.parse_memory(remember_body)
+            )
             if parsed is None:
-                return MemoryActionResult(
+                result = MemoryActionResult(
                     True,
                     "I couldn't save that because the memory request was not specific enough.",
+                    status=INVALID_MEMORY_REQUEST,
+                    action=CREATE,
                     error_code=INVALID_MEMORY_REQUEST,
+                    failure_reason="Memory parser could not extract a durable memory.",
+                    analysis=analysis,
                     clarification_needed=True,
                 )
+                self._emit_failure_diagnostics(diagnostics, result, "Validation")
+                return result
             try:
                 memory = self.remember(parsed, conversation_id, source_message_id, text)
             except Exception as error:
-                return MemoryActionResult(
+                result = MemoryActionResult(
                     True,
                     f"I couldn't save that memory: {error}",
+                    status=WRITE_FAILED,
+                    action=CREATE,
                     error_code=WRITE_FAILED,
+                    failure_reason=str(error),
+                    analysis=analysis,
                 )
-            return MemoryActionResult(
+                self._emit_failure_diagnostics(diagnostics, result, "Database Execution")
+                return result
+            result = MemoryActionResult(
                 True,
                 f"I'll remember that {memory.key} is {memory.value}.",
+                status=SUCCESS,
+                action=CREATE,
+                memory_id=memory.id,
+                canonical_key=canonical_key(memory.key),
+                new_value=memory.value,
+                affected_records=[memory.id],
+                confirmation="✓ Remembered",
+                analysis=analysis,
                 remembered=True,
                 memories=[memory],
             )
+            self._emit_success_diagnostics(diagnostics, result, memory, CREATE)
+            return result
 
         update_result = self.handle_update_intent(text, conversation_id, source_message_id)
         if update_result.handled:
+            update_result.analysis = analysis
+            self._emit_result_diagnostics(diagnostics, update_result)
             return update_result
 
         forget_query = self._strip_prefix(text, FORGET_PREFIXES)
-        if forget_query is None and intent.action == DELETE:
+        if forget_query is None and analysis.action == DELETE:
             forget_query = text
         if forget_query is not None:
             forget_query = re.sub(r"\b(from|in)\s+(long[- ]term\s+)?memory\b", "", forget_query, flags=re.IGNORECASE).strip(" .")
             if self._is_contextual_command(text, CONTEXTUAL_FORGET_COMMANDS):
                 if not self._suitable_reference(previous_user_text):
-                    return MemoryActionResult(
+                    result = MemoryActionResult(
                         True,
                         "I couldn't remove that because 'that' doesn't refer to a previous user statement.",
+                        status=INVALID_REFERENCE,
+                        action=DELETE,
                         error_code=INVALID_REFERENCE,
+                        failure_reason="'that' did not resolve to a previous user statement.",
+                        analysis=analysis,
                         clarification_needed=True,
                     )
+                    self._emit_failure_diagnostics(diagnostics, result, "Context Resolution")
+                    return result
                 forget_query = previous_user_text or ""
             matches = self.find_forget_matches(forget_query)
             if not matches:
-                return MemoryActionResult(
+                result = MemoryActionResult(
                     True,
                     f"I couldn't find a saved memory matching '{forget_query}'.",
+                    status=NO_MATCH,
+                    action=DELETE,
                     error_code=NO_MATCH,
+                    canonical_key=canonical_key(forget_query),
+                    failure_reason="No active memory matched delete request.",
+                    analysis=analysis,
                 )
+                self._emit_failure_diagnostics(diagnostics, result, "Candidate Retrieval")
+                return result
             if len(matches) > 1 and not self._looks_specific(forget_query):
                 lines = ["I found multiple matching memories. Which one should I remove?"]
                 lines.extend(f"- {memory.key}: {memory.value}" for memory in matches[:5])
-                return MemoryActionResult(
+                result = MemoryActionResult(
                     True,
                     "\n".join(lines),
+                    status=MULTIPLE_MATCHES,
+                    action=DELETE,
                     error_code=MULTIPLE_MATCHES,
+                    affected_records=[memory.id for memory in matches],
+                    failure_reason="Multiple candidate memories matched delete request.",
+                    analysis=analysis,
                     clarification_needed=True,
                     memories=matches,
                 )
+                self._emit_failure_diagnostics(diagnostics, result, "Validation")
+                return result
             try:
                 for memory in matches:
                     self.store.archive(memory.id)
             except Exception as error:
-                return MemoryActionResult(
+                result = MemoryActionResult(
                     True,
                     f"I couldn't remove that memory: {error}",
+                    status=WRITE_FAILED,
+                    action=DELETE,
                     error_code=WRITE_FAILED,
+                    affected_records=[memory.id for memory in matches],
+                    failure_reason=str(error),
+                    analysis=analysis,
                     memories=matches,
                 )
-            return MemoryActionResult(True, "Memory removed.", removed=True, memories=matches)
+                self._emit_failure_diagnostics(diagnostics, result, "Database Execution")
+                return result
+            result = MemoryActionResult(
+                True,
+                "Memory removed.",
+                status=SUCCESS,
+                action=DELETE,
+                affected_records=[memory.id for memory in matches],
+                confirmation="Memory removed.",
+                analysis=analysis,
+                removed=True,
+                memories=matches,
+            )
+            self._emit_result_diagnostics(diagnostics, result)
+            return result
 
-        return MemoryActionResult(False)
+        result = MemoryActionResult(False, status=None, action=NONE, analysis=analysis)
+        diagnostics.record(
+            validation_result="NO_EXECUTABLE_MEMORY_OPERATION",
+            operation_executed="Normal Chat",
+            structured_result="NORMAL_CHAT",
+            ui_confirmation="SKIPPED",
+            assistant_response="Normal chat",
+        )
+        diagnostics.emit()
+        return result
 
     def maybe_capture_automatic_memory(
         self,
@@ -239,30 +442,67 @@ class MemoryService:
         source_message_id: str | None,
         memory_mode: str,
     ) -> MemoryActionResult:
+        return self.process_user_message(text, conversation_id, source_message_id, memory_mode=memory_mode)
+
+    def _automatic_from_unrelated_message(
+        self,
+        text: str,
+        conversation_id: str,
+        source_message_id: str | None,
+        memory_mode: str,
+        analysis: MemoryAnalysis,
+        diagnostics: MemoryDiagnostics,
+    ) -> MemoryActionResult | None:
         if memory_mode not in {"Suggest", "Automatic"}:
-            return MemoryActionResult(False)
+            return None
         parsed = self.parse_memory(text)
         if parsed is None or parsed.confidence < 0.85:
-            return MemoryActionResult(False)
+            return None
         if not self._is_durable_user_memory(text, parsed):
-            return MemoryActionResult(False)
+            return None
         if memory_mode == "Suggest":
-            return MemoryActionResult(
+            result = MemoryActionResult(
                 True,
                 "Would you like me to remember that?",
+                status=SUCCESS,
+                action=CREATE,
+                confirmation="SKIPPED",
+                analysis=analysis,
                 clarification_needed=True,
                 memories=[],
             )
+            self._emit_result_diagnostics(diagnostics, result)
+            return result
         try:
             memory = self.remember(parsed, conversation_id, source_message_id, text)
         except Exception as error:
-            return MemoryActionResult(True, f"I couldn't save that memory: {error}", error_code=WRITE_FAILED)
-        return MemoryActionResult(
+            result = MemoryActionResult(
+                True,
+                f"I couldn't save that memory: {error}",
+                status=WRITE_FAILED,
+                action=CREATE,
+                error_code=WRITE_FAILED,
+                failure_reason=str(error),
+                analysis=analysis,
+            )
+            self._emit_failure_diagnostics(diagnostics, result, "Database Execution")
+            return result
+        result = MemoryActionResult(
             True,
             f"I'll remember that {memory.key} is {memory.value}.",
+            status=SUCCESS,
+            action=CREATE,
+            memory_id=memory.id,
+            canonical_key=canonical_key(memory.key),
+            new_value=memory.value,
+            affected_records=[memory.id],
+            confirmation="✓ Remembered",
+            analysis=analysis,
             remembered=True,
             memories=[memory],
         )
+        self._emit_success_diagnostics(diagnostics, result, memory, CREATE)
+        return result
 
     def _is_durable_user_memory(self, text: str, parsed: ParsedMemory) -> bool:
         lowered = text.casefold()
@@ -270,6 +510,78 @@ class MemoryService:
         if any(word in lowered for word in blocked):
             return False
         return parsed.category in {"User", "Preferences", "Projects", "People"} and parsed.subject == "user"
+
+    def _emit_success_diagnostics(
+        self,
+        diagnostics: MemoryDiagnostics,
+        result: MemoryActionResult,
+        memory: MemoryRecord,
+        operation: str,
+    ) -> None:
+        diagnostics.record(
+            candidate_memories=[f"{record.key}={record.value}" for record in self.retrieve(memory.key, mark_accessed=False)],
+            selected_memory=memory.id,
+            validation_result="VALID",
+            operation_executed=operation,
+            database_result=SUCCESS,
+            structured_result=result.status,
+            ui_confirmation=result.confirmation or "SKIPPED",
+            assistant_response=result.response,
+            selected_memory_value=memory.value,
+        )
+        diagnostics.emit()
+
+    def _emit_failure_diagnostics(
+        self,
+        diagnostics: MemoryDiagnostics,
+        result: MemoryActionResult,
+        failed_stage: str,
+    ) -> None:
+        diagnostics.record(
+            candidate_memories=[f"{memory.key}={memory.value}" for memory in (result.memories or [])],
+            ranking_scores="see hybrid retrieval scores in candidate order",
+            selected_memory=result.memory_id or "",
+            validation_result=result.status or result.error_code,
+            operation_executed=result.action,
+            database_result=result.status,
+            structured_result=result.status or result.error_code,
+            failed_stage=failed_stage,
+            failure_reason=result.failure_reason or result.response,
+            ui_confirmation="SKIPPED",
+            assistant_response=result.response,
+        )
+        diagnostics.emit()
+
+    def _emit_result_diagnostics(self, diagnostics: MemoryDiagnostics, result: MemoryActionResult) -> None:
+        if result.status == SUCCESS:
+            diagnostics.record(
+                candidate_memories=[f"{memory.key}={memory.value}" for memory in (result.memories or [])],
+                ranking_scores="see hybrid retrieval scores in candidate order",
+                selected_memory=result.memory_id or (result.affected_records or [""])[-1],
+                validation_result="VALID",
+                operation_executed=result.action,
+                previous_value=result.previous_value,
+                new_value=result.new_value,
+                database_result=SUCCESS,
+                structured_result=SUCCESS,
+                ui_confirmation=result.confirmation or "SKIPPED",
+                assistant_response=result.response,
+            )
+        else:
+            diagnostics.record(
+                candidate_memories=[f"{memory.key}={memory.value}" for memory in (result.memories or [])],
+                ranking_scores="see hybrid retrieval scores in candidate order",
+                selected_memory=result.memory_id or "",
+                validation_result=result.status or result.error_code,
+                operation_executed=result.action,
+                database_result=result.status,
+                structured_result=result.status or result.error_code,
+                failed_stage="Validation" if result.status == MULTIPLE_MATCHES else "Memory Pipeline",
+                failure_reason=result.failure_reason or result.response,
+                ui_confirmation="SKIPPED",
+                assistant_response=result.response,
+            )
+        diagnostics.emit()
 
     def handle_update_intent(
         self,
@@ -283,12 +595,19 @@ class MemoryService:
             if not match:
                 continue
             key = (match.groupdict().get("key") or match.groupdict().get("old") or "").strip()
+            if not key and "color i like most" in cleaned.casefold():
+                key = "favorite color"
+            if not key:
+                key = "it"
             value = match.group("value").strip()
             if not key or not value:
                 return MemoryActionResult(
                     True,
                     "What memory should I update?",
+                    status=INVALID_MEMORY_REQUEST,
+                    action=UPDATE,
                     error_code=INVALID_MEMORY_REQUEST,
+                    failure_reason="Missing update key or value.",
                     clarification_needed=True,
                 )
             matches = self.find_update_matches(key)
@@ -296,7 +615,11 @@ class MemoryService:
                 return MemoryActionResult(
                     True,
                     f"I couldn't find a saved memory matching '{key}'.",
+                    status=NO_MATCH,
+                    action=UPDATE,
                     error_code=NO_MATCH,
+                    canonical_key=canonical_key(key),
+                    failure_reason="No active memory matched update request.",
                 )
             if len(matches) > 1:
                 lines = ["I found multiple matching memories. Which one should I update?"]
@@ -304,7 +627,11 @@ class MemoryService:
                 return MemoryActionResult(
                     True,
                     "\n".join(lines),
+                    status=MULTIPLE_MATCHES,
+                    action=UPDATE,
                     error_code=MULTIPLE_MATCHES,
+                    affected_records=[memory.id for memory in matches],
+                    failure_reason="Multiple candidate memories matched update request.",
                     clarification_needed=True,
                     memories=matches,
                 )
@@ -322,12 +649,27 @@ class MemoryService:
                 return MemoryActionResult(
                     True,
                     f"I couldn't update that memory: {error}",
+                    status=WRITE_FAILED,
+                    action=UPDATE,
                     error_code=WRITE_FAILED,
+                    canonical_key=canonical_key(existing.key),
+                    previous_value=existing.value,
+                    new_value=value,
+                    affected_records=[existing.id],
+                    failure_reason=str(error),
                     memories=[existing],
                 )
             return MemoryActionResult(
                 True,
                 f"Memory updated: {memory.key} is {memory.value}.",
+                status=SUCCESS,
+                action=UPDATE,
+                memory_id=memory.id,
+                canonical_key=canonical_key(memory.key),
+                previous_value=existing.value,
+                new_value=memory.value,
+                affected_records=[existing.id, memory.id],
+                confirmation="Memory updated.",
                 remembered=True,
                 updated=True,
                 memories=[memory],
@@ -403,7 +745,7 @@ class MemoryService:
                     subject = f"project {key}"
                     key = "description"
             else:
-                if cleaned.casefold().startswith(("i live in", "i'm from", "im from")):
+                if cleaned.casefold().startswith(("i live in", "i am from", "i'm from", "im from")):
                     key = "location"
                 elif cleaned.casefold().startswith("i like") or cleaned.casefold().startswith("i prefer"):
                     key = "preference"
@@ -545,6 +887,9 @@ class MemoryService:
         cleaned = key.strip()
         if cleaned.casefold().startswith("my "):
             cleaned = cleaned[3:]
+        if cleaned.casefold() in {"it", "this", "that"}:
+            active = self.store.list_memories()
+            return active if len(active) <= 1 else active[:10]
         direct_matches = [
             memory
             for memory in self.store.search(cleaned, include_archived=False)

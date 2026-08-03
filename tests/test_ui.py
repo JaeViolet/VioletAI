@@ -17,19 +17,20 @@ from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtGui import QKeyEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication, QFrame, QLabel, QMessageBox, QToolButton, QWidget  # noqa: E402
 
-from config import DEFAULT_MODEL_NAME, SYSTEM_PROMPT  # noqa: E402
+from config import DEFAULT_MODEL_NAME, MEMORY_LOG_PATH, SYSTEM_PROMPT  # noqa: E402
 from conversation_store import ConversationStore  # noqa: E402
 import design  # noqa: E402
 from design import Colors, PNG_CONTROL_ICON_SIZE, asset_icon_path, icon  # noqa: E402
 from main import MainWindow  # noqa: E402
 from memory_embeddings import EMBEDDING_MODEL_NAME, canonical_key, cosine_similarity, embed_text  # noqa: E402
-from memory_intent import CREATE, DELETE, IGNORE, RETRIEVE, UPDATE, MemoryIntentClassifier  # noqa: E402
+from memory_intent import CREATE, DELETE, IGNORE, RETRIEVE, UPDATE, MemoryAnalysis, MemoryIntentClassifier  # noqa: E402
 from memory_models import CATEGORIES, ParsedMemory  # noqa: E402
 from memory_service import (  # noqa: E402
     INVALID_REFERENCE,
     MULTIPLE_MATCHES,
     NO_MATCH,
     WRITE_FAILED,
+    SUCCESS,
     MemoryService,
 )
 from memory_store import MemoryStore, MemoryStoreError, normalize_category, normalize_key  # noqa: E402
@@ -246,6 +247,104 @@ class ChatFoundationTests(unittest.TestCase):
         self.assertEqual(classifier.classify("What do you remember about me?").action, RETRIEVE)
         self.assertEqual(classifier.classify("Blue is a nice color.").action, IGNORE)
 
+    def test_memory_analysis_schema_handles_embedded_and_contextual_phrases(self) -> None:
+        classifier = MemoryIntentClassifier(use_llm=False)
+        analysis = classifier.analyze("Hello! Please remember that my favorite color is violet.")
+        self.assertTrue(analysis.memory_related)
+        self.assertEqual(analysis.action, CREATE)
+        self.assertEqual(analysis.canonical_key, "favorite color")
+        self.assertEqual(analysis.value, "violet")
+
+        contextual = classifier.analyze("Remember that.", previous_user_text="I am from Montreal.")
+        self.assertEqual(contextual.referenced_previous_user_message, "I am from Montreal.")
+
+        natural_update = classifier.analyze("The color I like most is green now.")
+        self.assertEqual(natural_update.action, UPDATE)
+        self.assertEqual(natural_update.canonical_key, "favorite color")
+        self.assertEqual(natural_update.value, "green")
+
+    def test_every_message_uses_single_memory_analysis_before_chat(self) -> None:
+        class RecordingClassifier:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def analyze(self, text: str, previous_user_text: str | None = None) -> MemoryAnalysis:
+                self.calls.append(text)
+                return MemoryAnalysis(False, "NONE", 0.0, diagnostic_reasoning="test ignore", original_text=text)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            classifier = RecordingClassifier()
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"), classifier=classifier)
+            result = service.process_user_message("Hello there.", "c1", "1")
+            self.assertFalse(result.handled)
+            self.assertEqual(classifier.calls, ["Hello there."])
+
+    def test_unified_pipeline_create_update_retrieve_delete_and_contextual_update(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+            create = service.process_user_message("Hello! Please remember that my favorite color is violet.", "c1", "1")
+            self.assertEqual(create.status, SUCCESS)
+            self.assertEqual(create.confirmation, "✓ Remembered")
+            self.assertEqual(service.retrieve("favorite color", mark_accessed=False)[0].value, "violet")
+
+            update = service.process_user_message("Change it to red.", "c1", "2")
+            self.assertEqual(update.status, SUCCESS)
+            self.assertEqual(update.confirmation, "Memory updated.")
+            self.assertEqual(service.retrieve("favorite color", mark_accessed=False)[0].value, "red")
+
+            natural = service.process_user_message("The color I like most is green now.", "c1", "3")
+            self.assertEqual(natural.status, SUCCESS)
+            self.assertEqual(service.retrieve("preferred colour", mark_accessed=False)[0].value, "green")
+
+            retrieve = service.process_user_message("What color do I like most?", "c1", "4")
+            self.assertEqual(retrieve.status, SUCCESS)
+            self.assertIn("green", retrieve.response)
+
+            delete = service.process_user_message("Delete the memory about my favorite color.", "c1", "5")
+            self.assertEqual(delete.status, SUCCESS)
+            self.assertEqual(delete.confirmation, "Memory removed.")
+            self.assertEqual(service.retrieve("favorite color", mark_accessed=False), [])
+
+    def test_contextual_delete_and_structured_failures_use_unified_pipeline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+            service.process_user_message("Remember my favorite movie is Interstellar.", "c1", "1")
+            delete = service.process_user_message("Delete that.", "c1", "2", previous_user_text="My favorite movie is Interstellar.")
+            self.assertEqual(delete.status, SUCCESS)
+            self.assertTrue(delete.removed)
+
+            failed = service.process_user_message("Delete that.", "c1", "3")
+            self.assertEqual(failed.status, INVALID_REFERENCE)
+            self.assertNotEqual(failed.confirmation, "Memory removed.")
+
+    def test_memory_diagnostics_disabled_by_default_and_enabled_writes_log(self) -> None:
+        try:
+            MEMORY_LOG_PATH.unlink()
+        except FileNotFoundError:
+            pass
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+            service.process_user_message("Remember my favorite color is violet.", "c1", "1")
+            self.assertFalse(MEMORY_LOG_PATH.exists())
+            result = service.process_user_message("Change it to red.", "c1", "2", diagnostics_enabled=True)
+            self.assertEqual(result.status, SUCCESS)
+            self.assertTrue(MEMORY_LOG_PATH.exists())
+            log_text = MEMORY_LOG_PATH.read_text(encoding="utf-8")
+            self.assertIn("[Memory Diagnostics]", log_text)
+            self.assertIn("Stage", log_text or "Stage")
+            self.assertIn("Memory Related", log_text)
+            self.assertIn("Structured Result", log_text)
+            self.assertIn("Memory updated.", log_text)
+
+    def test_memory_diagnostics_logs_failed_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+            result = service.process_user_message("Delete that.", "c1", "1", diagnostics_enabled=True)
+            self.assertEqual(result.status, INVALID_REFERENCE)
+            log_text = MEMORY_LOG_PATH.read_text(encoding="utf-8")
+            self.assertIn("Failed Stage", log_text)
+            self.assertIn("Context Resolution", log_text)
+
     def test_semantic_memory_retrieval_handles_equivalent_color_queries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
@@ -314,6 +413,16 @@ class ChatFoundationTests(unittest.TestCase):
                 self.assertEqual(memory.key, "location")
                 self.assertEqual(memory.value, "Montreal")
                 self.assertEqual(memory.category, "User")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+            result = service.handle_explicit_intent(
+                "Remember that.",
+                "c1",
+                "2",
+                previous_user_text="I am from Montreal.",
+            )
+            self.assertTrue(result.remembered)
+            self.assertEqual(service.retrieve("where am I from", mark_accessed=False)[0].key, "location")
 
     def test_contextual_memory_creation_without_previous_user_message_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

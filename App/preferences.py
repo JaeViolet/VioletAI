@@ -15,6 +15,7 @@ class Preferences:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.selected_model = DEFAULT_MODEL_NAME
         self.memory_mode = "Explicit"
+        self.memory_diagnostics = False
         self.load()
 
     def load(self) -> None:
@@ -26,12 +27,18 @@ class Preferences:
             self.selected_model = data["selected_model"]
         if isinstance(data, dict) and data.get("memory_mode") in MEMORY_MODES:
             self.memory_mode = data["memory_mode"]
+        if isinstance(data, dict) and isinstance(data.get("memory_diagnostics"), bool):
+            self.memory_diagnostics = data["memory_diagnostics"]
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(
             json.dumps(
-                {"selected_model": self.selected_model, "memory_mode": self.memory_mode},
+                {
+                    "selected_model": self.selected_model,
+                    "memory_mode": self.memory_mode,
+                    "memory_diagnostics": self.memory_diagnostics,
+                },
                 ensure_ascii=False,
                 indent=2,
             ),

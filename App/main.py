@@ -758,34 +758,18 @@ class MainWindow(QMainWindow):
         self._rebuild_sidebar()
         self.input_box.clear()
         self._scroll_to_bottom()
-        memory_result = self.memory_service.handle_explicit_intent(
+        memory_result = self.memory_service.process_user_message(
             message,
             self.conversation.id,
             source_message_id,
             previous_user_text,
             self.preferences.memory_mode,
+            self.preferences.memory_diagnostics,
         )
         if memory_result.handled:
             bubble = self._append_assistant_direct(memory_result.response)
-            if memory_result.updated:
-                self._add_memory_confirmation(bubble, "Memory updated.")
-            elif memory_result.remembered:
-                self._add_memory_confirmation(bubble, "✓ Remembered")
-            elif memory_result.removed:
-                self._add_memory_confirmation(bubble, "Memory removed.")
-            self.settings_overlay.refresh()
-            self._scroll_to_bottom()
-            return
-        automatic_memory = self.memory_service.maybe_capture_automatic_memory(
-            message,
-            self.conversation.id,
-            source_message_id,
-            self.preferences.memory_mode,
-        )
-        if automatic_memory.handled:
-            bubble = self._append_assistant_direct(automatic_memory.response)
-            if automatic_memory.remembered:
-                self._add_memory_confirmation(bubble, "✓ Remembered")
+            if memory_result.status == "SUCCESS" and memory_result.confirmation:
+                self._add_memory_confirmation(bubble, memory_result.confirmation)
             self.settings_overlay.refresh()
             self._scroll_to_bottom()
             return

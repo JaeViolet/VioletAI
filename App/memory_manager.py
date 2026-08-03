@@ -5,6 +5,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QComboBox,
+    QCheckBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -110,8 +111,11 @@ class SettingsOverlay(QFrame):
         self.memory_mode = QComboBox()
         self.memory_mode.setObjectName("modelSelector")
         self.memory_mode.addItems(MEMORY_MODES)
+        self.diagnostics_enabled = QCheckBox("Enable Memory Diagnostics")
+        self.diagnostics_enabled.setObjectName("welcomeSubtitle")
         if self.preferences is not None:
             self.memory_mode.setCurrentText(self.preferences.memory_mode)
+            self.diagnostics_enabled.setChecked(self.preferences.memory_diagnostics)
         clear = QPushButton("Clear all")
         clear.setObjectName("sidebarNewChat")
         clear.clicked.connect(self.clear_all)
@@ -122,6 +126,7 @@ class SettingsOverlay(QFrame):
         controls.addWidget(self.memory_mode)
         controls.addWidget(clear)
         self.content_layout.addLayout(controls)
+        self.content_layout.addWidget(self.diagnostics_enabled)
 
         self.rows = QWidget()
         self.rows_layout = QVBoxLayout(self.rows)
@@ -135,6 +140,7 @@ class SettingsOverlay(QFrame):
         self.include_archived.currentTextChanged.connect(self.refresh)
         self.sort_order.currentTextChanged.connect(self.refresh)
         self.memory_mode.currentTextChanged.connect(self._save_memory_mode)
+        self.diagnostics_enabled.toggled.connect(self._save_diagnostics_enabled)
         self.refresh()
         apply_interaction_cursors(self)
 
@@ -189,6 +195,12 @@ class SettingsOverlay(QFrame):
         if self.preferences is None or mode not in MEMORY_MODES:
             return
         self.preferences.memory_mode = mode
+        self.preferences.save()
+
+    def _save_diagnostics_enabled(self, enabled: bool) -> None:
+        if self.preferences is None:
+            return
+        self.preferences.memory_diagnostics = enabled
         self.preferences.save()
 
     def clear_all(self) -> None:
