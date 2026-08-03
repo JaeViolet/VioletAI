@@ -23,6 +23,7 @@ DELETE = "DELETE"
 RETRIEVE = "RETRIEVE"
 IGNORE = "IGNORE"
 NONE = "NONE"
+TRAILING_EMOTICON = re.compile(r"\s*(?:[:;=8xX][-']?[)(DPpOo/\\]|[🙂😊😉😄😃😂🤣😅🥲]+)\s*$")
 
 
 @dataclass(slots=True)
@@ -194,10 +195,10 @@ def _extract_key_value(text: str) -> tuple[str, str]:
     cleaned = text.strip(" .")
     match = re.search(r"\bmy (?P<key>.+?) is (?P<value>.+)$", cleaned, flags=re.IGNORECASE)
     if match:
-        return match.group("key").strip(), match.group("value").strip()
+        return match.group("key").strip(), _clean_value(match.group("value"))
     match = re.search(r"\bthe (?P<key>color|colour) i like most is (?P<value>.+?)(?: now)?$", cleaned, flags=re.IGNORECASE)
     if match:
-        return "favorite color", match.group("value").strip()
+        return "favorite color", _clean_value(match.group("value"))
     return "", ""
 
 
@@ -214,7 +215,7 @@ def _extract_update_key_value(text: str) -> tuple[str, str]:
         match = re.match(pattern, cleaned, flags=re.IGNORECASE)
         if match:
             key = (match.groupdict().get("key") or match.groupdict().get("old") or "").strip()
-            return key, match.group("value").strip()
+            return key, _clean_value(match.group("value"))
     return _extract_key_value(cleaned)
 
 
@@ -227,4 +228,15 @@ def _extract_delete_key(text: str) -> str:
 
 def _extract_now_value(text: str) -> str:
     match = re.search(r"\bis (?P<value>.+?) now\b", text, flags=re.IGNORECASE)
-    return match.group("value").strip(" .") if match else ""
+    return _clean_value(match.group("value")) if match else ""
+
+
+def _clean_value(value: str) -> str:
+    cleaned = " ".join(str(value or "").strip().split())
+    while True:
+        previous = cleaned
+        cleaned = TRAILING_EMOTICON.sub("", cleaned).strip()
+        cleaned = cleaned.rstrip(" \t\r\n.!?;:")
+        if cleaned == previous:
+            break
+    return cleaned

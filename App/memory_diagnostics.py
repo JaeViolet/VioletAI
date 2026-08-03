@@ -114,6 +114,9 @@ def _format_record(data: dict[str, Any]) -> str:
     if data.get("error"):
         lines.extend(["Error", _quote(data.get("error")), ""])
 
+    if data.get("post_memory_events"):
+        lines.extend(["Post-memory Ollama", *_post_memory_debug_lines(data), ""])
+
     lines.extend(["Assistant", _quote(data.get("assistant_response", "")), ""])
     lines.append(f"{'Total':<13} {_format_duration(data.get('total_execution_ms'))}")
     lines.append(divider)
@@ -239,3 +242,42 @@ def _format_duration(value: object) -> str:
     if milliseconds >= 10:
         return f"{milliseconds:.0f} ms"
     return f"{milliseconds:.1f} ms"
+
+
+def _post_memory_debug_lines(data: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    count = data.get("post_memory_message_count")
+    roles = data.get("post_memory_roles")
+    if count is not None:
+        lines.append(f"Messages      {count} roles={roles}")
+    for index, message in enumerate(data.get("post_memory_messages") or [], start=1):
+        if not isinstance(message, dict):
+            continue
+        lines.append(
+            f"Prompt {index:<6} {message.get('role', '')} len={message.get('length', 0)} "
+            f"preview={_quote(message.get('preview', ''))}"
+        )
+    for event in data.get("post_memory_events") or []:
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("event")
+        if kind == "request_start":
+            lines.append(
+                f"Request       start messages={event.get('message_count')} "
+                f"roles={event.get('roles')} cancelled={event.get('cancellation_requested')}"
+            )
+            if "think" in event or "options" in event:
+                lines.append(f"Options       think={event.get('think')} options={event.get('options')}")
+        elif kind == "http_status":
+            lines.append(f"HTTP          {event.get('status_code')}")
+        elif kind == "ndjson_event":
+            lines.append(
+                f"NDJSON        {event.get('event_type')} done={event.get('done')} "
+                f"chunk={event.get('chunk_length', 0)} total={event.get('accumulated_content_length', 0)} "
+                f"cancelled={event.get('cancellation_requested')}"
+            )
+        elif kind == "error":
+            lines.append(f"Error Source  {event.get('source')} {_quote(event.get('message', ''))}")
+        elif kind == "cancel_requested":
+            lines.append(f"Cancel        requested={event.get('cancellation_requested')}")
+    return lines

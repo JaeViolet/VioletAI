@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from config import APP_FOOTER_TEXT, APP_NAME, DEFAULT_MODEL_NAME, SYSTEM_PROMPT
+from config import APP_FOOTER_TEXT, APP_NAME, DEFAULT_MODEL_NAME, POST_MEMORY_READ_TIMEOUT_SECONDS, SYSTEM_PROMPT
 from conversation_store import Conversation, ConversationStore
 from design import Motion, PNG_CONTROL_ICON_SIZE, app_stylesheet, icon
 from memory_manager import SettingsOverlay
@@ -80,6 +80,9 @@ class MainWindow(QMainWindow):
         self.thinking_row: QWidget | None = None
         self.streamed_answer = ""
         self.pending_memory_confirmation = ""
+        self.pending_memory_topic = ""
+        self.pending_memory_value = ""
+        self._post_memory_generation_active = False
         self.current_diagnostics: MemoryDiagnostics | None = None
         self._ollama_request_started_at: float | None = None
         self._first_token_at: float | None = None
@@ -826,6 +829,9 @@ class MainWindow(QMainWindow):
     def _start_generation(self) -> None:
         self.streamed_answer = ""
         self.pending_memory_confirmation = ""
+        self.pending_memory_topic = ""
+        self.pending_memory_value = ""
+        self._post_memory_generation_active = False
         self.pending_bubble = None
         self.pending_row = None
         self._ollama_request_started_at = None
@@ -875,6 +881,9 @@ class MainWindow(QMainWindow):
     def _start_memory_response_generation(self, memory_result: MemoryActionResult) -> None:
         self.streamed_answer = ""
         self.pending_memory_confirmation = memory_result.confirmation
+        self.pending_memory_topic = memory_result.canonical_key.replace("_", " ").strip()
+        self.pending_memory_value = memory_result.new_value.strip()
+        self._post_memory_generation_active = True
         self.pending_bubble = None
         self.pending_row = None
         self.pending_column = None
@@ -892,8 +901,17 @@ class MainWindow(QMainWindow):
         prompt_started = perf_counter()
         ollama_messages = build_memory_result_response_messages(self.messages, memory_result, SYSTEM_PROMPT)
         self._record_diagnostics_elapsed("prompt_ms", prompt_started)
+        self._record_post_memory_prompt_shape(ollama_messages)
         self._prompt_ready_at = perf_counter()
-        self.worker = OllamaWorker(ollama_messages, self.active_model)
+        self.worker = OllamaWorker(
+            ollama_messages,
+            self.active_model,
+            read_timeout_seconds=POST_MEMORY_READ_TIMEOUT_SECONDS,
+            request_kind="post_memory",
+            diagnostic_callback=self._record_ollama_diagnostic_event,
+            options={"num_predict": 64, "temperature": 0.5},
+            think=False,
+        )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.request_started.connect(self._diagnostics_ollama_started)
@@ -920,6 +938,64 @@ class MainWindow(QMainWindow):
     def _record_diagnostics_value(self, key: str, milliseconds: float) -> None:
         if self.current_diagnostics is not None:
             self.current_diagnostics.record(**{key: round(milliseconds, 3)})
+
+    def _record_post_memory_prompt_shape(self, messages: list[dict[str, str]]) -> None:
+        if self.current_diagnostics is None:
+            return
+        self.current_diagnostics.record(
+            post_memory_message_count=len(messages),
+            post_memory_roles=[message.get("role", "") for message in messages],
+            post_memory_messages=[
+                {
+                    "role": message.get("role", ""),
+                    "length": len(message.get("content", "")),
+                    "preview": self._sanitized_message_preview(message),
+                }
+                for message in messages
+            ],
+        )
+
+    def _record_ollama_diagnostic_event(self, event: dict[str, object]) -> None:
+        if self.current_diagnostics is None or event.get("request_kind") != "post_memory":
+            return
+        existing = list(self.current_diagnostics.data.get("post_memory_events", []))
+        sanitized = {
+            key: value
+            for key, value in event.items()
+            if key
+            in {
+                "event",
+                "request_kind",
+                "message_count",
+                "roles",
+                "status_code",
+                "event_type",
+                "done",
+                "chunk_length",
+                "accumulated_content_length",
+                "cancellation_requested",
+                "source",
+                "message",
+                "think",
+                "options",
+            }
+        }
+        existing.append(sanitized)
+        self.current_diagnostics.record(post_memory_events=existing)
+
+    def _sanitized_message_preview(self, message: dict[str, str]) -> str:
+        text = message.get("content", "")
+        if message.get("role") == "user":
+            return "[user message redacted]"
+        if "[Memory operation summary]" in text:
+            return "[memory operation summary]"
+        return self._redacted_preview(text)
+
+    def _redacted_preview(self, text: str) -> str:
+        normalized = " ".join(text.split())
+        if len(normalized) <= 90:
+            return normalized
+        return f"{normalized[:87]}..."
 
     def _finalize_diagnostics(
         self,
@@ -968,6 +1044,7 @@ class MainWindow(QMainWindow):
     def _receive_response(self, answer: str) -> None:
         if self._generation_cancel_requested:
             return
+        answer = self._safe_post_memory_answer(answer)
         generation_finished_at = perf_counter()
         if self._first_token_at is not None:
             self._record_diagnostics_value("generate_ms", (generation_finished_at - self._first_token_at) * 1000)
@@ -1011,13 +1088,14 @@ class MainWindow(QMainWindow):
         self._render_timer.stop()
         self._remove_thinking()
         if self.pending_memory_confirmation:
-            bubble = self._append_assistant_direct("Done.")
+            fallback = "I couldn't generate a follow-up."
+            bubble = self._append_assistant_direct(fallback)
             self._add_memory_confirmation(bubble, self.pending_memory_confirmation)
             self.pending_memory_confirmation = ""
             self._set_status("Ready")
             self._scroll_to_bottom()
             self._record_diagnostics_elapsed("render_ms", render_started)
-            self._finalize_diagnostics("Done.", "Generation", error)
+            self._finalize_diagnostics(fallback, "Generation", error)
             return
         if self.pending_bubble is not None and self.streamed_answer.strip():
             self.pending_bubble.set_text(self.streamed_answer)
@@ -1080,10 +1158,41 @@ class MainWindow(QMainWindow):
         self.pending_row = None
         self.pending_column = None
         self.pending_memory_confirmation = ""
+        self.pending_memory_topic = ""
+        self.pending_memory_value = ""
+        self._post_memory_generation_active = False
         self._set_controls_generating(False)
         if self.footer_status.text() in {"Connecting...", "Thinking...", "Generating..."}:
             self._set_status("Ready")
         self.input_box.setFocus()
+
+    def _safe_post_memory_answer(self, answer: str) -> str:
+        if not self._post_memory_generation_active:
+            return answer
+        lowered = answer.casefold()
+        forbidden = (
+            "remember",
+            "saved",
+            "save",
+            "memory",
+            "noted",
+            "note that",
+            "keep in mind",
+            "stored",
+            "updated",
+            "i'll keep",
+            "i have",
+            "i've",
+        )
+        if not any(term in lowered for term in forbidden):
+            return answer
+        value = self.pending_memory_value.strip()
+        topic = self.pending_memory_topic.strip()
+        if value:
+            return f"{value.capitalize()} is a solid pick."
+        if topic:
+            return f"{topic.capitalize()} is a solid pick."
+        return "That sounds good."
 
     def _set_controls_generating(self, generating: bool) -> None:
         self.send_button.setEnabled(not generating)

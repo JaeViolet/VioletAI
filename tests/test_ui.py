@@ -426,6 +426,53 @@ class ChatFoundationTests(unittest.TestCase):
             self.assertIn("Assistant\n\"Could not connect to Ollama.\"", log_text)
         window.close()
 
+    def test_post_memory_diagnostics_include_sanitized_request_events(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "memory.log"
+            with patch.object(memory_diagnostics, "MEMORY_LOG_PATH", log_path):
+                window.current_diagnostics = memory_diagnostics.MemoryDiagnostics(True, auto_emit=False)
+                window.current_diagnostics.record(user_message="Remember that my favorite drink is water.", action=CREATE)
+                messages = [
+                    {"role": "system", "content": "system prompt"},
+                    {"role": "system", "content": "topic favorite drink"},
+                    {"role": "user", "content": "Remember that my favorite drink is water."},
+                ]
+                window._record_post_memory_prompt_shape(messages)
+                window._record_ollama_diagnostic_event({
+                    "request_kind": "post_memory",
+                    "event": "request_start",
+                    "message_count": 3,
+                    "roles": ["system", "system", "user"],
+                    "cancellation_requested": False,
+                    "think": False,
+                    "options": {"num_predict": 64},
+                })
+                window._record_ollama_diagnostic_event({
+                    "request_kind": "post_memory",
+                    "event": "http_status",
+                    "status_code": 200,
+                })
+                window._record_ollama_diagnostic_event({
+                    "request_kind": "post_memory",
+                    "event": "ndjson_event",
+                    "event_type": "chunk",
+                    "done": False,
+                    "chunk_length": 5,
+                    "accumulated_content_length": 5,
+                    "cancellation_requested": False,
+                })
+                window._finalize_diagnostics("Nice choice.")
+                log_text = log_path.read_text(encoding="utf-8")
+            self.assertIn("Post-memory Ollama", log_text)
+            self.assertIn("Messages      3 roles=['system', 'system', 'user']", log_text)
+            self.assertIn('preview="[user message redacted]"', log_text)
+            self.assertIn("Options       think=False options={'num_predict': 64}", log_text)
+            self.assertIn("HTTP          200", log_text)
+            self.assertIn("NDJSON        chunk done=False chunk=5 total=5 cancelled=False", log_text)
+            self.assertNotIn("memory_id", log_text)
+        window.close()
+
     def test_semantic_memory_retrieval_handles_equivalent_color_queries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
@@ -664,15 +711,33 @@ class ChatFoundationTests(unittest.TestCase):
             memory_id="mem_1",
         )
         messages = build_memory_result_response_messages(
-            [{"role": "user", "content": "Remember that my favorite color is purple."}],
+            [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "Hi there."},
+                {"role": "user", "content": "Remember that my favorite color is purple."},
+            ],
             result,
             SYSTEM_PROMPT,
         )
         combined = "\n".join(message["content"] for message in messages)
-        self.assertIn('"status": "SUCCESS"', combined)
-        self.assertIn('"confirmation": "✓ Remembered"', combined)
         self.assertIn("Do not say or imply", messages[0]["content"])
-        self.assertEqual(messages[-1]["content"], "Respond briefly and naturally without mentioning the memory operation.")
+        self.assertIn("Do not list capabilities", messages[0]["content"])
+        self.assertIn("Status: SUCCESS", combined)
+        self.assertNotIn('"memory_id"', combined)
+        self.assertNotIn("Respond briefly and naturally", combined)
+        self.assertEqual([message["role"] for message in messages], ["system", "system", "user", "assistant", "user"])
+        self.assertEqual(messages[-1]["content"], "Remember that my favorite color is purple.")
+        self.assertIn("Do not claim you can manage files", SYSTEM_PROMPT)
+
+    def test_memory_value_cleanup_strips_trailing_punctuation_and_emoticons(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+            result = service.process_user_message("can you remember that my favorite drink is water?", "c1", "1")
+            self.assertEqual(result.status, SUCCESS)
+            self.assertEqual(service.retrieve("favorite drink", mark_accessed=False)[0].value, "water")
+            result = service.process_user_message("remember that my favorite snack is popcorn :)", "c1", "2")
+            self.assertEqual(result.status, SUCCESS)
+            self.assertEqual(service.retrieve("favorite snack", mark_accessed=False)[0].value, "popcorn")
 
     def test_memory_store_database_errors_are_reported(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -960,6 +1025,17 @@ class ChatFoundationTests(unittest.TestCase):
         self.assertEqual(memory.value, "Montreal")
         window.close()
 
+    def test_automatic_memory_creation_uses_post_memory_response_path(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.preferences.memory_mode = "Automatic"
+        with patch.object(window, "_start_memory_response_generation") as memory_generation:
+            window.input_box.setPlainText("my favorite chapstick brand is nivea")
+            window.send_message()
+        memory_generation.assert_called_once()
+        memory = window.memory_service.retrieve("favorite chapstick brand", mark_accessed=False)[0]
+        self.assertEqual(memory.value, "nivea")
+        window.close()
+
     def test_failed_memory_write_does_not_show_remembered_confirmation(self) -> None:
         window, _temp_dir = self._window_with_temp_store()
         with patch.object(window.memory_store, "add_memory", side_effect=RuntimeError("disk is read-only")):
@@ -980,6 +1056,25 @@ class ChatFoundationTests(unittest.TestCase):
         labels = [label.text() for label in window.findChildren(QLabel)]
         self.assertIn("Memory updated.", labels)
         self.assertEqual(window.messages[-1]["content"], "That works.")
+        window.close()
+
+    def test_post_memory_response_repetition_is_neutralized(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.pending_memory_confirmation = "✓ Remembered"
+        window.pending_memory_value = "water"
+        window._post_memory_generation_active = True
+        window._receive_response("Got it, I've noted that your favorite drink is water.")
+        self.assertEqual(window.messages[-1]["content"], "Water is a solid pick.")
+        window.close()
+
+    def test_post_memory_error_fallback_is_honest_and_not_done(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.pending_memory_confirmation = "✓ Remembered"
+        window._receive_error("Ollama returned an empty response.")
+        labels = [label.text() for label in window.findChildren(QLabel)]
+        self.assertIn("✓ Remembered", labels)
+        self.assertEqual(window.messages[-1]["content"], "I couldn't generate a follow-up.")
+        self.assertNotEqual(window.messages[-1]["content"], "Done.")
         window.close()
 
     def test_settings_overlay_memory_manager_search_edit_delete(self) -> None:
@@ -1227,6 +1322,29 @@ class ChatFoundationTests(unittest.TestCase):
         worker.run()
         self.assertEqual(chunks, ["Hello", " there"])
         self.assertEqual(answers, ["Hello there"])
+        self.assertNotIn("think", post.call_args.kwargs["json"])
+        response.close.assert_called_once()
+
+    @patch("ollama_client.requests.post")
+    def test_ollama_worker_can_send_post_memory_options(self, post: Mock) -> None:
+        response = Mock()
+        response.status_code = 200
+        response.iter_lines.return_value = ['{"message":{"content":"Nice choice."},"done":true}']
+        post.return_value = response
+        worker = OllamaWorker(
+            [{"role": "user", "content": "Hi"}],
+            DEFAULT_MODEL_NAME,
+            request_kind="post_memory",
+            options={"num_predict": 64, "temperature": 0.5},
+            think=False,
+        )
+        answers: list[str] = []
+        worker.finished.connect(answers.append)
+        worker.run()
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["think"], False)
+        self.assertEqual(payload["options"]["num_predict"], 64)
+        self.assertEqual(answers, ["Nice choice."])
         response.close.assert_called_once()
 
     @patch("ollama_client.requests.post")

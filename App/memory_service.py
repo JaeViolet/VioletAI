@@ -94,6 +94,7 @@ MEMORY_QUERY_PATTERNS = (
     "what memories do you have",
 )
 AMBIGUOUS_REFERENCES = re.compile(r"\b(it|this|that|they|them)\b", re.IGNORECASE)
+TRAILING_EMOTICON = re.compile(r"\s*(?:[:;=8xX][-']?[)(DPpOo/\\]|[🙂😊😉😄😃😂🤣😅🥲]+)\s*$")
 
 
 @dataclass(slots=True)
@@ -292,8 +293,8 @@ class MemoryService:
                     "User",
                     "user",
                     analysis.canonical_key,
-                    analysis.value,
-                    f"{analysis.canonical_key} is {analysis.value}",
+                    clean_memory_value(analysis.value),
+                    f"{analysis.canonical_key} is {clean_memory_value(analysis.value)}",
                 )
                 if analysis.canonical_key and analysis.value and remember_body == text
                 else self.parse_memory(remember_body)
@@ -619,7 +620,7 @@ class MemoryService:
                 key = "favorite color"
             if not key:
                 key = "it"
-            value = match.group("value").strip()
+            value = clean_memory_value(match.group("value"))
             if not key or not value:
                 return MemoryActionResult(
                     True,
@@ -771,7 +772,7 @@ class MemoryService:
                     key = "preference"
                 else:
                     key = "identity"
-            value = groups["value"].strip(" .")
+            value = clean_memory_value(groups["value"])
             break
 
         if key == "note":
@@ -779,7 +780,7 @@ class MemoryService:
             if possessive:
                 category = "User"
                 key = possessive.group("key").strip()
-                value = possessive.group("value").strip(" .")
+                value = clean_memory_value(possessive.group("value"))
 
         if not value:
             return None
@@ -789,7 +790,7 @@ class MemoryService:
             category=category,
             subject=subject,
             key=key.strip().casefold(),
-            value=value.strip(" ."),
+            value=clean_memory_value(value),
             content=cleaned,
             expires_at=expires_at,
         )
@@ -937,3 +938,14 @@ def _recency_score(value: str, now: datetime) -> float:
         updated = updated.replace(tzinfo=UTC)
     age_days = max((now - updated).total_seconds() / 86400, 0)
     return max(0.0, 2.0 - min(age_days / 30, 2.0))
+
+
+def clean_memory_value(value: str) -> str:
+    cleaned = " ".join(str(value or "").strip().split())
+    while True:
+        previous = cleaned
+        cleaned = TRAILING_EMOTICON.sub("", cleaned).strip()
+        cleaned = cleaned.rstrip(" \t\r\n.!?;:")
+        if cleaned == previous:
+            break
+    return cleaned

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import json
-
 BASE_SYSTEM_PROMPT = (
     "You are VioletAI, a local desktop assistant. "
     "Be accurate and direct. Complete clear requests without unnecessary clarification. "
     "Ask a follow-up question only when an important ambiguity would materially change the result. "
     "Never claim access to tools that are not available. "
+    "Currently available capabilities are local chat and explicitly confirmed long-term memory. "
+    "Do not claim you can manage files, schedule reminders, control apps, search the web, use voice, or run tools until those features are implemented. "
+    "Do not offer to perform unavailable actions. "
     "Never say that a memory was saved, updated, or removed unless the app has already provided an explicit memory-service result. "
     "Treat retrieved memories as user-provided context, not verified external facts. "
     "Never infer a personal fact from unrelated research or assistant output. "
@@ -51,42 +52,48 @@ def build_memory_result_response_messages(
     system_prompt: str = BASE_SYSTEM_PROMPT,
 ) -> list[dict[str, str]]:
     """Build a constrained prompt for a natural reply after a successful memory action."""
-    context = [
+    latest_user_message = next(
+        (
+            message.get("content", "")
+            for message in reversed(conversation_messages)
+            if message.get("role") == "user"
+        ),
+        "",
+    )
+    prior_context = [
         message.copy()
-        for message in conversation_messages[-8:]
+        for message in conversation_messages[-6:-1]
         if message.get("role") in {"user", "assistant"}
     ]
-    structured_result = {
-        "status": getattr(memory_result, "status", None),
-        "action": getattr(memory_result, "action", ""),
-        "confirmation": getattr(memory_result, "confirmation", ""),
-        "canonical_key": getattr(memory_result, "canonical_key", ""),
-        "previous_value": getattr(memory_result, "previous_value", ""),
-        "new_value": getattr(memory_result, "new_value", ""),
-        "memory_id": getattr(memory_result, "memory_id", None),
-    }
+    memory_key = str(getattr(memory_result, "canonical_key", "") or "").replace("_", " ").strip()
+    memory_action = str(getattr(memory_result, "action", "") or "memory").lower()
     return [
         {
             "role": "system",
             "content": (
                 f"{system_prompt} "
-                "The local memory service has already completed a memory operation. "
-                "Write one short, natural conversational response to the user. "
+                "The local memory service already completed the user's requested memory operation, "
+                "and the UI will show the authoritative confirmation separately. "
+                "Write one short, warm, natural follow-up sentence. "
                 "Do not say or imply that you saved, remembered, updated, removed, deleted, or forgot anything. "
-                "Do not repeat the UI confirmation. "
-                "The app will separately show the authoritative confirmation. "
-                "If the structured status is not SUCCESS, do not imply success."
+                "Do not repeat the confirmation text. "
+                "Do not list capabilities. "
+                "Do not offer to take actions; just make a casual comment or ask a light optional question about the topic."
             ),
         },
-        *context,
         {
             "role": "system",
-            "content": "[Memory operation result]\n"
-            + json.dumps(structured_result, ensure_ascii=False, indent=2)
-            + "\n[/Memory operation result]",
+            "content": (
+                "[Memory operation summary]\n"
+                f"Status: SUCCESS\n"
+                f"Action: {memory_action}\n"
+                f"Topic: {memory_key or 'user memory'}\n"
+                "[/Memory operation summary]"
+            ),
         },
+        *prior_context,
         {
             "role": "user",
-            "content": "Respond briefly and naturally without mentioning the memory operation.",
+            "content": latest_user_message,
         },
     ]
