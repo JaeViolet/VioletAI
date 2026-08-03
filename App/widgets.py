@@ -15,6 +15,7 @@ from PySide6.QtGui import (
     QKeyEvent,
     QSyntaxHighlighter,
     QTextCharFormat,
+    QTextDocument,
 )
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -145,6 +146,27 @@ class AutoGrowingInput(QTextEdit):
         line_height = max(1, self.fontMetrics().lineSpacing())
         document_height = self.document().documentLayout().documentSize().height()
         return self.document().blockCount() > 1 or document_height > line_height + 14
+
+    def measured_document_metrics(self, text_width: int) -> dict[str, float | int]:
+        """Measure this text using a stable wrapping width supplied by the parent layout."""
+        width = max(1, int(text_width))
+        document = QTextDocument()
+        document.setDefaultFont(self.font())
+        document.setDocumentMargin(4)
+        document.setPlainText(self.toPlainText() or " ")
+        document.setTextWidth(width)
+        _ = document.size()
+        visual_lines = 0
+        block = document.begin()
+        while block.isValid():
+            visual_lines += max(1, block.layout().lineCount())
+            block = block.next()
+        return {
+            "document_height": float(document.documentLayout().documentSize().height()),
+            "visual_lines": visual_lines,
+            "block_count": document.blockCount(),
+            "line_height": max(1, self.fontMetrics().lineSpacing()),
+        }
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         is_enter = event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)

@@ -114,6 +114,23 @@ class ChatFoundationTests(unittest.TestCase):
         self.addCleanup(temp_dir.cleanup)
         return MainWindow(), temp_dir
 
+    def _process_composer_events(self, window: MainWindow, cycles: int = 4) -> None:
+        for _ in range(cycles):
+            self.app.processEvents()
+            window._update_composer_mode()
+
+    def _composer_wrap_boundary_text(self, window: MainWindow) -> tuple[str, str]:
+        width = window._stable_composer_text_width()
+        previous = "word"
+        for count in range(2, 240):
+            text = " ".join(["word"] * count)
+            window.input_box.setPlainText(text)
+            metrics = window.input_box.measured_document_metrics(width)
+            if int(metrics["visual_lines"]) > 1:
+                return previous, text
+            previous = text
+        self.fail("Could not find composer wrap boundary text.")
+
     def test_markdown_message_splits_out_code_block(self) -> None:
         bubble = MessageBubble(
             "Text before.\n\n```python\nprint('hello')\n```\n\nText after.",
@@ -1180,6 +1197,101 @@ class ChatFoundationTests(unittest.TestCase):
         self.app.processEvents()
         window._update_composer_mode()
         self.assertFalse(window._composer_multiline)
+        window.close()
+
+    def test_composer_stays_compact_at_wrap_threshold(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        self.app.processEvents()
+        threshold_text, _wrapped_text = self._composer_wrap_boundary_text(window)
+        window._composer_layout_diagnostics.clear()
+        window._composer_total_state_changes = 0
+        window.input_box.setPlainText(threshold_text)
+        self._process_composer_events(window, 8)
+        self.assertFalse(window._composer_multiline)
+        self.assertEqual(window._composer_total_state_changes, 0)
+        self.assertTrue(window._composer_layout_diagnostics)
+        last = window._composer_layout_diagnostics[-1]
+        self.assertIn("document_height", last)
+        self.assertIn("available_text_width", last)
+        self.assertIn("target_height", last)
+        self.assertEqual(last["requested_next_state"], "compact")
+        window.close()
+
+    def test_composer_expands_once_when_crossing_from_one_visual_line_to_two(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        self.app.processEvents()
+        threshold_text, wrapped_text = self._composer_wrap_boundary_text(window)
+        window.input_box.setPlainText(threshold_text)
+        self._process_composer_events(window)
+        window._composer_total_state_changes = 0
+        window.input_box.setPlainText(wrapped_text)
+        self._process_composer_events(window, 10)
+        self.assertTrue(window._composer_multiline)
+        self.assertEqual(window._composer_total_state_changes, 1)
+        self.assertLessEqual(window._composer_state_changes_this_edit, 1)
+        window.close()
+
+    def test_composer_collapses_once_after_deleting_back_to_one_line(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        self.app.processEvents()
+        threshold_text, wrapped_text = self._composer_wrap_boundary_text(window)
+        window.input_box.setPlainText(wrapped_text)
+        self._process_composer_events(window)
+        self.assertTrue(window._composer_multiline)
+        window._composer_total_state_changes = 0
+        window.input_box.setPlainText(threshold_text)
+        self._process_composer_events(window, 10)
+        self.assertFalse(window._composer_multiline)
+        self.assertEqual(window._composer_total_state_changes, 1)
+        window.close()
+
+    def test_composer_pasting_long_text_expands_without_recursive_toggling(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        self.app.processEvents()
+        initial_width = window.composer.width()
+        window._composer_total_state_changes = 0
+        window.input_box.setPlainText(" ".join(["longtext"] * 120))
+        self._process_composer_events(window, 12)
+        self.assertTrue(window._composer_multiline)
+        self.assertEqual(window._composer_total_state_changes, 1)
+        self.assertEqual(window.composer.width(), initial_width)
+        window.close()
+
+    def test_composer_rapid_typing_near_threshold_does_not_loop(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        self.app.processEvents()
+        threshold_text, wrapped_text = self._composer_wrap_boundary_text(window)
+        initial_width = window.composer.width()
+        window._composer_total_state_changes = 0
+        for index in range(18):
+            window.input_box.setPlainText(wrapped_text if index % 2 else threshold_text)
+            self.app.processEvents()
+        self._process_composer_events(window, 20)
+        self.assertLessEqual(window._composer_total_state_changes, 18)
+        self.assertLessEqual(window._composer_state_changes_this_edit, 1)
+        self.assertFalse(window._composer_mode_timer.isActive())
+        self.assertEqual(window.composer.width(), initial_width)
+        window.close()
+
+    def test_composer_same_text_does_not_toggle_on_repeated_geometry_updates(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        self.app.processEvents()
+        _threshold_text, wrapped_text = self._composer_wrap_boundary_text(window)
+        window.input_box.setPlainText(wrapped_text)
+        self._process_composer_events(window)
+        changes = window._composer_total_state_changes
+        for _ in range(20):
+            window._resize_rows()
+            self.app.processEvents()
+            window._update_composer_mode()
+        self.assertEqual(window._composer_total_state_changes, changes)
+        self.assertTrue(window._composer_multiline)
         window.close()
 
     def test_tools_menu_has_independent_placeholder_actions(self) -> None:

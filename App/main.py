@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import os
 from time import perf_counter
 
 from PySide6.QtCore import (
@@ -103,6 +104,10 @@ class MainWindow(QMainWindow):
         self._render_timer.timeout.connect(self._render_stream)
         self._composer_multiline = False
         self._updating_composer_mode = False
+        self._composer_edit_sequence = 0
+        self._composer_state_changes_this_edit = 0
+        self._composer_total_state_changes = 0
+        self._composer_layout_diagnostics: list[dict[str, object]] = []
         self._composer_mode_timer = QTimer(self)
         self._composer_mode_timer.setSingleShot(True)
         self._composer_mode_timer.timeout.connect(self._update_composer_mode)
@@ -182,7 +187,7 @@ class MainWindow(QMainWindow):
         self.input_box = AutoGrowingInput()
         self.input_box.send_requested.connect(self.send_message)
         self.input_box.height_changed.connect(lambda _height: self._schedule_composer_mode_update())
-        self.input_box.textChanged.connect(self._schedule_composer_mode_update)
+        self.input_box.textChanged.connect(self._handle_composer_text_changed)
         self.tools_button = QToolButton(objectName="toolsButton")
         self.tools_button.setToolTip("VioletAI tools")
         self.tools_button.setIcon(icon("new"))
@@ -293,8 +298,13 @@ class MainWindow(QMainWindow):
     def _set_composer_layout_mode(self, multiline: bool) -> None:
         if self._updating_composer_mode:
             return
+        if multiline == self._composer_multiline:
+            return
         self._updating_composer_mode = True
+        cursor = self.input_box.textCursor()
         self._composer_multiline = multiline
+        self._composer_state_changes_this_edit += 1
+        self._composer_total_state_changes += 1
         try:
             is_compact = not multiline
             if self.composer.property("compact") != is_compact:
@@ -323,6 +333,8 @@ class MainWindow(QMainWindow):
                 self.toolbar_widget.setMaximumHeight(0)
             self.composer_layout.activate()
             self.composer.updateGeometry()
+            self.input_box.setTextCursor(cursor)
+            self.input_box.setFocus()
         finally:
             self._updating_composer_mode = False
 
@@ -331,18 +343,25 @@ class MainWindow(QMainWindow):
             widget.setVisible(visible)
 
     def _schedule_composer_mode_update(self) -> None:
+        if self._updating_composer_mode:
+            return
         if hasattr(self, "_composer_mode_timer") and not self._composer_mode_timer.isActive():
             self._composer_mode_timer.start(0)
 
+    def _handle_composer_text_changed(self) -> None:
+        self._composer_edit_sequence += 1
+        self._composer_state_changes_this_edit = 0
+        self._schedule_composer_mode_update()
+
     def _update_composer_mode(self) -> None:
-        if not hasattr(self, "input_box"):
+        if not hasattr(self, "input_box") or self._updating_composer_mode:
             return
-        multiline = self.input_box.is_visually_multiline()
+        available_width = self._stable_composer_text_width()
+        metrics = self.input_box.measured_document_metrics(available_width)
+        multiline = self._next_composer_multiline(metrics)
+        self._record_composer_layout_diagnostic(metrics, available_width, multiline)
         if multiline != self._composer_multiline:
-            cursor = self.input_box.textCursor()
             self._set_composer_layout_mode(multiline)
-            self.input_box.setTextCursor(cursor)
-            self.input_box.setFocus()
         else:
             target_toolbar_height = 16_777_215 if multiline else 0
             if self.toolbar_widget.maximumHeight() != target_toolbar_height:
@@ -357,6 +376,47 @@ class MainWindow(QMainWindow):
                 self._set_visible_if_needed(self.toolbar_send_button, multiline)
                 self._set_visible_if_needed(self.stop_button, False)
                 self._set_visible_if_needed(self.toolbar_stop_button, False)
+
+    def _next_composer_multiline(self, metrics: dict[str, float | int]) -> bool:
+        visual_lines = int(metrics.get("visual_lines") or 1)
+        block_count = int(metrics.get("block_count") or 1)
+        document_height = float(metrics.get("document_height") or 0)
+        line_height = max(1.0, float(metrics.get("line_height") or 1))
+        if not self._composer_multiline:
+            return block_count > 1 or visual_lines > 1 or document_height > line_height * 1.75
+        return not (block_count <= 1 and visual_lines <= 1 and document_height < line_height * 1.45)
+
+    def _stable_composer_text_width(self) -> int:
+        row_spacing = self.input_row.spacing()
+        control_width = 0
+        visible_controls = (self.tools_button, self.model_selector, self.send_button if self.thread is None else self.stop_button)
+        for control in visible_controls:
+            hint = control.sizeHint()
+            control_width += max(control.width(), hint.width(), control.minimumWidth())
+        control_width += row_spacing * max(0, len(visible_controls))
+        compact_left_margin = 12
+        compact_right_margin = 6
+        return max(80, self.composer.width() - compact_left_margin - compact_right_margin - control_width)
+
+    def _record_composer_layout_diagnostic(
+        self,
+        metrics: dict[str, float | int],
+        available_width: int,
+        requested_state: bool,
+    ) -> None:
+        record = {
+            "edit": self._composer_edit_sequence,
+            "document_height": round(float(metrics.get("document_height") or 0), 3),
+            "available_text_width": available_width,
+            "target_height": self.input_box.height(),
+            "current_state": "multiline" if self._composer_multiline else "compact",
+            "requested_next_state": "multiline" if requested_state else "compact",
+            "state_changes_this_edit": self._composer_state_changes_this_edit,
+        }
+        self._composer_layout_diagnostics.append(record)
+        self._composer_layout_diagnostics = self._composer_layout_diagnostics[-80:]
+        if os.environ.get("VIOLETAI_COMPOSER_DIAGNOSTICS") == "1":
+            print(f"Composer {record}", flush=True)
 
     def _make_welcome(self) -> QWidget:
         row = QWidget()
@@ -488,7 +548,7 @@ class MainWindow(QMainWindow):
             self.input_panel.layout().activate()
         if hasattr(self, "input_box"):
             self.input_box._update_height()
-        self._update_composer_mode()
+        self._schedule_composer_mode_update()
         for index in range(self.message_layout.count() - 1):
             row = self.message_layout.itemAt(index).widget()
             if row and row.property("messageRow"):
