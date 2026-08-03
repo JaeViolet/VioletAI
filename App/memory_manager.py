@@ -141,7 +141,6 @@ class SettingsOverlay(QFrame):
         self.sort_order.currentTextChanged.connect(self.refresh)
         self.memory_mode.currentTextChanged.connect(self._save_memory_mode)
         self.diagnostics_enabled.toggled.connect(self._save_diagnostics_enabled)
-        self.refresh()
         apply_interaction_cursors(self)
 
     def show_overlay(self) -> None:

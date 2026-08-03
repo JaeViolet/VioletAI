@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, sleep
 from unittest.mock import Mock, patch
 
 import requests
@@ -118,6 +118,17 @@ class ChatFoundationTests(unittest.TestCase):
         for _ in range(cycles):
             self.app.processEvents()
             window._update_composer_mode()
+
+    def _wait_until(self, predicate, timeout_seconds: float = 3.0) -> None:
+        deadline = perf_counter() + timeout_seconds
+        while perf_counter() < deadline:
+            self.app.processEvents()
+            if predicate():
+                return
+        self.fail("Timed out waiting for asynchronous UI work.")
+
+    def _wait_for_request_preparation(self, window: MainWindow) -> None:
+        self._wait_until(lambda: window.prep_thread is None)
 
     def _composer_wrap_boundary_text(self, window: MainWindow) -> tuple[str, str]:
         width = window._stable_composer_text_width()
@@ -1003,6 +1014,16 @@ class ChatFoundationTests(unittest.TestCase):
             self.assertTrue(window.send_button.isEnabled())
             window.close()
 
+    def test_rebuilding_long_conversation_batches_row_resizes(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.messages[:] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        for index in range(80):
+            window.messages.append({"role": "user" if index % 2 == 0 else "assistant", "content": f"message {index}"})
+        with patch.object(window, "_resize_rows", wraps=window._resize_rows) as resize_rows:
+            window._rebuild_messages()
+        self.assertEqual(resize_rows.call_count, 1)
+        window.close()
+
     def test_empty_chat_branding_has_no_auto_assistant_message(self) -> None:
         window, _temp_dir = self._window_with_temp_store()
         labels = [label.text() for label in window.findChildren(QLabel)]
@@ -1021,6 +1042,7 @@ class ChatFoundationTests(unittest.TestCase):
             window.scroll_area.verticalScrollBar().setValue(0)
             window.input_box.setPlainText("Scroll now")
             window.send_message()
+            self._wait_for_request_preparation(window)
             self.app.processEvents()
             bar = window.scroll_area.verticalScrollBar()
             self.assertEqual(bar.value(), bar.maximum())
@@ -1199,6 +1221,27 @@ class ChatFoundationTests(unittest.TestCase):
         self.assertFalse(window._composer_multiline)
         window.close()
 
+    def test_send_message_returns_before_slow_memory_preparation_finishes(self) -> None:
+        class SlowMemoryService:
+            def process_user_message(self, *_args, **_kwargs) -> MemoryActionResult:
+                sleep(0.45)
+                return MemoryActionResult(False, status=None, action=NONE)
+
+            def retrieve(self, *_args, **_kwargs) -> list[object]:
+                return []
+
+        window, _temp_dir = self._window_with_temp_store()
+        window.memory_service = SlowMemoryService()
+        with patch.object(window, "_start_generation") as generation:
+            window.input_box.setPlainText("This should not freeze the UI.")
+            started = perf_counter()
+            window.send_message()
+            elapsed_ms = (perf_counter() - started) * 1000
+            self.assertLess(elapsed_ms, 120)
+            self.assertIsNotNone(window.prep_thread)
+            self._wait_until(lambda: generation.called)
+        window.close()
+
     def test_composer_stays_compact_at_wrap_threshold(self) -> None:
         window, _temp_dir = self._window_with_temp_store()
         window.show()
@@ -1312,6 +1355,7 @@ class ChatFoundationTests(unittest.TestCase):
         with patch.object(window, "_start_memory_response_generation") as memory_generation:
             window.input_box.setPlainText("Remember that my favorite color is purple.")
             window.send_message()
+            self._wait_until(lambda: memory_generation.called)
         memory_generation.assert_called_once()
         self.assertEqual(memory_generation.call_args.args[0].status, SUCCESS)
         self.assertEqual(memory_generation.call_args.args[0].confirmation, "✓ Remembered")
@@ -1324,9 +1368,11 @@ class ChatFoundationTests(unittest.TestCase):
         with patch.object(window, "_start_generation"):
             window.input_box.setPlainText("I'm from Montreal.")
             window.send_message()
+            self._wait_for_request_preparation(window)
         with patch.object(window, "_start_memory_response_generation") as memory_generation:
             window.input_box.setPlainText("Remember that.")
             window.send_message()
+            self._wait_until(lambda: memory_generation.called)
         memory_generation.assert_called_once()
         self.assertEqual(memory_generation.call_args.args[0].status, SUCCESS)
         memory = window.memory_service.retrieve("where am I from", mark_accessed=False)[0]
@@ -1343,6 +1389,7 @@ class ChatFoundationTests(unittest.TestCase):
         with patch.object(window, "_start_memory_response_generation") as memory_generation:
             window.input_box.setPlainText(message)
             window.send_message()
+            self._wait_until(lambda: memory_generation.called)
         memory_generation.assert_called_once()
         memory = window.memory_service.retrieve("favorite chapstick brand", mark_accessed=False)[0]
         self.assertEqual(memory.value, "nivea")
@@ -1354,6 +1401,7 @@ class ChatFoundationTests(unittest.TestCase):
             with patch.object(window, "_start_generation") as generation:
                 window.input_box.setPlainText("Remember that my favorite color is purple.")
                 window.send_message()
+                self._wait_for_request_preparation(window)
         generation.assert_not_called()
         labels = [label.text() for label in window.findChildren(QLabel)]
         self.assertNotIn("✓ Remembered", labels)
@@ -1414,6 +1462,7 @@ class ChatFoundationTests(unittest.TestCase):
         with patch.object(window, "_start_memory_response_generation") as memory_generation:
             window.input_box.setPlainText("Remember that my favorite color is purple.")
             window.send_message()
+            self._wait_until(lambda: memory_generation.called)
         result = memory_generation.call_args.args[0]
         self.assertEqual(result.status, SUCCESS)
         window.pending_memory_confirmation = result.confirmation
