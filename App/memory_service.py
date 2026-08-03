@@ -97,6 +97,10 @@ MEMORY_QUERY_PATTERNS = (
 )
 AMBIGUOUS_REFERENCES = re.compile(r"\b(it|this|that|they|them)\b", re.IGNORECASE)
 TRAILING_EMOTICON = re.compile(r"\s*(?:[:;=8xX][-']?[)(DPpOo/\\]|[🙂😊😉😄😃😂🤣😅🥲]+)\s*$")
+PHONE_MODEL = re.compile(
+    r"\b(?P<model>iphone(?:\s+\d{1,2})?(?:\s+(?:pro|max|plus|mini|promax|pro max))?|android phone|phone)\b",
+    re.IGNORECASE,
+)
 CREATE_COMMAND_WRAPPER = re.compile(
     r"^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?"
     r"(?P<command>remember(?: that| this)?|don't forget that|dont forget that|save(?: that| this)?|store(?: that| this)?|note that|keep in mind|create a memory|add this to(?: your)? memory)"
@@ -124,6 +128,13 @@ DURABLE_CLASSES = {
     "SKILL",
     "LONG_TERM_PROJECT",
     "LOCATION",
+}
+REJECT_CLASSES = {
+    "TEMPORARY_STATE",
+    "CURRENT_ACTIVITY",
+    "SHORT_TERM_PLAN",
+    "CASUAL_STATEMENT",
+    "NONE",
 }
 
 
@@ -375,7 +386,7 @@ class MemoryService:
                 status=SUCCESS,
                 action=CREATE,
                 memory_id=memory.id,
-                canonical_key=canonical_key(memory.key),
+                canonical_key=result_canonical_key(memory.key),
                 new_value=memory.value,
                 affected_records=[memory.id],
                 confirmation="✓ Remembered",
@@ -567,7 +578,7 @@ class MemoryService:
             status=SUCCESS,
             action=CREATE,
             memory_id=memory.id,
-            canonical_key=canonical_key(memory.key),
+            canonical_key=result_canonical_key(memory.key),
             new_value=memory.value,
             affected_records=[memory.id],
             confirmation="✓ Remembered",
@@ -617,7 +628,7 @@ class MemoryService:
             status=SUCCESS,
             action=CREATE,
             memory_id=memory.id,
-            canonical_key=canonical_key(memory.key),
+            canonical_key=result_canonical_key(memory.key),
             new_value=memory.value,
             affected_records=[memory.id],
             confirmation="✓ Remembered",
@@ -635,11 +646,11 @@ class MemoryService:
         return parsed.category in {"User", "Preferences", "Projects", "People"} and parsed.subject == "user"
 
     def _validated_automatic_decision(self, decision: DurableMemoryDecision) -> tuple[ParsedMemory | None, str]:
-        rejection = (decision.rejection_reason or decision.durability_class or "LOW_CONFIDENCE").upper()
+        rejection = self._automatic_rejection_code(decision)
         if decision.classifier_source == "FALLBACK" and decision.error:
             return None, "CLASSIFIER_FAILED"
         if not decision.is_user_fact:
-            return None, rejection if rejection not in {"", "NONE"} else "NOT_USER_FACT"
+            return None, rejection or "NOT_USER_FACT"
         if not decision.save_automatically:
             return None, rejection if rejection not in {"", "NONE"} else "LOW_CONFIDENCE"
         if decision.durability_class not in DURABLE_CLASSES:
@@ -652,6 +663,16 @@ class MemoryService:
         category = self._automatic_category(decision, parsed_hint)
         key = decision.canonical_key
         value = clean_memory_value(decision.value)
+        phone_value = extract_phone_model(
+            decision.value,
+            decision.extracted_fact,
+            decision.canonical_key,
+        )
+        if decision.durability_class == "POSSESSION" and phone_value:
+            category = "User"
+            key = "primary_phone"
+            value = phone_value
+            parsed_hint = None
         if parsed_hint is not None and parsed_hint.key != "note" and (
             value.casefold() in {"true", "false", "yes", "no"}
             or not value
@@ -678,6 +699,15 @@ class MemoryService:
         if not self._is_durable_user_memory(decision.extracted_fact or parsed.content, parsed):
             return None, "LOW_CONFIDENCE"
         return parsed, ""
+
+    def _automatic_rejection_code(self, decision: DurableMemoryDecision) -> str:
+        durability_class = (decision.durability_class or "").upper()
+        if durability_class in REJECT_CLASSES:
+            return durability_class
+        reason = (decision.rejection_reason or "").upper().strip()
+        if reason in REJECT_CLASSES or reason in {"LOW_CONFIDENCE", "NOT_USER_FACT", "CLASSIFIER_FAILED", "INVALID_CLASSIFIER_OUTPUT"}:
+            return reason
+        return durability_class or "LOW_CONFIDENCE"
 
     def _automatic_category(self, decision: DurableMemoryDecision, parsed_hint: ParsedMemory | None) -> str:
         if parsed_hint is not None and parsed_hint.category != "Facts":
@@ -841,6 +871,7 @@ class MemoryService:
                     memories=matches,
                 )
             existing = matches[0]
+            value = normalize_memory_value(existing.key, value)
             parsed = ParsedMemory(
                 category=existing.category,
                 subject=existing.subject,
@@ -857,7 +888,7 @@ class MemoryService:
                     status=WRITE_FAILED,
                     action=UPDATE,
                     error_code=WRITE_FAILED,
-                    canonical_key=canonical_key(existing.key),
+                canonical_key=result_canonical_key(existing.key),
                     previous_value=existing.value,
                     new_value=value,
                     affected_records=[existing.id],
@@ -870,7 +901,7 @@ class MemoryService:
                 status=SUCCESS,
                 action=UPDATE,
                 memory_id=memory.id,
-                canonical_key=canonical_key(memory.key),
+                canonical_key=result_canonical_key(memory.key),
                 previous_value=existing.value,
                 new_value=memory.value,
                 affected_records=[existing.id, memory.id],
@@ -935,8 +966,8 @@ class MemoryService:
 
         patterns = [
             (r"^my (?P<key>.+?) is (?P<value>.+)$", "User"),
-            (r"^i have an? (?P<value>iphone|android phone|phone|ipad|tablet|macbook|laptop|desktop|pc|computer)$", "User"),
-            (r"^i own an? (?P<value>iphone|android phone|phone|ipad|tablet|macbook|laptop|desktop|pc|computer)$", "User"),
+            (r"^i have an? (?P<value>iphone(?:\s+\d{1,2})?(?:\s+(?:pro|max|plus|mini|pro max))?|android phone|phone|ipad|tablet|macbook|laptop|desktop|pc|computer)$", "User"),
+            (r"^i own an? (?P<value>iphone(?:\s+\d{1,2})?(?:\s+(?:pro|max|plus|mini|pro max))?|android phone|phone|ipad|tablet|macbook|laptop|desktop|pc|computer)$", "User"),
             (r"^i am from (?P<value>.+)$", "User"),
             (r"^i'?m from (?P<value>.+)$", "User"),
             (r"^i(?: am|'?m) left[- ]handed$", "User"),
@@ -966,7 +997,7 @@ class MemoryService:
                 if match_text.casefold().startswith(("i live in", "i am from", "i'm from", "im from")):
                     key = "location"
                 elif match_text.casefold().startswith(("i have", "i own")):
-                    key = "device"
+                    key = "primary phone" if extract_phone_model(groups.get("value", "")) else "device"
                 elif match_text.casefold().startswith(("i am left", "i'm left", "im left")):
                     key = "handedness"
                     groups["value"] = "left-handed"
@@ -1108,6 +1139,14 @@ class MemoryService:
         cleaned = query.strip()
         if cleaned.casefold().startswith("my "):
             cleaned = cleaned[3:]
+        phone_query = extract_phone_model(cleaned)
+        if phone_query:
+            return [
+                memory
+                for memory in self.store.list_memories()
+                if result_canonical_key(memory.key) in {"primary_phone", "device"}
+                and extract_phone_model(memory.value) == phone_query
+            ]
         return self.retrieve(cleaned, limit=10, mark_accessed=False, include_all_if_query=not cleaned)
 
     def find_update_matches(self, key: str) -> list[MemoryRecord]:
@@ -1159,8 +1198,10 @@ def clean_memory_value(value: str) -> str:
 
 def normalize_memory_value(key: str, value: str) -> str:
     cleaned = clean_memory_value(value)
-    if canonical_key(key) != "device":
+    if result_canonical_key(key) not in {"device", "primary_phone", "phone", "primary_device_model"}:
         return cleaned
+    if phone := extract_phone_model(cleaned):
+        return phone
     normalized = cleaned.casefold()
     replacements = {
         "iphone": "iPhone",
@@ -1169,3 +1210,43 @@ def normalize_memory_value(key: str, value: str) -> str:
         "pc": "PC",
     }
     return replacements.get(normalized, cleaned)
+
+
+def extract_phone_model(*values: str) -> str:
+    for value in values:
+        cleaned = clean_memory_value(value).replace("-", " ")
+        cleaned = re.sub(r"\b(actually|for good|again|now|current|currently|primary|main|model)\b", " ", cleaned, flags=re.IGNORECASE)
+        match = PHONE_MODEL.search(" ".join(cleaned.split()))
+        if not match:
+            continue
+        model = " ".join(match.group("model").split())
+        parts = []
+        for part in model.split():
+            lower = part.casefold()
+            if lower == "iphone":
+                parts.append("iPhone")
+            elif lower == "pro":
+                parts.append("Pro")
+            elif lower == "max":
+                parts.append("Max")
+            elif lower == "promax":
+                parts.extend(["Pro", "Max"])
+            elif lower == "plus":
+                parts.append("Plus")
+            elif lower == "mini":
+                parts.append("mini")
+            elif lower == "android":
+                parts.append("Android")
+            elif lower == "phone":
+                parts.append("phone" if parts else "Phone")
+            else:
+                parts.append(part)
+        return " ".join(parts)
+    return ""
+
+
+def result_canonical_key(key: str) -> str:
+    normalized = canonical_key(key).replace(" ", "_")
+    if normalized in {"primary_phone", "primary_device_model", "possession_iphone", "possession_phone"}:
+        return "primary_phone"
+    return normalized if normalized == "primary_phone" else canonical_key(key)
