@@ -101,6 +101,7 @@ class OllamaWorker(QObject):
     """Run one streaming chat request outside the UI thread."""
 
     connected = Signal()
+    request_started = Signal()
     chunk_received = Signal(str)
     finished = Signal(str)
     cancelled = Signal()
@@ -122,6 +123,7 @@ class OllamaWorker(QObject):
     def run(self) -> None:
         complete_answer: list[str] = []
         try:
+            self.request_started.emit()
             self._response = requests.post(
                 OLLAMA_URL,
                 json={

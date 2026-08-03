@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from time import perf_counter
 
 from memory_diagnostics import MemoryDiagnostics
 from memory_embeddings import canonical_key, embed_text, cosine_similarity
@@ -158,8 +159,9 @@ class MemoryService:
         previous_user_text: str | None = None,
         memory_mode: str = "Explicit",
         diagnostics_enabled: bool = False,
+        diagnostics: MemoryDiagnostics | None = None,
     ) -> MemoryActionResult:
-        diagnostics = MemoryDiagnostics(diagnostics_enabled)
+        diagnostics = diagnostics or MemoryDiagnostics(diagnostics_enabled)
         diagnostics.record(user_message=text, memory_mode=memory_mode)
         if memory_mode == "Off":
             result = MemoryActionResult(
@@ -178,7 +180,9 @@ class MemoryService:
             )
             diagnostics.emit()
             return result
+        analysis_started = perf_counter()
         analysis = self.classifier.analyze(text, previous_user_text)
+        diagnostics.record_elapsed("analysis_ms", analysis_started)
         diagnostics.record(
             memory_related="YES" if analysis.memory_related else "NO",
             action=analysis.action,
@@ -212,7 +216,9 @@ class MemoryService:
             return result
         lowered = text.casefold().strip()
         if analysis.action == RETRIEVE or any(pattern in lowered for pattern in MEMORY_QUERY_PATTERNS):
+            retrieve_started = perf_counter()
             memories = self.retrieve(text, mark_accessed=False, include_all_if_query=True)
+            diagnostics.record_elapsed("retrieve_ms", retrieve_started)
             if not memories:
                 result = MemoryActionResult(
                     True,
@@ -306,8 +312,11 @@ class MemoryService:
                 self._emit_failure_diagnostics(diagnostics, result, "Validation")
                 return result
             try:
+                execute_started = perf_counter()
                 memory = self.remember(parsed, conversation_id, source_message_id, text)
+                diagnostics.record_elapsed("execute_ms", execute_started)
             except Exception as error:
+                diagnostics.record_elapsed("execute_ms", execute_started)
                 result = MemoryActionResult(
                     True,
                     f"I couldn't save that memory: {error}",
@@ -336,7 +345,10 @@ class MemoryService:
             self._emit_success_diagnostics(diagnostics, result, memory, CREATE)
             return result
 
+        execute_started = perf_counter()
         update_result = self.handle_update_intent(text, conversation_id, source_message_id)
+        if update_result.handled:
+            diagnostics.record_elapsed("execute_ms", execute_started)
         if update_result.handled:
             update_result.analysis = analysis
             self._emit_result_diagnostics(diagnostics, update_result)
@@ -362,7 +374,9 @@ class MemoryService:
                     self._emit_failure_diagnostics(diagnostics, result, "Context Resolution")
                     return result
                 forget_query = previous_user_text or ""
+            retrieve_started = perf_counter()
             matches = self.find_forget_matches(forget_query)
+            diagnostics.record_elapsed("retrieve_ms", retrieve_started)
             if not matches:
                 result = MemoryActionResult(
                     True,
@@ -394,9 +408,12 @@ class MemoryService:
                 self._emit_failure_diagnostics(diagnostics, result, "Validation")
                 return result
             try:
+                execute_started = perf_counter()
                 for memory in matches:
                     self.store.archive(memory.id)
+                diagnostics.record_elapsed("execute_ms", execute_started)
             except Exception as error:
+                diagnostics.record_elapsed("execute_ms", execute_started)
                 result = MemoryActionResult(
                     True,
                     f"I couldn't remove that memory: {error}",
@@ -474,8 +491,11 @@ class MemoryService:
             self._emit_result_diagnostics(diagnostics, result)
             return result
         try:
+            execute_started = perf_counter()
             memory = self.remember(parsed, conversation_id, source_message_id, text)
+            diagnostics.record_elapsed("execute_ms", execute_started)
         except Exception as error:
+            diagnostics.record_elapsed("execute_ms", execute_started)
             result = MemoryActionResult(
                 True,
                 f"I couldn't save that memory: {error}",

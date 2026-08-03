@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 BASE_SYSTEM_PROMPT = (
     "You are VioletAI, a local desktop assistant. "
     "Be accurate and direct. Complete clear requests without unnecessary clarification. "
@@ -41,3 +43,50 @@ def build_ollama_messages(
         assembled.append({"role": "system", "content": memory_section})
     assembled.extend(messages)
     return assembled
+
+
+def build_memory_result_response_messages(
+    conversation_messages: list[dict[str, str]],
+    memory_result: object,
+    system_prompt: str = BASE_SYSTEM_PROMPT,
+) -> list[dict[str, str]]:
+    """Build a constrained prompt for a natural reply after a successful memory action."""
+    context = [
+        message.copy()
+        for message in conversation_messages[-8:]
+        if message.get("role") in {"user", "assistant"}
+    ]
+    structured_result = {
+        "status": getattr(memory_result, "status", None),
+        "action": getattr(memory_result, "action", ""),
+        "confirmation": getattr(memory_result, "confirmation", ""),
+        "canonical_key": getattr(memory_result, "canonical_key", ""),
+        "previous_value": getattr(memory_result, "previous_value", ""),
+        "new_value": getattr(memory_result, "new_value", ""),
+        "memory_id": getattr(memory_result, "memory_id", None),
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                f"{system_prompt} "
+                "The local memory service has already completed a memory operation. "
+                "Write one short, natural conversational response to the user. "
+                "Do not say or imply that you saved, remembered, updated, removed, deleted, or forgot anything. "
+                "Do not repeat the UI confirmation. "
+                "The app will separately show the authoritative confirmation. "
+                "If the structured status is not SUCCESS, do not imply success."
+            ),
+        },
+        *context,
+        {
+            "role": "system",
+            "content": "[Memory operation result]\n"
+            + json.dumps(structured_result, ensure_ascii=False, indent=2)
+            + "\n[/Memory operation result]",
+        },
+        {
+            "role": "user",
+            "content": "Respond briefly and naturally without mentioning the memory operation.",
+        },
+    ]

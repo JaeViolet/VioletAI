@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from time import perf_counter
 
 from PySide6.QtCore import (
     QEasingCurve,
@@ -37,11 +38,12 @@ from config import APP_FOOTER_TEXT, APP_NAME, DEFAULT_MODEL_NAME, SYSTEM_PROMPT
 from conversation_store import Conversation, ConversationStore
 from design import Motion, PNG_CONTROL_ICON_SIZE, app_stylesheet, icon
 from memory_manager import SettingsOverlay
-from memory_service import MemoryService
+from memory_diagnostics import MemoryDiagnostics
+from memory_service import SUCCESS, MemoryActionResult, MemoryService
 from memory_store import MemoryStore
 from ollama_client import ModelDiscoveryWorker, OllamaWorker
 from preferences import Preferences
-from prompts import build_ollama_messages
+from prompts import build_memory_result_response_messages, build_ollama_messages
 from sidebar import ChatSidebar, SearchOverlay
 from widgets import (
     AutoGrowingInput,
@@ -77,6 +79,11 @@ class MainWindow(QMainWindow):
         self.pending_column: QWidget | None = None
         self.thinking_row: QWidget | None = None
         self.streamed_answer = ""
+        self.pending_memory_confirmation = ""
+        self.current_diagnostics: MemoryDiagnostics | None = None
+        self._ollama_request_started_at: float | None = None
+        self._first_token_at: float | None = None
+        self._prompt_ready_at: float | None = None
         self._finalized_current_response = False
         self._generation_cancel_requested = False
         self._scroll_animation: QPropertyAnimation | None = None
@@ -745,6 +752,11 @@ class MainWindow(QMainWindow):
         message = self.input_box.toPlainText().strip()
         if not message or self.thread is not None:
             return
+        self.current_diagnostics = MemoryDiagnostics(
+            self.preferences.memory_diagnostics,
+            auto_emit=False,
+        )
+        self.current_diagnostics.record(user_message=message)
         previous_user_text = next(
             (item.get("content", "") for item in reversed(self.messages) if item.get("role") == "user"),
             None,
@@ -765,11 +777,18 @@ class MainWindow(QMainWindow):
             previous_user_text,
             self.preferences.memory_mode,
             self.preferences.memory_diagnostics,
+            self.current_diagnostics,
         )
         if memory_result.handled:
-            bubble = self._append_assistant_direct(memory_result.response)
-            if memory_result.status == "SUCCESS" and memory_result.confirmation:
-                self._add_memory_confirmation(bubble, memory_result.confirmation)
+            if memory_result.status == SUCCESS:
+                self._start_memory_response_generation(memory_result)
+                self.settings_overlay.refresh()
+                return
+            render_started = perf_counter()
+            self._append_assistant_direct(memory_result.response)
+            self._record_diagnostics_elapsed("render_ms", render_started)
+            failed_stage = None if memory_result.status == SUCCESS else "Memory Pipeline"
+            self._finalize_diagnostics(memory_result.response, failed_stage, memory_result.failure_reason)
             self.settings_overlay.refresh()
             self._scroll_to_bottom()
             return
@@ -806,8 +825,12 @@ class MainWindow(QMainWindow):
 
     def _start_generation(self) -> None:
         self.streamed_answer = ""
+        self.pending_memory_confirmation = ""
         self.pending_bubble = None
         self.pending_row = None
+        self._ollama_request_started_at = None
+        self._first_token_at = None
+        self._prompt_ready_at = None
         self._finalized_current_response = False
         self._generation_cancel_requested = False
         self._auto_scroll_enabled = True
@@ -823,12 +846,16 @@ class MainWindow(QMainWindow):
         relevant_memories = (
             []
             if self.preferences.memory_mode == "Off"
-            else self.memory_service.retrieve(last_user_message)
+            else self._retrieve_memories_for_prompt(last_user_message)
         )
+        prompt_started = perf_counter()
         ollama_messages = build_ollama_messages(self.messages, relevant_memories, SYSTEM_PROMPT)
+        self._record_diagnostics_elapsed("prompt_ms", prompt_started)
+        self._prompt_ready_at = perf_counter()
         self.worker = OllamaWorker(ollama_messages, self.active_model)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
+        self.worker.request_started.connect(self._diagnostics_ollama_started)
         self.worker.connected.connect(lambda: self._set_status("Thinking"))
         self.worker.chunk_received.connect(self._receive_chunk)
         self.worker.finished.connect(self._receive_response)
@@ -838,6 +865,71 @@ class MainWindow(QMainWindow):
         self.worker.stopped.connect(self.thread.quit)
         self.thread.finished.connect(self._cleanup_worker)
         self.thread.start()
+
+    def _retrieve_memories_for_prompt(self, message: str) -> list[object]:
+        retrieve_started = perf_counter()
+        memories = self.memory_service.retrieve(message)
+        self._record_diagnostics_elapsed("retrieve_ms", retrieve_started)
+        return memories
+
+    def _start_memory_response_generation(self, memory_result: MemoryActionResult) -> None:
+        self.streamed_answer = ""
+        self.pending_memory_confirmation = memory_result.confirmation
+        self.pending_bubble = None
+        self.pending_row = None
+        self.pending_column = None
+        self._ollama_request_started_at = None
+        self._first_token_at = None
+        self._prompt_ready_at = None
+        self._finalized_current_response = False
+        self._generation_cancel_requested = False
+        self._auto_scroll_enabled = True
+        self._show_thinking()
+        self._set_controls_generating(True)
+        self._set_status("Connecting")
+
+        self.thread = QThread(self)
+        prompt_started = perf_counter()
+        ollama_messages = build_memory_result_response_messages(self.messages, memory_result, SYSTEM_PROMPT)
+        self._record_diagnostics_elapsed("prompt_ms", prompt_started)
+        self._prompt_ready_at = perf_counter()
+        self.worker = OllamaWorker(ollama_messages, self.active_model)
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
+        self.worker.request_started.connect(self._diagnostics_ollama_started)
+        self.worker.connected.connect(lambda: self._set_status("Thinking"))
+        self.worker.chunk_received.connect(self._receive_chunk)
+        self.worker.finished.connect(self._receive_response)
+        self.worker.cancelled.connect(self._receive_cancelled)
+        self.worker.failed.connect(self._receive_error)
+        self.worker.stopped.connect(self.worker.deleteLater)
+        self.worker.stopped.connect(self.thread.quit)
+        self.thread.finished.connect(self._cleanup_worker)
+        self.thread.start()
+
+    def _diagnostics_ollama_started(self) -> None:
+        now = perf_counter()
+        self._ollama_request_started_at = now
+        if self._prompt_ready_at is not None:
+            self._record_diagnostics_value("ollama_start_ms", (now - self._prompt_ready_at) * 1000)
+
+    def _record_diagnostics_elapsed(self, key: str, started_at: float) -> None:
+        if self.current_diagnostics is not None:
+            self.current_diagnostics.record_elapsed(key, started_at)
+
+    def _record_diagnostics_value(self, key: str, milliseconds: float) -> None:
+        if self.current_diagnostics is not None:
+            self.current_diagnostics.record(**{key: round(milliseconds, 3)})
+
+    def _finalize_diagnostics(
+        self,
+        assistant_response: str,
+        failed_stage: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        if self.current_diagnostics is not None:
+            self.current_diagnostics.finalize(assistant_response, failed_stage, error)
+            self.current_diagnostics = None
 
     def stop_generation(self) -> None:
         if self.worker is None:
@@ -851,6 +943,11 @@ class MainWindow(QMainWindow):
     def _receive_chunk(self, chunk: str) -> None:
         if self._generation_cancel_requested:
             return
+        now = perf_counter()
+        if self._first_token_at is None:
+            self._first_token_at = now
+            if self._ollama_request_started_at is not None:
+                self._record_diagnostics_value("first_token_ms", (now - self._ollama_request_started_at) * 1000)
         if self.pending_bubble is None:
             self._remove_thinking()
             self.pending_bubble = self._add_message("", "assistant")
@@ -871,6 +968,10 @@ class MainWindow(QMainWindow):
     def _receive_response(self, answer: str) -> None:
         if self._generation_cancel_requested:
             return
+        generation_finished_at = perf_counter()
+        if self._first_token_at is not None:
+            self._record_diagnostics_value("generate_ms", (generation_finished_at - self._first_token_at) * 1000)
+        render_started = perf_counter()
         self._render_timer.stop()
         self._remove_thinking()
         if self.pending_bubble is None:
@@ -881,19 +982,43 @@ class MainWindow(QMainWindow):
             self.pending_bubble.set_text(answer)
         self._finalize_message_geometry()
         self._append_assistant_message(answer)
+        if self.pending_memory_confirmation and self.pending_bubble is not None:
+            self._add_memory_confirmation(self.pending_bubble, self.pending_memory_confirmation)
+            self.pending_memory_confirmation = ""
         if self._auto_scroll_enabled:
             self._scroll_to_bottom(smooth=True)
         self._set_status("Ready")
+        self._record_diagnostics_elapsed("render_ms", render_started)
+        self._finalize_diagnostics(answer)
 
     def _receive_cancelled(self) -> None:
+        generation_finished_at = perf_counter()
+        if self._first_token_at is not None:
+            self._record_diagnostics_value("generate_ms", (generation_finished_at - self._first_token_at) * 1000)
+        render_started = perf_counter()
         self._set_status("Stopped")
         self._finalize_partial_response(stopped=True)
+        self._record_diagnostics_elapsed("render_ms", render_started)
+        self._finalize_diagnostics(self.streamed_answer.strip(), "Generation", "cancelled")
 
     def _receive_error(self, error: str) -> None:
         if self._generation_cancel_requested:
             return
+        generation_finished_at = perf_counter()
+        if self._first_token_at is not None:
+            self._record_diagnostics_value("generate_ms", (generation_finished_at - self._first_token_at) * 1000)
+        render_started = perf_counter()
         self._render_timer.stop()
         self._remove_thinking()
+        if self.pending_memory_confirmation:
+            bubble = self._append_assistant_direct("Done.")
+            self._add_memory_confirmation(bubble, self.pending_memory_confirmation)
+            self.pending_memory_confirmation = ""
+            self._set_status("Ready")
+            self._scroll_to_bottom()
+            self._record_diagnostics_elapsed("render_ms", render_started)
+            self._finalize_diagnostics("Done.", "Generation", error)
+            return
         if self.pending_bubble is not None and self.streamed_answer.strip():
             self.pending_bubble.set_text(self.streamed_answer)
             self._finalize_partial_response()
@@ -901,6 +1026,8 @@ class MainWindow(QMainWindow):
         self.store.save(self.conversation)
         self._set_status("Error")
         self._scroll_to_bottom()
+        self._record_diagnostics_elapsed("render_ms", render_started)
+        self._finalize_diagnostics(error, "Generation", error)
 
     def _append_assistant_message(self, answer: str) -> None:
         if self._finalized_current_response:
@@ -933,6 +1060,13 @@ class MainWindow(QMainWindow):
                 self.pending_bubble.set_text(answer)
         if answer:
             self._append_assistant_message(answer)
+            if self.pending_memory_confirmation and self.pending_bubble is not None:
+                self._add_memory_confirmation(self.pending_bubble, self.pending_memory_confirmation)
+                self.pending_memory_confirmation = ""
+        elif self.pending_memory_confirmation:
+            bubble = self._append_assistant_direct("Done.")
+            self._add_memory_confirmation(bubble, self.pending_memory_confirmation)
+            self.pending_memory_confirmation = ""
         else:
             self._remove_thinking()
             self.store.save(self.conversation)
@@ -945,6 +1079,7 @@ class MainWindow(QMainWindow):
         self.pending_bubble = None
         self.pending_row = None
         self.pending_column = None
+        self.pending_memory_confirmation = ""
         self._set_controls_generating(False)
         if self.footer_status.text() in {"Connecting...", "Thinking...", "Generating..."}:
             self._set_status("Ready")

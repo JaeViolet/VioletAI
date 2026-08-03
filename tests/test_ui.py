@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from time import perf_counter
 from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -17,13 +18,14 @@ from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtGui import QKeyEvent  # noqa: E402
 from PySide6.QtWidgets import QApplication, QFrame, QLabel, QMessageBox, QToolButton, QWidget  # noqa: E402
 
-from config import DEFAULT_MODEL_NAME, MEMORY_LOG_PATH, SYSTEM_PROMPT  # noqa: E402
+from config import DEFAULT_MODEL_NAME, SYSTEM_PROMPT  # noqa: E402
 from conversation_store import ConversationStore  # noqa: E402
 import design  # noqa: E402
+import memory_diagnostics  # noqa: E402
 from design import Colors, PNG_CONTROL_ICON_SIZE, asset_icon_path, icon  # noqa: E402
 from main import MainWindow  # noqa: E402
 from memory_embeddings import EMBEDDING_MODEL_NAME, canonical_key, cosine_similarity, embed_text  # noqa: E402
-from memory_intent import CREATE, DELETE, IGNORE, RETRIEVE, UPDATE, MemoryAnalysis, MemoryIntentClassifier  # noqa: E402
+from memory_intent import CREATE, DELETE, IGNORE, NONE, RETRIEVE, UPDATE, MemoryAnalysis, MemoryIntentClassifier  # noqa: E402
 from memory_models import CATEGORIES, ParsedMemory  # noqa: E402
 from memory_service import (  # noqa: E402
     INVALID_REFERENCE,
@@ -31,11 +33,12 @@ from memory_service import (  # noqa: E402
     NO_MATCH,
     WRITE_FAILED,
     SUCCESS,
+    MemoryActionResult,
     MemoryService,
 )
 from memory_store import MemoryStore, MemoryStoreError, normalize_category, normalize_key  # noqa: E402
 from ollama_client import InvalidStreamError, OllamaWorker, discover_models, iter_message_chunks  # noqa: E402
-from prompts import build_ollama_messages, format_relevant_memories  # noqa: E402
+from prompts import build_memory_result_response_messages, build_ollama_messages, format_relevant_memories  # noqa: E402
 from sidebar import ChatSidebar  # noqa: E402
 from widgets import AutoGrowingInput, CodeBlock, MarkdownView, MessageActions, MessageBubble  # noqa: E402
 
@@ -318,32 +321,110 @@ class ChatFoundationTests(unittest.TestCase):
             self.assertNotEqual(failed.confirmation, "Memory removed.")
 
     def test_memory_diagnostics_disabled_by_default_and_enabled_writes_log(self) -> None:
-        try:
-            MEMORY_LOG_PATH.unlink()
-        except FileNotFoundError:
-            pass
         with tempfile.TemporaryDirectory() as temp_dir:
-            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
-            service.process_user_message("Remember my favorite color is violet.", "c1", "1")
-            self.assertFalse(MEMORY_LOG_PATH.exists())
-            result = service.process_user_message("Change it to red.", "c1", "2", diagnostics_enabled=True)
-            self.assertEqual(result.status, SUCCESS)
-            self.assertTrue(MEMORY_LOG_PATH.exists())
-            log_text = MEMORY_LOG_PATH.read_text(encoding="utf-8")
-            self.assertIn("[Memory Diagnostics]", log_text)
-            self.assertIn("Stage", log_text or "Stage")
-            self.assertIn("Memory Related", log_text)
-            self.assertIn("Structured Result", log_text)
-            self.assertIn("Memory updated.", log_text)
+            log_path = Path(temp_dir) / "memory.log"
+            with patch.object(memory_diagnostics, "MEMORY_LOG_PATH", log_path):
+                service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+                service.process_user_message("Remember my favorite color is violet.", "c1", "1")
+                self.assertFalse(log_path.exists())
+                result = service.process_user_message("Change it to red.", "c1", "2", diagnostics_enabled=True)
+                self.assertEqual(result.status, SUCCESS)
+                self.assertTrue(log_path.exists())
+                log_text = log_path.read_text(encoding="utf-8")
+            self.assertIn("Memory", log_text)
+            self.assertIn("User\n\"Change it to red.\"", log_text)
+            self.assertIn("UPDATE • favorite color = red", log_text)
+            self.assertIn("Assistant\n\"Memory updated: favorite color is red.\"", log_text)
+            self.assertIn("Total", log_text)
+            self.assertNotIn("Structured Result", log_text)
+            self.assertNotIn("Canonical Key", log_text)
+            self.assertNotIn("Reasoning", log_text)
 
     def test_memory_diagnostics_logs_failed_stage(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
-            result = service.process_user_message("Delete that.", "c1", "1", diagnostics_enabled=True)
-            self.assertEqual(result.status, INVALID_REFERENCE)
-            log_text = MEMORY_LOG_PATH.read_text(encoding="utf-8")
-            self.assertIn("Failed Stage", log_text)
-            self.assertIn("Context Resolution", log_text)
+            log_path = Path(temp_dir) / "memory.log"
+            with patch.object(memory_diagnostics, "MEMORY_LOG_PATH", log_path):
+                service = MemoryService(MemoryStore(Path(temp_dir) / "memory.db"))
+                result = service.process_user_message("Delete that.", "c1", "1", diagnostics_enabled=True)
+                self.assertEqual(result.status, INVALID_REFERENCE)
+                log_text = log_path.read_text(encoding="utf-8")
+            self.assertIn("Memory", log_text)
+            self.assertIn("DELETE • FAILED (INVALID_REFERENCE)", log_text)
+            self.assertIn("Retrieve      FAILED (INVALID_REFERENCE)", log_text)
+            self.assertNotIn("Failed Stage", log_text)
+            self.assertNotIn("Context Resolution", log_text)
+
+    def test_diagnostics_total_not_finalized_before_stream_completion(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "memory.log"
+            with patch.object(memory_diagnostics, "MEMORY_LOG_PATH", log_path):
+                window.current_diagnostics = memory_diagnostics.MemoryDiagnostics(True, auto_emit=False)
+                window.current_diagnostics.record(user_message="Hello", action=NONE)
+                window._prompt_ready_at = perf_counter() - 0.01
+                window._diagnostics_ollama_started()
+                window._ollama_request_started_at = perf_counter() - 1.0
+                window._receive_chunk("Hello")
+                self.assertFalse(log_path.exists())
+                window._first_token_at = perf_counter() - 2.0
+                window._receive_response("Hello there.")
+                self.assertTrue(log_path.exists())
+                self.assertIn("Assistant\n\"Hello there.\"", log_path.read_text(encoding="utf-8"))
+        window.close()
+
+    def test_diagnostics_first_token_generation_render_and_total_timing(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "memory.log"
+            with patch.object(memory_diagnostics, "MEMORY_LOG_PATH", log_path):
+                window.current_diagnostics = memory_diagnostics.MemoryDiagnostics(True, auto_emit=False)
+                window.current_diagnostics.record(user_message="Hello", action=NONE)
+                window.current_diagnostics.started_at = perf_counter() - 11.62
+                window._prompt_ready_at = perf_counter() - 0.05
+                window._diagnostics_ollama_started()
+                request_started = perf_counter() - 8.42
+                window._ollama_request_started_at = request_started
+                window._receive_chunk("Hello")
+                self.assertGreaterEqual(window.current_diagnostics.data["first_token_ms"], 8400)
+                first_token = perf_counter() - 3.18
+                window._first_token_at = first_token
+                window._receive_response("Hello there.")
+                log_text = log_path.read_text(encoding="utf-8")
+            self.assertIn("Ollama Start", log_text)
+            self.assertIn("First Token", log_text)
+            self.assertIn("Generate", log_text)
+            self.assertIn("Render", log_text)
+            self.assertIn("Total         11.", log_text)
+        window.close()
+
+    def test_diagnostics_cancellation_finalizes_with_elapsed_error(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "memory.log"
+            with patch.object(memory_diagnostics, "MEMORY_LOG_PATH", log_path):
+                window.current_diagnostics = memory_diagnostics.MemoryDiagnostics(True, auto_emit=False)
+                window.current_diagnostics.record(user_message="Hello", action=NONE)
+                window.streamed_answer = "partial"
+                window._receive_cancelled()
+                log_text = log_path.read_text(encoding="utf-8")
+            self.assertIn("Generate      FAILED", log_text)
+            self.assertIn("Error\n\"cancelled\"", log_text)
+            self.assertIn("Total", log_text)
+        window.close()
+
+    def test_diagnostics_error_finalizes_with_actual_error(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "memory.log"
+            with patch.object(memory_diagnostics, "MEMORY_LOG_PATH", log_path):
+                window.current_diagnostics = memory_diagnostics.MemoryDiagnostics(True, auto_emit=False)
+                window.current_diagnostics.record(user_message="Hello", action=NONE)
+                window._receive_error("Could not connect to Ollama.")
+                log_text = log_path.read_text(encoding="utf-8")
+            self.assertIn("Generate      FAILED", log_text)
+            self.assertIn("Error\n\"Could not connect to Ollama.\"", log_text)
+            self.assertIn("Assistant\n\"Could not connect to Ollama.\"", log_text)
+        window.close()
 
     def test_semantic_memory_retrieval_handles_equivalent_color_queries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -571,6 +652,27 @@ class ChatFoundationTests(unittest.TestCase):
             forget = service.handle_explicit_intent("Forget my favorite color.", "c1", "2")
             self.assertTrue(forget.removed)
             self.assertEqual(service.retrieve("favorite color"), [])
+
+    def test_memory_success_response_prompt_uses_structured_result_without_forced_confirmation(self) -> None:
+        result = MemoryActionResult(
+            handled=True,
+            status=SUCCESS,
+            action=CREATE,
+            confirmation="✓ Remembered",
+            canonical_key="favorite_color",
+            new_value="purple",
+            memory_id="mem_1",
+        )
+        messages = build_memory_result_response_messages(
+            [{"role": "user", "content": "Remember that my favorite color is purple."}],
+            result,
+            SYSTEM_PROMPT,
+        )
+        combined = "\n".join(message["content"] for message in messages)
+        self.assertIn('"status": "SUCCESS"', combined)
+        self.assertIn('"confirmation": "✓ Remembered"', combined)
+        self.assertIn("Do not say or imply", messages[0]["content"])
+        self.assertEqual(messages[-1]["content"], "Respond briefly and naturally without mentioning the memory operation.")
 
     def test_memory_store_database_errors_are_reported(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -834,28 +936,28 @@ class ChatFoundationTests(unittest.TestCase):
 
     def test_explicit_memory_command_shows_remembered_confirmation(self) -> None:
         window, _temp_dir = self._window_with_temp_store()
-        with patch.object(window, "_start_generation") as generation:
+        with patch.object(window, "_start_memory_response_generation") as memory_generation:
             window.input_box.setPlainText("Remember that my favorite color is purple.")
             window.send_message()
-        generation.assert_not_called()
-        labels = [label.text() for label in window.findChildren(QLabel)]
-        self.assertIn("✓ Remembered", labels)
+        memory_generation.assert_called_once()
+        self.assertEqual(memory_generation.call_args.args[0].status, SUCCESS)
+        self.assertEqual(memory_generation.call_args.args[0].confirmation, "✓ Remembered")
         self.assertEqual(window.memory_service.retrieve("favorite color", mark_accessed=False)[0].value, "purple")
         window.close()
 
     def test_contextual_memory_command_uses_previous_user_message_in_window(self) -> None:
         window, _temp_dir = self._window_with_temp_store()
+        window.preferences.memory_mode = "Explicit"
         with patch.object(window, "_start_generation"):
             window.input_box.setPlainText("I'm from Montreal.")
             window.send_message()
-        with patch.object(window, "_start_generation") as generation:
+        with patch.object(window, "_start_memory_response_generation") as memory_generation:
             window.input_box.setPlainText("Remember that.")
             window.send_message()
-        generation.assert_not_called()
+        memory_generation.assert_called_once()
+        self.assertEqual(memory_generation.call_args.args[0].status, SUCCESS)
         memory = window.memory_service.retrieve("where am I from", mark_accessed=False)[0]
         self.assertEqual(memory.value, "Montreal")
-        labels = [label.text() for label in window.findChildren(QLabel)]
-        self.assertIn("✓ Remembered", labels)
         window.close()
 
     def test_failed_memory_write_does_not_show_remembered_confirmation(self) -> None:
@@ -869,6 +971,15 @@ class ChatFoundationTests(unittest.TestCase):
         self.assertNotIn("✓ Remembered", labels)
         self.assertIn("disk is read-only", window.messages[-1]["content"])
         self.assertEqual(window.memory_store.list_memories(), [])
+        window.close()
+
+    def test_memory_success_confirmation_attaches_after_natural_response(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.pending_memory_confirmation = "Memory updated."
+        window._receive_response("That works.")
+        labels = [label.text() for label in window.findChildren(QLabel)]
+        self.assertIn("Memory updated.", labels)
+        self.assertEqual(window.messages[-1]["content"], "That works.")
         window.close()
 
     def test_settings_overlay_memory_manager_search_edit_delete(self) -> None:
