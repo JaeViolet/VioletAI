@@ -11,6 +11,8 @@ from pathlib import Path
 from time import perf_counter
 from unittest.mock import Mock, patch
 
+import requests
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
@@ -471,9 +473,10 @@ class ChatFoundationTests(unittest.TestCase):
                 window.current_diagnostics.record(user_message="Hello", action=NONE)
                 window._receive_error("Could not connect to Ollama.")
                 log_text = log_path.read_text(encoding="utf-8")
-            self.assertIn("Generate      FAILED", log_text)
+            self.assertIn("First Token   FAILED", log_text)
             self.assertIn("Error\n\"Could not connect to Ollama.\"", log_text)
-            self.assertIn("Assistant\n\"Could not connect to Ollama.\"", log_text)
+            self.assertIn("Assistant\n\"**Response failed**", log_text)
+            self.assertNotIn("Unable to respond", log_text)
         window.close()
 
     def test_post_memory_diagnostics_include_sanitized_request_events(self) -> None:
@@ -494,6 +497,7 @@ class ChatFoundationTests(unittest.TestCase):
                     "event": "request_start",
                     "message_count": 3,
                     "roles": ["system", "system", "user"],
+                    "message_lengths": [13, 20, 46],
                     "cancellation_requested": False,
                     "think": False,
                     "options": {"num_predict": 64},
@@ -505,20 +509,11 @@ class ChatFoundationTests(unittest.TestCase):
                 })
                 window._record_ollama_diagnostic_event({
                     "request_kind": "post_memory",
-                    "event": "ndjson_event",
-                    "event_type": "chunk",
-                    "done": False,
-                    "chunk_length": 5,
-                    "accumulated_content_length": 5,
-                    "cancellation_requested": False,
-                })
-                window._record_ollama_diagnostic_event({
-                    "request_kind": "post_memory",
-                    "event": "ndjson_event",
-                    "event_type": "done",
+                    "event": "stream_summary",
+                    "event_count": 2,
+                    "empty_event_count": 1,
+                    "visible_content_length": 5,
                     "done": True,
-                    "chunk_length": 0,
-                    "accumulated_content_length": 5,
                     "cancellation_requested": False,
                 })
                 window._finalize_diagnostics("Nice choice.")
@@ -528,7 +523,7 @@ class ChatFoundationTests(unittest.TestCase):
             self.assertIn('preview="[user message redacted]"', log_text)
             self.assertIn("Options       think=False options={'num_predict': 64}", log_text)
             self.assertIn("HTTP          200", log_text)
-            self.assertIn("Stream        events=2 content_length=5 done=True cancelled=False", log_text)
+            self.assertIn("Stream        events=2 empty=1 content_length=5 done=True cancelled=False", log_text)
             self.assertNotIn("NDJSON        chunk", log_text)
             self.assertNotIn("memory_id", log_text)
         window.close()
@@ -1278,7 +1273,42 @@ class ChatFoundationTests(unittest.TestCase):
         window._receive_error("Ollama returned an empty response.")
         labels = [label.text() for label in window.findChildren(QLabel)]
         self.assertIn("✓ Remembered", labels)
-        self.assertEqual(window.messages[-1]["content"], "I couldn't generate a follow-up.")
+        self.assertIn("The memory operation succeeded", window.messages[-1]["content"])
+        self.assertNotEqual(window.messages[-1]["content"], "Done.")
+        window.close()
+
+    def test_response_error_is_stage_specific_not_generic_unable_to_respond(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window._receive_error("Ollama completed the stream before sending visible assistant text.")
+        error_bubble = [bubble for bubble in window.findChildren(MessageBubble) if bubble.role == "error"][-1]
+        self.assertIn("**Response failed**", error_bubble.text())
+        self.assertIn("Stage: before first token", error_bubble.text())
+        self.assertNotIn("Unable to respond", error_bubble.text())
+        window.close()
+
+    def test_partial_response_is_preserved_when_stream_later_fails(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window._receive_chunk("Hello")
+        window._receive_error("network dropped")
+        self.assertIn("Hello", window.messages[-1]["content"])
+        self.assertIn("_Response stopped._", window.messages[-1]["content"])
+        error_bubble = [bubble for bubble in window.findChildren(MessageBubble) if bubble.role == "error"][-1]
+        self.assertIn("**Generation stopped**", error_bubble.text())
+        self.assertNotIn("Unable to respond", error_bubble.text())
+        window.close()
+
+    def test_successful_memory_write_is_not_rolled_back_when_followup_fails(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        with patch.object(window, "_start_memory_response_generation") as memory_generation:
+            window.input_box.setPlainText("Remember that my favorite color is purple.")
+            window.send_message()
+        result = memory_generation.call_args.args[0]
+        self.assertEqual(result.status, SUCCESS)
+        window.pending_memory_confirmation = result.confirmation
+        window._receive_error("Ollama completed the stream before sending visible assistant text.")
+        self.assertEqual(window.memory_service.retrieve("favorite color", mark_accessed=False)[0].value, "purple")
+        labels = [label.text() for label in window.findChildren(QLabel)]
+        self.assertIn(result.confirmation, labels)
         self.assertNotEqual(window.messages[-1]["content"], "Done.")
         window.close()
 
@@ -1531,6 +1561,80 @@ class ChatFoundationTests(unittest.TestCase):
         response.close.assert_called_once()
 
     @patch("ollama_client.requests.post")
+    def test_ollama_worker_many_empty_chunks_then_valid_content(self, post: Mock) -> None:
+        response = Mock()
+        response.status_code = 200
+        response.iter_lines.return_value = [
+            "",
+            '{"message":{"content":""},"done":false}',
+            '{"message":{"content":"Visible"},"done":true}',
+        ]
+        post.return_value = response
+        worker = OllamaWorker([{"role": "user", "content": "Hi"}], DEFAULT_MODEL_NAME)
+        answers: list[str] = []
+        worker.finished.connect(answers.append)
+        worker.run()
+        self.assertEqual(answers, ["Visible"])
+        response.close.assert_called_once()
+
+    @patch("ollama_client.requests.post")
+    def test_ollama_worker_http_200_empty_stream_reports_specific_failure(self, post: Mock) -> None:
+        response = Mock()
+        response.status_code = 200
+        response.iter_lines.return_value = []
+        post.return_value = response
+        worker = OllamaWorker([{"role": "user", "content": "Hi"}], DEFAULT_MODEL_NAME)
+        failures: list[str] = []
+        worker.failed.connect(failures.append)
+        worker.run()
+        self.assertEqual(failures, ["Ollama returned no stream events before the response ended."])
+        response.close.assert_called_once()
+
+    @patch("ollama_client.requests.post")
+    def test_ollama_worker_done_event_with_no_content_reports_empty_visible_text(self, post: Mock) -> None:
+        response = Mock()
+        response.status_code = 200
+        response.iter_lines.return_value = ['{"message":{"content":""},"done":true}']
+        post.return_value = response
+        worker = OllamaWorker([{"role": "user", "content": "Hi"}], DEFAULT_MODEL_NAME)
+        failures: list[str] = []
+        worker.failed.connect(failures.append)
+        worker.run()
+        self.assertEqual(
+            failures,
+            ["Ollama completed the stream before sending visible assistant text (events=1, empty_events=1, done=True)."],
+        )
+        response.close.assert_called_once()
+
+    @patch("ollama_client.requests.post")
+    def test_ollama_worker_partial_content_followed_by_error_preserves_chunk_signal(self, post: Mock) -> None:
+        response = Mock()
+        response.status_code = 200
+        response.iter_lines.return_value = [
+            '{"message":{"content":"Hello"},"done":false}',
+            '{"error":"stream broke"}',
+        ]
+        post.return_value = response
+        worker = OllamaWorker([{"role": "user", "content": "Hi"}], DEFAULT_MODEL_NAME)
+        chunks: list[str] = []
+        failures: list[str] = []
+        worker.chunk_received.connect(chunks.append)
+        worker.failed.connect(failures.append)
+        worker.run()
+        self.assertEqual(chunks, ["Hello"])
+        self.assertEqual(failures, ["stream broke"])
+        response.close.assert_called_once()
+
+    @patch("ollama_client.requests.post")
+    def test_ollama_worker_timeout_before_first_token_is_stage_specific(self, post: Mock) -> None:
+        post.side_effect = requests.Timeout()
+        worker = OllamaWorker([{"role": "user", "content": "Hi"}], DEFAULT_MODEL_NAME, read_timeout_seconds=1)
+        failures: list[str] = []
+        worker.failed.connect(failures.append)
+        worker.run()
+        self.assertEqual(failures, ["Ollama request timed out before first event after 1 seconds."])
+
+    @patch("ollama_client.requests.post")
     def test_ollama_worker_can_send_post_memory_options(self, post: Mock) -> None:
         response = Mock()
         response.status_code = 200
@@ -1553,6 +1657,25 @@ class ChatFoundationTests(unittest.TestCase):
         response.close.assert_called_once()
 
     @patch("ollama_client.requests.post")
+    def test_post_memory_followup_worker_returns_visible_content(self, post: Mock) -> None:
+        response = Mock()
+        response.status_code = 200
+        response.iter_lines.return_value = ['{"message":{"content":"Natural reply."},"done":true}']
+        post.return_value = response
+        worker = OllamaWorker(
+            [{"role": "system", "content": "summary"}, {"role": "user", "content": "Remember that."}],
+            DEFAULT_MODEL_NAME,
+            request_kind="post_memory",
+            options={"num_predict": 64},
+            think=False,
+        )
+        answers: list[str] = []
+        worker.finished.connect(answers.append)
+        worker.run()
+        self.assertEqual(answers, ["Natural reply."])
+        response.close.assert_called_once()
+
+    @patch("ollama_client.requests.post")
     def test_ollama_worker_cancellation_closes_response(self, post: Mock) -> None:
         response = Mock()
         response.status_code = 200
@@ -1568,6 +1691,29 @@ class ChatFoundationTests(unittest.TestCase):
         self.assertEqual(cancelled, [True])
         self.assertEqual(finished, [])
         response.close.assert_called_once()
+
+    @patch("ollama_client.requests.post")
+    def test_ollama_worker_cancellation_after_partial_output(self, post: Mock) -> None:
+        response = Mock()
+        response.status_code = 200
+        response.iter_lines.return_value = [
+            '{"message":{"content":"Hello"},"done":false}',
+            '{"message":{"content":" there"},"done":true}',
+        ]
+        post.return_value = response
+        worker = OllamaWorker([{"role": "user", "content": "Hi"}], DEFAULT_MODEL_NAME)
+        chunks: list[str] = []
+        cancelled: list[bool] = []
+        finished: list[str] = []
+        worker.chunk_received.connect(chunks.append)
+        worker.chunk_received.connect(lambda _chunk: worker.cancel())
+        worker.cancelled.connect(lambda: cancelled.append(True))
+        worker.finished.connect(finished.append)
+        worker.run()
+        self.assertEqual(chunks, ["Hello"])
+        self.assertEqual(cancelled, [True])
+        self.assertEqual(finished, [])
+        response.close.assert_called()
 
     @patch("ollama_client.requests.get")
     def test_model_discovery_reads_ollama_tags(self, get: Mock) -> None:

@@ -116,8 +116,11 @@ def _format_record(data: dict[str, Any]) -> str:
     if data.get("error"):
         lines.extend(["Error", _quote(data.get("error")), ""])
 
+    if data.get("ollama_events"):
+        lines.extend(["Ollama", *_ollama_debug_lines(data, "ollama_events"), ""])
+
     if data.get("post_memory_events"):
-        lines.extend(["Post-memory Ollama", *_post_memory_debug_lines(data), ""])
+        lines.extend(["Post-memory Ollama", *_ollama_debug_lines(data, "post_memory_events"), ""])
 
     lines.extend(["Assistant", _quote(data.get("assistant_response", "")), ""])
     lines.append(f"{'Total':<13} {_format_duration(data.get('total_execution_ms'))}")
@@ -271,63 +274,55 @@ def _format_duration(value: object) -> str:
     return f"{milliseconds:.1f} ms"
 
 
-def _post_memory_debug_lines(data: dict[str, Any]) -> list[str]:
+def _ollama_debug_lines(data: dict[str, Any], key_name: str) -> list[str]:
     lines: list[str] = []
-    count = data.get("post_memory_message_count")
-    roles = data.get("post_memory_roles")
-    if count is not None:
-        lines.append(f"Messages      {count} roles={roles}")
-    for index, message in enumerate(data.get("post_memory_messages") or [], start=1):
-        if not isinstance(message, dict):
-            continue
-        lines.append(
-            f"Prompt {index:<6} {message.get('role', '')} len={message.get('length', 0)} "
-            f"preview={_quote(message.get('preview', ''))}"
-        )
-    for event in data.get("post_memory_events") or []:
+    if key_name == "post_memory_events":
+        count = data.get("post_memory_message_count")
+        roles = data.get("post_memory_roles")
+        if count is not None:
+            lines.append(f"Messages      {count} roles={roles}")
+        for index, message in enumerate(data.get("post_memory_messages") or [], start=1):
+            if not isinstance(message, dict):
+                continue
+            lines.append(
+                f"Prompt {index:<6} {message.get('role', '')} len={message.get('length', 0)} "
+                f"preview={_quote(message.get('preview', ''))}"
+            )
+    for event in data.get(key_name) or []:
         if not isinstance(event, dict):
             continue
         kind = event.get("event")
         if kind == "request_start":
             lines.append(
                 f"Request       start messages={event.get('message_count')} "
-                f"roles={event.get('roles')} cancelled={event.get('cancellation_requested')}"
+                f"roles={event.get('roles')} lengths={event.get('message_lengths')} "
+                f"cancelled={event.get('cancellation_requested')}"
             )
             if "think" in event or "options" in event:
                 lines.append(f"Options       think={event.get('think')} options={event.get('options')}")
         elif kind == "http_status":
             lines.append(f"HTTP          {event.get('status_code')}")
-        elif kind == "ndjson_event":
-            continue
+        elif kind == "first_event":
+            lines.append(f"First Event   {_format_duration(event.get('elapsed_ms'))}")
+        elif kind == "first_visible_token":
+            lines.append(f"First Visible {_format_duration(event.get('elapsed_ms'))}")
+        elif kind == "stream_summary":
+            lines.append(_stream_summary_line(event))
         elif kind == "error":
-            lines.append(f"Error Source  {event.get('source')} {_quote(event.get('message', ''))}")
+            stage = event.get("stage")
+            lines.append(f"Error Source  {event.get('source')} stage={stage} {_quote(event.get('message', ''))}")
+        elif kind == "stream_error":
+            lines.append(f"Stream Error  {_quote(event.get('error', ''))}")
         elif kind == "cancel_requested":
             lines.append(f"Cancel        requested={event.get('cancellation_requested')}")
-    stream = _post_memory_stream_summary(data.get("post_memory_events") or [])
-    if stream:
-        lines.append(stream)
     return lines
 
 
-def _post_memory_stream_summary(events: object) -> str:
-    if not isinstance(events, list):
+def _stream_summary_line(event: dict[str, Any]) -> str:
+    if not event:
         return ""
-    saw_stream = False
-    done = False
-    content_length = 0
-    cancelled = False
-    event_count = 0
-    for event in events:
-        if not isinstance(event, dict) or event.get("event") != "ndjson_event":
-            continue
-        saw_stream = True
-        event_count += 1
-        done = bool(event.get("done"))
-        cancelled = bool(event.get("cancellation_requested"))
-        try:
-            content_length = max(content_length, int(event.get("accumulated_content_length") or 0))
-        except (TypeError, ValueError):
-            pass
-    if not saw_stream:
-        return ""
-    return f"Stream        events={event_count} content_length={content_length} done={done} cancelled={cancelled}"
+    return (
+        f"Stream        events={event.get('event_count')} empty={event.get('empty_event_count')} "
+        f"content_length={event.get('visible_content_length')} done={event.get('done')} "
+        f"cancelled={event.get('cancellation_requested')}"
+    )

@@ -858,7 +858,12 @@ class MainWindow(QMainWindow):
         ollama_messages = build_ollama_messages(self.messages, relevant_memories, SYSTEM_PROMPT)
         self._record_diagnostics_elapsed("prompt_ms", prompt_started)
         self._prompt_ready_at = perf_counter()
-        self.worker = OllamaWorker(ollama_messages, self.active_model)
+        self.worker = OllamaWorker(
+            ollama_messages,
+            self.active_model,
+            diagnostic_callback=self._record_ollama_diagnostic_event,
+            think=False,
+        )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.request_started.connect(self._diagnostics_ollama_started)
@@ -956,9 +961,11 @@ class MainWindow(QMainWindow):
         )
 
     def _record_ollama_diagnostic_event(self, event: dict[str, object]) -> None:
-        if self.current_diagnostics is None or event.get("request_kind") != "post_memory":
+        if self.current_diagnostics is None:
             return
-        existing = list(self.current_diagnostics.data.get("post_memory_events", []))
+        request_kind = str(event.get("request_kind") or "chat")
+        key_name = "post_memory_events" if request_kind == "post_memory" else "ollama_events"
+        existing = list(self.current_diagnostics.data.get(key_name, []))
         sanitized = {
             key: value
             for key, value in event.items()
@@ -966,22 +973,29 @@ class MainWindow(QMainWindow):
             in {
                 "event",
                 "request_kind",
+                "model",
                 "message_count",
                 "roles",
+                "message_lengths",
                 "status_code",
-                "event_type",
                 "done",
-                "chunk_length",
-                "accumulated_content_length",
+                "event_count",
+                "empty_event_count",
+                "visible_content_length",
+                "time_to_first_event_ms",
+                "time_to_first_visible_token_ms",
                 "cancellation_requested",
                 "source",
+                "stage",
                 "message",
                 "think",
                 "options",
+                "elapsed_ms",
+                "error",
             }
         }
         existing.append(sanitized)
-        self.current_diagnostics.record(post_memory_events=existing)
+        self.current_diagnostics.record(**{key_name: existing})
 
     def _sanitized_message_preview(self, message: dict[str, str]) -> str:
         text = message.get("content", "")
@@ -1076,11 +1090,12 @@ class MainWindow(QMainWindow):
         self._set_status("Stopped")
         self._finalize_partial_response(stopped=True)
         self._record_diagnostics_elapsed("render_ms", render_started)
-        self._finalize_diagnostics(self.streamed_answer.strip(), "Generation", "cancelled")
+        self._finalize_diagnostics(self.streamed_answer.strip(), self._response_failure_stage("cancelled"), "cancelled")
 
     def _receive_error(self, error: str) -> None:
         if self._generation_cancel_requested:
             return
+        failed_stage = self._response_failure_stage(error)
         generation_finished_at = perf_counter()
         if self._first_token_at is not None:
             self._record_diagnostics_value("generate_ms", (generation_finished_at - self._first_token_at) * 1000)
@@ -1088,24 +1103,37 @@ class MainWindow(QMainWindow):
         self._render_timer.stop()
         self._remove_thinking()
         if self.pending_memory_confirmation:
-            fallback = "I couldn't generate a follow-up."
-            bubble = self._append_assistant_direct(fallback)
-            self._add_memory_confirmation(bubble, self.pending_memory_confirmation)
+            confirmation = self.pending_memory_confirmation
+            if self.pending_bubble is not None and self.streamed_answer.strip():
+                assistant_text = f"{self.streamed_answer.strip()}\n\n_Response stopped._"
+                self.pending_bubble.set_text(assistant_text)
+                self._append_assistant_message(assistant_text)
+                bubble = self.pending_bubble
+            else:
+                fallback = self._memory_followup_failure_fallback(error, failed_stage)
+                bubble = self._append_assistant_direct(fallback)
+                assistant_text = fallback
+            self._add_memory_confirmation(bubble, confirmation)
             self.pending_memory_confirmation = ""
             self._set_status("Ready")
             self._scroll_to_bottom()
             self._record_diagnostics_elapsed("render_ms", render_started)
-            self._finalize_diagnostics(fallback, "Generation", error)
+            self._finalize_diagnostics(assistant_text, failed_stage, error)
             return
         if self.pending_bubble is not None and self.streamed_answer.strip():
             self.pending_bubble.set_text(self.streamed_answer)
-            self._finalize_partial_response()
-        self._add_message(f"**Unable to respond**\n\n{error}", "error")
+            self._finalize_partial_response(stopped=True)
+            error_message = self._format_generation_error(error, failed_stage, partial=True)
+            assistant_for_diagnostics = self.streamed_answer.strip()
+        else:
+            error_message = self._format_generation_error(error, failed_stage)
+            assistant_for_diagnostics = error_message
+        self._add_message(error_message, "error")
         self.store.save(self.conversation)
         self._set_status("Error")
         self._scroll_to_bottom()
         self._record_diagnostics_elapsed("render_ms", render_started)
-        self._finalize_diagnostics(error, "Generation", error)
+        self._finalize_diagnostics(assistant_for_diagnostics, failed_stage, error)
 
     def _append_assistant_message(self, answer: str) -> None:
         if self._finalized_current_response:
@@ -1142,12 +1170,45 @@ class MainWindow(QMainWindow):
                 self._add_memory_confirmation(self.pending_bubble, self.pending_memory_confirmation)
                 self.pending_memory_confirmation = ""
         elif self.pending_memory_confirmation:
-            bubble = self._append_assistant_direct("Done.")
+            bubble = self._append_assistant_direct("I couldn't generate a follow-up.")
             self._add_memory_confirmation(bubble, self.pending_memory_confirmation)
             self.pending_memory_confirmation = ""
         else:
             self._remove_thinking()
             self.store.save(self.conversation)
+
+    def _response_failure_stage(self, error: str) -> str:
+        lowered = error.casefold()
+        if "cancel" in lowered:
+            return "Generation"
+        if self._first_token_at is None:
+            return "First Token"
+        if self.streamed_answer.strip():
+            return "Generate"
+        return "Generate"
+
+    def _format_generation_error(self, error: str, failed_stage: str, partial: bool = False) -> str:
+        stage = self._stage_display_name(failed_stage)
+        if partial:
+            return f"**Generation stopped**\n\nStage: {stage}\n\nError: {error}"
+        return f"**Response failed**\n\nStage: {stage}\n\nError: {error}"
+
+    def _memory_followup_failure_fallback(self, error: str, failed_stage: str) -> str:
+        stage = self._stage_display_name(failed_stage).lower()
+        if "empty" in error.casefold():
+            if failed_stage == "First Token":
+                return "The memory operation succeeded, but the follow-up response came back empty before the first token arrived."
+            return f"The memory operation succeeded, but the follow-up response came back empty during {stage}."
+        if failed_stage == "First Token":
+            return "The memory operation succeeded, but I couldn't generate a follow-up before the first token arrived."
+        return f"The memory operation succeeded, but I couldn't generate a follow-up during {stage}."
+
+    def _stage_display_name(self, failed_stage: str) -> str:
+        return {
+            "First Token": "before first token",
+            "Generate": "during streaming",
+            "Generation": "generation",
+        }.get(failed_stage, failed_stage or "generation")
 
     def _cleanup_worker(self) -> None:
         if self.thread is not None:
