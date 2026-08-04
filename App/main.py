@@ -353,6 +353,7 @@ class MainWindow(QMainWindow):
         self.search_overlay.selected.connect(self._select_from_search)
         self.search_overlay.search_changed.connect(self._rebuild_search_results)
         self.settings_overlay = SettingsOverlay(self.memory_store, self.preferences, self.chat_panel)
+        
 
     def _configure_model_selector(self, selector: QComboBox) -> None:
         selector.setToolTip("Select local Ollama model")

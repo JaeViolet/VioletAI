@@ -142,6 +142,7 @@ class SettingsOverlay(QFrame):
         self.memory_mode.currentTextChanged.connect(self._save_memory_mode)
         self.diagnostics_enabled.toggled.connect(self._save_diagnostics_enabled)
         apply_interaction_cursors(self)
+        self.hide()
 
     def show_overlay(self) -> None:
         if self.parentWidget() is not None:
