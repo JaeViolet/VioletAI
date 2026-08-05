@@ -7,7 +7,6 @@ from datetime import datetime
 from PySide6.QtCore import QPropertyAnimation, QSize, Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QFrame,
     QGraphicsOpacityEffect,
@@ -26,9 +25,8 @@ from PySide6.QtWidgets import (
 )
 
 from design import Motion, icon
-from memory_models import CATEGORIES, MemoryRecord
-from memory_store import MemoryStore
-from preferences import MEMORY_MODES, Preferences
+from memory_v2.models import CATEGORIES, MemoryRecord
+from memory_v2.store import MemoryStore
 from themes import BUILTIN_THEMES, DEFAULT_ACCENT, DEFAULT_THEME_NAME, is_builtin
 from widgets import apply_interaction_cursors
 
@@ -277,26 +275,11 @@ class SettingsOverlay(QFrame):
         self.category_filter = self._make_combo(["All", *CATEGORIES], 7)
         self.include_archived = self._make_combo(["Enabled", "Disabled", "All"], 8)
         self.sort_order = self._make_combo(["Created", "Updated", "Category", "Accessed"], 7)
-        self.memory_mode = self._make_combo(MEMORY_MODES, 7)
-        if self.preferences is not None:
-            self.memory_mode.setCurrentText(self.preferences.memory_mode)
         filters.addWidget(self.category_filter)
         filters.addWidget(self.include_archived)
         filters.addWidget(self.sort_order)
-        filters.addWidget(self.memory_mode)
         filters.addStretch()
         layout.addLayout(filters)
-
-        options = QHBoxLayout()
-        options.setSpacing(8)
-        self.diagnostics_enabled = QCheckBox("Diagnostics")
-        self.diagnostics_enabled.setObjectName("welcomeSubtitle")
-        self.diagnostics_enabled.setToolTip("Enable memory diagnostics")
-        if self.preferences is not None:
-            self.diagnostics_enabled.setChecked(self.preferences.memory_diagnostics)
-        options.addWidget(self.diagnostics_enabled)
-        options.addStretch()
-        layout.addLayout(options)
 
         self.rows = QWidget()
         self.rows_layout = QVBoxLayout(self.rows)
@@ -309,8 +292,6 @@ class SettingsOverlay(QFrame):
         self.category_filter.currentTextChanged.connect(self.refresh)
         self.include_archived.currentTextChanged.connect(self.refresh)
         self.sort_order.currentTextChanged.connect(self.refresh)
-        self.memory_mode.currentTextChanged.connect(self._save_memory_mode)
-        self.diagnostics_enabled.toggled.connect(self._save_diagnostics_enabled)
 
     def _make_combo(self, items: list[str], min_chars: int) -> QComboBox:
         combo = QComboBox(objectName="modelSelector")
@@ -581,7 +562,7 @@ class SettingsOverlay(QFrame):
         self.confirm_panel.hide()
         self.edit_panel.hide()
         self.delete_panel.hide()
-        records = self.store.search(
+        records = self.store.search_memories(
             self.search_input.text().strip(),
             self.category_filter.currentText(),
             include_archived=status != "Enabled",
@@ -609,18 +590,6 @@ class SettingsOverlay(QFrame):
             return sorted(records, key=lambda record: (record.last_accessed_at or "", record.access_count), reverse=True)
         return sorted(records, key=lambda record: record.updated_at, reverse=True)
 
-    def _save_memory_mode(self, mode: str) -> None:
-        if self.preferences is None or mode not in MEMORY_MODES:
-            return
-        self.preferences.memory_mode = mode
-        self.preferences.save()
-
-    def _save_diagnostics_enabled(self, enabled: bool) -> None:
-        if self.preferences is None:
-            return
-        self.preferences.memory_diagnostics = enabled
-        self.preferences.save()
-
     def clear_all(self) -> None:
         self.edit_panel.hide()
         self.delete_panel.hide()
@@ -631,7 +600,7 @@ class SettingsOverlay(QFrame):
 
     def _confirmed_clear_all(self) -> None:
         self.confirm_panel.hide()
-        self.store.clear_all()
+        self.store.clear_durable()
         self.refresh()
 
     def _open_edit_panel(self, record: MemoryRecord) -> None:
@@ -655,13 +624,14 @@ class SettingsOverlay(QFrame):
             self.edit_error.show()
             return
         self.edit_panel.hide()
-        self.store.edit(
+        self.store.update_memory(
             record.id,
-            record.category,
-            record.subject,
-            record.key,
-            value,
-            f"{record.key}: {value}",
+            category=record.category,
+            subject=record.subject,
+            key=record.key,
+            value=value,
+            content=f"{record.key}: {value}",
+            manual=True,
         )
         self.refresh()
 
@@ -681,7 +651,7 @@ class SettingsOverlay(QFrame):
         self.delete_panel.hide()
         if record is None:
             return
-        self.store.delete(record.id)
+        self.store.delete_memory(record.id)
         self.refresh()
 
     def _cancel_delete(self) -> None:
@@ -730,9 +700,9 @@ class MemoryRow(QFrame):
 
     def toggle_archive(self) -> None:
         if self.record.active:
-            self.store.archive(self.record.id)
+            self.store.archive_memory(self.record.id)
         else:
-            self.store.restore(self.record.id)
+            self.store.restore_memory(self.record.id)
         self.refresh_callback()
 
 

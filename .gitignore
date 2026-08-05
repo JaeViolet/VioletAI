@@ -15,9 +15,9 @@ logs/
 # Local app data
 memory/conversations/
 memory/preferences.json
-memory/memory.db
-memory/memory.db-shm
-memory/memory.db-wal
+memory/*.db
+memory/*.db-shm
+memory/*.db-wal
 
 # Ollama models
 ollama/models/

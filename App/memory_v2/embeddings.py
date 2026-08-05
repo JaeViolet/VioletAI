@@ -1,8 +1,10 @@
-"""Local semantic helpers for VioletAI memory retrieval.
+"""Local deterministic embeddings for VioletAI Memory V2 retrieval.
 
 The embedder is intentionally lightweight and local-only. It uses normalized
 character n-gram hashing so semantic-ish variants such as "fav colour" and
 "favorite color" share useful signals without requiring an external service.
+The exact same vector is produced for the same input, which keeps retrieval
+deterministic and testable.
 """
 
 from __future__ import annotations
@@ -11,33 +13,11 @@ import math
 import re
 from collections import Counter
 
-EMBEDDING_MODEL_NAME = "local-hash-ngram-v1"
+from memory_v2.normalize import canonical_text
 
-SYNONYMS = {
-    "fav": "favorite",
-    "fave": "favorite",
-    "preferred": "favorite",
-    "preference": "favorite",
-    "colour": "color",
-    "colours": "colors",
-    "movie": "film",
-    "job": "occupation",
-    "work": "occupation",
-    "city": "location",
-    "from": "location",
-}
+EMBEDDING_MODEL_NAME = "local-hash-ngram-v2"
 
-
-def canonical_text(text: str) -> str:
-    words = re.findall(r"[\w']+", text.casefold())
-    normalized = [SYNONYMS.get(word, word) for word in words]
-    return " ".join(normalized)
-
-
-def canonical_key(key: str) -> str:
-    text = canonical_text(key)
-    text = re.sub(r"\bfavorite\s+favorite\b", "favorite", text)
-    return " ".join(text.split())
+_TOKEN_RE = re.compile(r"[\w']+")
 
 
 def embed_text(text: str) -> dict[str, float]:
@@ -63,3 +43,7 @@ def cosine_similarity(left: dict[str, float], right: dict[str, float]) -> float:
     if len(left) > len(right):
         left, right = right, left
     return sum(value * right.get(key, 0.0) for key, value in left.items())
+
+
+def embed_key_value(key: str, value: str, subject: str = "", category: str = "") -> dict[str, float]:
+    return embed_text(f"{category} {subject} {key} {value}")

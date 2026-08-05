@@ -8,8 +8,6 @@ import re
 from config import DEFAULT_MODEL_NAME, PREFERENCES_PATH
 from themes import DEFAULT_ACCENT, DEFAULT_THEME_NAME
 
-MEMORY_MODES = ("Off", "Explicit", "Suggest", "Automatic")
-
 _HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
@@ -22,8 +20,6 @@ class Preferences:
         self.path = PREFERENCES_PATH
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.selected_model = DEFAULT_MODEL_NAME
-        self.memory_mode = "Explicit"
-        self.memory_diagnostics = False
         self.theme_name = DEFAULT_THEME_NAME
         self.theme_accent = DEFAULT_ACCENT
         self.custom_themes: list[dict] = []
@@ -36,10 +32,6 @@ class Preferences:
             return
         if isinstance(data, dict) and isinstance(data.get("selected_model"), str):
             self.selected_model = data["selected_model"]
-        if isinstance(data, dict) and data.get("memory_mode") in MEMORY_MODES:
-            self.memory_mode = data["memory_mode"]
-        if isinstance(data, dict) and isinstance(data.get("memory_diagnostics"), bool):
-            self.memory_diagnostics = data["memory_diagnostics"]
         if isinstance(data, dict) and isinstance(data.get("theme_name"), str):
             self.theme_name = data["theme_name"]
         if isinstance(data, dict) and _is_hex(data.get("theme_accent")):
@@ -62,8 +54,6 @@ class Preferences:
             json.dumps(
                 {
                     "selected_model": self.selected_model,
-                    "memory_mode": self.memory_mode,
-                    "memory_diagnostics": self.memory_diagnostics,
                     "theme_name": self.theme_name,
                     "theme_accent": self.theme_accent,
                     "custom_themes": self.custom_themes,
@@ -73,4 +63,3 @@ class Preferences:
             ),
             encoding="utf-8",
         )
-

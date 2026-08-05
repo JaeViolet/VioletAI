@@ -38,16 +38,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from config import APP_FOOTER_TEXT, APP_NAME, DEFAULT_MODEL_NAME, POST_MEMORY_READ_TIMEOUT_SECONDS, SYSTEM_PROMPT
+from config import APP_FOOTER_TEXT, APP_NAME, DEFAULT_MODEL_NAME, MEMORY_DB_PATH, SYSTEM_PROMPT
 from conversation_store import Conversation, ConversationStore
 from design import Motion, PNG_CONTROL_ICON_SIZE, app_stylesheet, icon
 from memory_manager import SettingsOverlay
-from memory_diagnostics import MemoryDiagnostics
-from memory_service import SUCCESS, MemoryActionResult, MemoryService
-from memory_store import MemoryStore
+from memory_v2.pipeline import MemorySystem
+from memory_v2.store import MemoryStore
 from ollama_client import ModelDiscoveryWorker, OllamaWorker
 from preferences import Preferences
-from prompts import build_memory_result_response_messages, build_ollama_messages
+from prompts import build_ollama_messages
 from sidebar import ChatSidebar, SearchOverlay
 from widgets import (
     AutoGrowingInput,
@@ -61,9 +60,8 @@ from widgets import (
 
 @dataclass
 class PreparedRequest:
-    memory_result: MemoryActionResult
+    outcome: object
     ollama_messages: list[dict[str, str]]
-    post_memory: bool = False
 
 
 class RequestPreparationWorker(QObject):
@@ -73,63 +71,37 @@ class RequestPreparationWorker(QObject):
 
     def __init__(
         self,
-        memory_service: MemoryService,
+        memory_system: MemorySystem,
         messages: list[dict[str, str]],
         message: str,
         conversation_id: str,
         source_message_id: str,
         previous_user_text: str | None,
-        memory_mode: str,
-        diagnostics_enabled: bool,
-        diagnostics: MemoryDiagnostics,
         system_prompt: str,
     ) -> None:
         super().__init__()
-        self._memory_service = memory_service
+        self._memory_system = memory_system
         self._messages = messages
         self._message = message
         self._conversation_id = conversation_id
         self._source_message_id = source_message_id
         self._previous_user_text = previous_user_text
-        self._memory_mode = memory_mode
-        self._diagnostics_enabled = diagnostics_enabled
-        self._diagnostics = diagnostics
         self._system_prompt = system_prompt
 
     @Slot()
     def run(self) -> None:
         try:
-            memory_result = self._memory_service.process_user_message(
+            outcome = self._memory_system.handle_user_message(
                 self._message,
-                self._conversation_id,
-                self._source_message_id,
-                self._previous_user_text,
-                self._memory_mode,
-                self._diagnostics_enabled,
-                self._diagnostics,
+                conversation_id=self._conversation_id,
+                message_id=self._source_message_id,
+                previous_user_text=self._previous_user_text,
             )
-            if memory_result.handled:
-                ollama_messages: list[dict[str, str]] = []
-                if memory_result.status == SUCCESS:
-                    prompt_started = perf_counter()
-                    ollama_messages = build_memory_result_response_messages(
-                        self._messages,
-                        memory_result,
-                        self._system_prompt,
-                    )
-                    self._diagnostics.record_elapsed("prompt_ms", prompt_started)
-                self.finished.emit(PreparedRequest(memory_result, ollama_messages, post_memory=True))
-                return
-
-            relevant_memories = []
-            if self._memory_mode != "Off":
-                retrieve_started = perf_counter()
-                relevant_memories = self._memory_service.retrieve(self._message)
-                self._diagnostics.record_elapsed("retrieve_ms", retrieve_started)
-            prompt_started = perf_counter()
+            relevant_memories = (
+                [item.record for item in outcome.retrieval.selected] if outcome.retrieval is not None else []
+            )
             ollama_messages = build_ollama_messages(self._messages, relevant_memories, self._system_prompt)
-            self._diagnostics.record_elapsed("prompt_ms", prompt_started)
-            self.finished.emit(PreparedRequest(memory_result, ollama_messages, post_memory=False))
+            self.finished.emit(PreparedRequest(outcome, ollama_messages))
         except Exception as error:
             self.failed.emit(str(error))
         finally:
@@ -206,8 +178,8 @@ class MainWindow(QMainWindow):
         self.active_model = self.preferences.selected_model or DEFAULT_MODEL_NAME
         self.available_models: list[str] = []
         self.store = ConversationStore()
-        self.memory_store = MemoryStore()
-        self.memory_service = MemoryService(self.memory_store)
+        self.memory_store = MemoryStore(MEMORY_DB_PATH)
+        self.memory_service = MemorySystem(self.memory_store)
         self.conversation = self._load_or_create_conversation()
         self.messages = self.conversation.messages
 
@@ -222,11 +194,7 @@ class MainWindow(QMainWindow):
         self.pending_column: QWidget | None = None
         self.thinking_row: QWidget | None = None
         self.streamed_answer = ""
-        self.pending_memory_confirmation = ""
-        self.pending_memory_topic = ""
-        self.pending_memory_value = ""
-        self._post_memory_generation_active = False
-        self.current_diagnostics: MemoryDiagnostics | None = None
+        self.current_diagnostics: object | None = None
         self._ollama_request_started_at: float | None = None
         self._first_token_at: float | None = None
         self._prompt_ready_at: float | None = None
@@ -1039,11 +1007,6 @@ class MainWindow(QMainWindow):
         message = self.input_box.toPlainText().strip()
         if not message or self.thread is not None or self.prep_thread is not None:
             return
-        self.current_diagnostics = MemoryDiagnostics(
-            self.preferences.memory_diagnostics,
-            auto_emit=False,
-        )
-        self.current_diagnostics.record(user_message=message)
         previous_user_text = next(
             (item.get("content", "") for item in reversed(self.messages) if item.get("role") == "user"),
             None,
@@ -1066,10 +1029,6 @@ class MainWindow(QMainWindow):
         previous_user_text: str | None,
     ) -> None:
         self.streamed_answer = ""
-        self.pending_memory_confirmation = ""
-        self.pending_memory_topic = ""
-        self.pending_memory_value = ""
-        self._post_memory_generation_active = False
         self.pending_bubble = None
         self.pending_row = None
         self.pending_column = None
@@ -1091,9 +1050,6 @@ class MainWindow(QMainWindow):
             self.conversation.id,
             source_message_id,
             previous_user_text,
-            self.preferences.memory_mode,
-            self.preferences.memory_diagnostics,
-            self.current_diagnostics,
             SYSTEM_PROMPT,
         )
         self.prep_worker.moveToThread(self.prep_thread)
@@ -1106,28 +1062,6 @@ class MainWindow(QMainWindow):
         self.prep_thread.start()
 
     def _receive_prepared_request(self, prepared: PreparedRequest) -> None:
-        memory_result = prepared.memory_result
-        if memory_result.handled:
-            if memory_result.status == SUCCESS:
-                self._start_memory_response_generation(
-                    memory_result,
-                    prepared.ollama_messages,
-                    prompt_already_recorded=True,
-                    show_thinking=False,
-                )
-                self._refresh_settings_if_visible()
-                return
-            render_started = perf_counter()
-            self._remove_thinking()
-            self._append_assistant_direct(memory_result.response)
-            self._record_diagnostics_elapsed("render_ms", render_started)
-            failed_stage = None if memory_result.status == SUCCESS else "Memory Pipeline"
-            self._finalize_diagnostics(memory_result.response, failed_stage, memory_result.failure_reason)
-            self._refresh_settings_if_visible()
-            self._scroll_to_bottom()
-            self._set_controls_preparing(False)
-            self._set_status("Ready" if memory_result.status == SUCCESS else "Error")
-            return
         self._start_generation(prepared.ollama_messages, prompt_already_recorded=True, show_thinking=False)
 
     def _request_preparation_failed(self, error: str) -> None:
@@ -1159,15 +1093,6 @@ class MainWindow(QMainWindow):
         self._rebuild_sidebar()
         return bubble
 
-    def _add_memory_confirmation(self, bubble: MessageBubble, text: str) -> None:
-        column = bubble.parentWidget()
-        if not isinstance(column, QWidget) or column.layout() is None:
-            return
-        label = QLabel(text)
-        label.setObjectName("copiedLabel")
-        column.layout().addWidget(label)
-        self._finalize_message_geometry()
-
     def regenerate_response(self, message_index: int) -> None:
         if self.thread is not None or self.prep_thread is not None:
             return
@@ -1187,10 +1112,6 @@ class MainWindow(QMainWindow):
         show_thinking: bool = True,
     ) -> None:
         self.streamed_answer = ""
-        self.pending_memory_confirmation = ""
-        self.pending_memory_topic = ""
-        self.pending_memory_value = ""
-        self._post_memory_generation_active = False
         self.pending_bubble = None
         self.pending_row = None
         self._ollama_request_started_at = None
@@ -1210,11 +1131,8 @@ class MainWindow(QMainWindow):
                 (message.get("content", "") for message in reversed(self.messages) if message.get("role") == "user"),
                 "",
             )
-            relevant_memories = (
-                []
-                if self.preferences.memory_mode == "Off"
-                else self._retrieve_memories_for_prompt(last_user_message)
-            )
+            retrieval = self.memory_service.retrieve(last_user_message)
+            relevant_memories = [item.record for item in retrieval.selected]
             prompt_started = perf_counter()
             ollama_messages = build_ollama_messages(self.messages, relevant_memories, SYSTEM_PROMPT)
             if not prompt_already_recorded:
@@ -1224,68 +1142,6 @@ class MainWindow(QMainWindow):
             ollama_messages,
             self.active_model,
             diagnostic_callback=self._record_ollama_diagnostic_event,
-            think=False,
-        )
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.request_started.connect(self._diagnostics_ollama_started)
-        self.worker.connected.connect(lambda: self._set_status("Thinking"))
-        self.worker.chunk_received.connect(self._receive_chunk)
-        self.worker.finished.connect(self._receive_response)
-        self.worker.cancelled.connect(self._receive_cancelled)
-        self.worker.failed.connect(self._receive_error)
-        self.worker.stopped.connect(self.worker.deleteLater)
-        self.worker.stopped.connect(self.thread.quit)
-        self.thread.finished.connect(self._cleanup_worker)
-        self.thread.start()
-
-    def _retrieve_memories_for_prompt(self, message: str) -> list[object]:
-        retrieve_started = perf_counter()
-        memories = self.memory_service.retrieve(message)
-        self._record_diagnostics_elapsed("retrieve_ms", retrieve_started)
-        return memories
-
-    def _start_memory_response_generation(
-        self,
-        memory_result: MemoryActionResult,
-        ollama_messages: list[dict[str, str]] | None = None,
-        prompt_already_recorded: bool = False,
-        show_thinking: bool = True,
-    ) -> None:
-        self.streamed_answer = ""
-        self.pending_memory_confirmation = memory_result.confirmation
-        self.pending_memory_topic = memory_result.canonical_key.replace("_", " ").strip()
-        self.pending_memory_value = memory_result.new_value.strip()
-        self._post_memory_generation_active = True
-        self.pending_bubble = None
-        self.pending_row = None
-        self.pending_column = None
-        self._ollama_request_started_at = None
-        self._first_token_at = None
-        self._prompt_ready_at = None
-        self._finalized_current_response = False
-        self._generation_cancel_requested = False
-        self._auto_scroll_enabled = True
-        if show_thinking:
-            self._show_thinking()
-        self._set_controls_generating(True)
-        self._set_status("Connecting")
-
-        self.thread = QThread(self)
-        if ollama_messages is None:
-            prompt_started = perf_counter()
-            ollama_messages = build_memory_result_response_messages(self.messages, memory_result, SYSTEM_PROMPT)
-            if not prompt_already_recorded:
-                self._record_diagnostics_elapsed("prompt_ms", prompt_started)
-        self._record_post_memory_prompt_shape(ollama_messages)
-        self._prompt_ready_at = perf_counter()
-        self.worker = OllamaWorker(
-            ollama_messages,
-            self.active_model,
-            read_timeout_seconds=POST_MEMORY_READ_TIMEOUT_SECONDS,
-            request_kind="post_memory",
-            diagnostic_callback=self._record_ollama_diagnostic_event,
-            options={"num_predict": 64, "temperature": 0.5},
             think=False,
         )
         self.worker.moveToThread(self.thread)
@@ -1314,22 +1170,6 @@ class MainWindow(QMainWindow):
     def _record_diagnostics_value(self, key: str, milliseconds: float) -> None:
         if self.current_diagnostics is not None:
             self.current_diagnostics.record(**{key: round(milliseconds, 3)})
-
-    def _record_post_memory_prompt_shape(self, messages: list[dict[str, str]]) -> None:
-        if self.current_diagnostics is None:
-            return
-        self.current_diagnostics.record(
-            post_memory_message_count=len(messages),
-            post_memory_roles=[message.get("role", "") for message in messages],
-            post_memory_messages=[
-                {
-                    "role": message.get("role", ""),
-                    "length": len(message.get("content", "")),
-                    "preview": self._sanitized_message_preview(message),
-                }
-                for message in messages
-            ],
-        )
 
     def _record_ollama_diagnostic_event(self, event: dict[str, object]) -> None:
         if self.current_diagnostics is None:
@@ -1367,20 +1207,6 @@ class MainWindow(QMainWindow):
         }
         existing.append(sanitized)
         self.current_diagnostics.record(**{key_name: existing})
-
-    def _sanitized_message_preview(self, message: dict[str, str]) -> str:
-        text = message.get("content", "")
-        if message.get("role") == "user":
-            return "[user message redacted]"
-        if "[Memory operation summary]" in text:
-            return "[memory operation summary]"
-        return self._redacted_preview(text)
-
-    def _redacted_preview(self, text: str) -> str:
-        normalized = " ".join(text.split())
-        if len(normalized) <= 90:
-            return normalized
-        return f"{normalized[:87]}..."
 
     def _finalize_diagnostics(
         self,
@@ -1429,7 +1255,6 @@ class MainWindow(QMainWindow):
     def _receive_response(self, answer: str) -> None:
         if self._generation_cancel_requested:
             return
-        answer = self._safe_post_memory_answer(answer)
         generation_finished_at = perf_counter()
         if self._first_token_at is not None:
             self._record_diagnostics_value("generate_ms", (generation_finished_at - self._first_token_at) * 1000)
@@ -1444,9 +1269,6 @@ class MainWindow(QMainWindow):
             self.pending_bubble.set_text(answer)
         self._finalize_message_geometry()
         self._append_assistant_message(answer)
-        if self.pending_memory_confirmation and self.pending_bubble is not None:
-            self._add_memory_confirmation(self.pending_bubble, self.pending_memory_confirmation)
-            self.pending_memory_confirmation = ""
         if self._auto_scroll_enabled:
             self._scroll_to_bottom(smooth=True)
         self._set_status("Ready")
@@ -1473,24 +1295,6 @@ class MainWindow(QMainWindow):
         render_started = perf_counter()
         self._render_timer.stop()
         self._remove_thinking()
-        if self.pending_memory_confirmation:
-            confirmation = self.pending_memory_confirmation
-            if self.pending_bubble is not None and self.streamed_answer.strip():
-                assistant_text = f"{self.streamed_answer.strip()}\n\n_Response stopped._"
-                self.pending_bubble.set_text(assistant_text)
-                self._append_assistant_message(assistant_text)
-                bubble = self.pending_bubble
-            else:
-                fallback = self._memory_followup_failure_fallback(error, failed_stage)
-                bubble = self._append_assistant_direct(fallback)
-                assistant_text = fallback
-            self._add_memory_confirmation(bubble, confirmation)
-            self.pending_memory_confirmation = ""
-            self._set_status("Ready")
-            self._scroll_to_bottom()
-            self._record_diagnostics_elapsed("render_ms", render_started)
-            self._finalize_diagnostics(assistant_text, failed_stage, error)
-            return
         if self.pending_bubble is not None and self.streamed_answer.strip():
             self.pending_bubble.set_text(self.streamed_answer)
             self._finalize_partial_response(stopped=True)
@@ -1537,13 +1341,6 @@ class MainWindow(QMainWindow):
                 self.pending_bubble.set_text(answer)
         if answer:
             self._append_assistant_message(answer)
-            if self.pending_memory_confirmation and self.pending_bubble is not None:
-                self._add_memory_confirmation(self.pending_bubble, self.pending_memory_confirmation)
-                self.pending_memory_confirmation = ""
-        elif self.pending_memory_confirmation:
-            bubble = self._append_assistant_direct("I couldn't generate a follow-up.")
-            self._add_memory_confirmation(bubble, self.pending_memory_confirmation)
-            self.pending_memory_confirmation = ""
         else:
             self._remove_thinking()
             self.store.save(self.conversation)
@@ -1564,16 +1361,6 @@ class MainWindow(QMainWindow):
             return f"**Generation stopped**\n\nStage: {stage}\n\nError: {error}"
         return f"**Response failed**\n\nStage: {stage}\n\nError: {error}"
 
-    def _memory_followup_failure_fallback(self, error: str, failed_stage: str) -> str:
-        stage = self._stage_display_name(failed_stage).lower()
-        if "empty" in error.casefold():
-            if failed_stage == "First Token":
-                return "The memory operation succeeded, but the follow-up response came back empty before the first token arrived."
-            return f"The memory operation succeeded, but the follow-up response came back empty during {stage}."
-        if failed_stage == "First Token":
-            return "The memory operation succeeded, but I couldn't generate a follow-up before the first token arrived."
-        return f"The memory operation succeeded, but I couldn't generate a follow-up during {stage}."
-
     def _stage_display_name(self, failed_stage: str) -> str:
         return {
             "First Token": "before first token",
@@ -1589,42 +1376,10 @@ class MainWindow(QMainWindow):
         self.pending_bubble = None
         self.pending_row = None
         self.pending_column = None
-        self.pending_memory_confirmation = ""
-        self.pending_memory_topic = ""
-        self.pending_memory_value = ""
-        self._post_memory_generation_active = False
         self._set_controls_generating(False)
         if self.footer_status.text() in {"Connecting...", "Thinking...", "Generating..."}:
             self._set_status("Ready")
         self.input_box.setFocus()
-
-    def _safe_post_memory_answer(self, answer: str) -> str:
-        if not self._post_memory_generation_active:
-            return answer
-        lowered = answer.casefold()
-        forbidden = (
-            "remember",
-            "saved",
-            "save",
-            "memory",
-            "noted",
-            "note that",
-            "keep in mind",
-            "stored",
-            "updated",
-            "i'll keep",
-            "i have",
-            "i've",
-        )
-        if not any(term in lowered for term in forbidden):
-            return answer
-        value = self.pending_memory_value.strip()
-        topic = self.pending_memory_topic.strip()
-        if value:
-            return f"{value.capitalize()} is a solid pick."
-        if topic:
-            return f"{topic.capitalize()} is a solid pick."
-        return "That sounds good."
 
     def _set_controls_generating(self, generating: bool) -> None:
         self.send_button.setEnabled(not generating)

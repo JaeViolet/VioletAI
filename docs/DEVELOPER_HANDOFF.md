@@ -62,13 +62,17 @@ Every architectural decision should support one or more of these goals.
   - [App/conversation_store.py](#appconversation_storepy)
   - [App/design.py](#appdesignpy)
   - [App/main.py](#appmainpy)
-  - [App/memory_diagnostics.py](#appmemory_diagnosticspy)
-  - [App/memory_embeddings.py](#appmemory_embeddingspy)
-  - [App/memory_intent.py](#appmemory_intentpy)
   - [App/memory_manager.py](#appmemory_managerpy)
-  - [App/memory_models.py](#appmemory_modelspy)
-  - [App/memory_service.py](#appmemory_servicepy)
-  - [App/memory_store.py](#appmemory_storepy)
+  - [App/memory_v2/models.py](#appmemory_v2modelspy)
+  - [App/memory_v2/normalize.py](#appmemory_v2normalizepy)
+  - [App/memory_v2/embeddings.py](#appmemory_v2embeddingspy)
+  - [App/memory_v2/store.py](#appmemory_v2storepy)
+  - [App/memory_v2/extract.py](#appmemory_v2extractpy)
+  - [App/memory_v2/operations.py](#appmemory_v2operationspy)
+  - [App/memory_v2/retrieval.py](#appmemory_v2retrievalpy)
+  - [App/memory_v2/temporary.py](#appmemory_v2temporarypy)
+  - [App/memory_v2/consolidation.py](#appmemory_v2consolidationpy)
+  - [App/memory_v2/pipeline.py](#appmemory_v2pipelinepy)
   - [App/ollama_client.py](#appollama_clientpy)
   - [App/preferences.py](#apppreferencespy)
   - [App/prompts.py](#apppromptspy)
@@ -95,10 +99,13 @@ flowchart TD
     UI --> SaveUser["Render + save user message"]
     SaveUser --> PrepThread["RequestPreparationWorker on QThread"]
 
-    PrepThread --> MemoryService["MemoryService"]
-    MemoryService --> Intent["MemoryIntentClassifier"]
-    MemoryService --> Store["MemoryStore SQLite"]
-    MemoryService --> Retrieval["Hybrid memory retrieval"]
+    PrepThread --> MemorySystem["MemorySystem (memory_v2.pipeline)"]
+    MemorySystem --> Extractor["Extractor"]
+    MemorySystem --> Operations["Operations"]
+    MemorySystem --> Store["MemoryStore SQLite"]
+    MemorySystem --> Retriever["Hybrid retrieval"]
+    MemorySystem --> Temporary["TemporaryMemory lifecycle"]
+    MemorySystem --> Consolidator["Consolidator"]
 
     PrepThread --> Prompt["Prompt assembly"]
     Prompt --> OllamaThread["OllamaWorker on QThread"]
@@ -110,14 +117,13 @@ flowchart TD
 
     UI --> Render["Incremental assistant rendering"]
     Render --> Persist["ConversationStore JSON"]
-    Render --> Diagnostics["MemoryDiagnostics log/console"]
 ```
 
 Application startup:
 
 - Entry point is `main()` in [App/main.py](../App/main.py).
 - It creates a `QApplication`, applies dark styling, builds `MainWindow`, then starts the Qt event loop.
-- `MainWindow.__init__()` loads preferences, selected model, conversation store, memory store/service, creates a new conversation, builds the interface, refreshes model list in the background, rebuilds the sidebar/messages, and focuses the composer.
+- `MainWindow.__init__()` loads preferences, selected model, conversation store, memory store + `MemorySystem`, creates a new conversation, builds the interface, refreshes model list in the background, rebuilds the sidebar/messages, and focuses the composer.
 - Current code intentionally opens to a new chat at startup, not Settings and not the latest conversation.
 
 Major subsystems:
@@ -127,8 +133,7 @@ Major subsystems:
 - Prompt construction: [App/prompts.py](../App/prompts.py)
 - Conversations: [App/conversation_store.py](../App/conversation_store.py)
 - Preferences: [App/preferences.py](../App/preferences.py)
-- Long-term memory: [App/memory_service.py](../App/memory_service.py), [App/memory_store.py](../App/memory_store.py), [App/memory_intent.py](../App/memory_intent.py), [App/memory_models.py](../App/memory_models.py), [App/memory_embeddings.py](../App/memory_embeddings.py)
-- Diagnostics: [App/memory_diagnostics.py](../App/memory_diagnostics.py)
+- Long-term memory: [App/memory_v2/pipeline.py](../App/memory_v2/pipeline.py), [App/memory_v2/store.py](../App/memory_v2/store.py), [App/memory_v2/extract.py](../App/memory_v2/extract.py), [App/memory_v2/operations.py](../App/memory_v2/operations.py), [App/memory_v2/retrieval.py](../App/memory_v2/retrieval.py), [App/memory_v2/temporary.py](../App/memory_v2/temporary.py), [App/memory_v2/consolidation.py](../App/memory_v2/consolidation.py), [App/memory_v2/models.py](../App/memory_v2/models.py)
 
 Threading model:
 
@@ -143,15 +148,8 @@ Persistence:
 
 - Conversations are JSON files under `memory/conversations/`, managed by `ConversationStore`.
 - Empty conversations are not saved.
-- Long-term memories are SQLite records in `memory/memory.db`, managed only through `MemoryStore` and `MemoryService`.
+- Long-term memories are SQLite records in `memory/memory.db`, managed only through `MemoryStore` and the `MemorySystem` facade.
 - Preferences live in `memory/preferences.json`.
-- Diagnostics write to `logs/memory.log` and console when enabled.
-
-Diagnostics/logging:
-
-- `MemoryDiagnostics` stays open across analysis, memory execution, prompt prep, Ollama streaming, rendering, and final response.
-- It records stages such as Analysis, Retrieve, Execute, Prompt, Ollama Start, First Token, Generate, Render, and Total.
-- It also records sanitized Ollama request/stream summaries, especially for post-memory follow-up generation.
 
 ## 2. File-by-File Explanation
 
@@ -228,10 +226,10 @@ Main responsibilities:
 - Own conversation state.
 - Render messages.
 - Start request preparation.
-- Route memory results.
-- Start normal or post-memory Ollama generation.
+- Run memory extraction/retrieval through the single `MemorySystem` facade.
+- Start Ollama generation for every user turn (single visible response path).
 - Handle streaming chunks.
-- Finalize responses and diagnostics.
+- Finalize responses.
 - Manage cancellation/Stop.
 - Manage model discovery and model switching.
 - Coordinate sidebar/search/settings overlays.
@@ -240,81 +238,17 @@ Main responsibilities:
 Important architectural decisions:
 
 - Request preparation runs before Ollama generation and is offloaded to avoid UI blocking.
-- Memory success does not directly trust LLM wording; UI confirmations are attached only after service success.
+- Every user message follows exactly one response path: preparation (which may save/retrieve memory invisibly) followed by a single conversational-model stream. There is no separate post-memory response path.
+- Memory operates automatically and invisibly; the app never renders memory confirmations.
 - Response ownership is guarded by `_finalized_current_response` so multiple paths do not append the same assistant message.
 - Streaming is throttled through a render timer so every chunk does not force full layout work.
 - Composer resizing uses deferred/stable event-loop updates to avoid layout feedback loops.
 
 Mixed responsibility note:
 
-- This is the largest file and contains UI composition, request lifecycle, worker wiring, streaming finalization, diagnostics coordination, and some performance logic. It may eventually deserve careful extraction, but not during focused bug fixes.
+- This is the largest file and contains UI composition, request lifecycle, worker wiring, streaming finalization, and some performance logic. It may eventually deserve careful extraction, but not during focused bug fixes.
 
 Subsystem: application coordination.
-
-### App/memory_diagnostics.py
-
-Purpose: compact diagnostics for memory/chat request lifecycle.
-
-Responsibilities:
-
-- Collect timing/event fields.
-- Finalize once.
-- Write compact records to console/log.
-- Format classifier, memory, Ollama stream, error, assistant response, and total timing.
-
-Important constraints:
-
-- Do not print private/internal details unnecessarily.
-- Do not finalize before streaming/rendering completes.
-- Keep measured stages even if log format changes.
-
-Subsystem: diagnostics.
-
-### App/memory_embeddings.py
-
-Purpose: lightweight local semantic-ish retrieval helper.
-
-Responsibilities:
-
-- Canonicalize text/key terms.
-- Apply synonym mapping.
-- Build hashed n-gram feature vectors.
-- Compute cosine similarity.
-
-Important constraints:
-
-- Local-only and dependency-light.
-- Not a real embedding model; behavior is approximate but deterministic/testable.
-
-Subsystem: memory retrieval.
-
-### App/memory_intent.py
-
-Purpose: classify memory-related user messages without executing writes.
-
-Important classes:
-
-- `MemoryIntent`
-- `MemoryAnalysis`
-- `DurableMemoryDecision`
-- `MemoryIntentClassifier`
-
-Responsibilities:
-
-- Detect explicit create/update/delete/retrieve intents.
-- Support contextual commands such as “Remember that.”
-- Use local LLM classification for ambiguous memory-related messages.
-- Classify durable automatic memories in Suggest/Automatic modes.
-- Provide deterministic fallback extraction and validation.
-
-Important constraints:
-
-- The classifier interprets intent only.
-- It must not write to memory.
-- It must not claim success.
-- False positives here can hijack normal chat, so new patterns must be conservative.
-
-Subsystem: memory analysis.
 
 ### App/memory_manager.py
 
@@ -329,91 +263,236 @@ Responsibilities:
 
 - Settings tab layout.
 - Memory search/filter/sort.
-- Memory mode selector.
-- Diagnostics toggle.
 - Edit, archive/restore, delete, clear memories.
 
 Important constraints:
 
 - Settings should start hidden and refresh only when visible.
-- Manual edits go through `MemoryStore.edit()`.
+- Manual edits go through `MemoryStore.update_memory(...)` (manual provenance).
 - Memory Manager must preserve categories and active/archive filtering.
+- UI layer only — all logic lives in `MemoryStore`/`MemorySystem`.
 
 Subsystem: settings/memory UI.
 
-### App/memory_models.py
+### App/memory_v2/models.py
 
-Purpose: typed memory data models.
+Purpose: typed data models for Memory V2.
 
 Important objects:
 
-- `CATEGORIES`
-- `MemoryRecord`
-- `ParsedMemory`
-
-Responsibilities:
-
-- Define canonical categories: User, Preferences, Projects, People, Facts, Temporary.
-- Represent stored memory rows and parsed candidate memories.
+- `MemoryLayer` (durable / temporary / archived)
+- `MemoryCategory` + `CATEGORIES`
+- `ProvenanceKind` (explicit / automatic / imported / restored)
+- `MutationKind`, `MutationStatus`
+- `ParsedMemory`, `MemoryRecord`, `TemporaryRecord`
+- `Provenance`
+- `RankedMemory`, `RetrievalOutcome`
+- `MemoryCommand`, `TurnAnalysis`, `TurnOutcome`
 
 Important constraints:
 
 - Category names are part of schema/UI behavior.
-- Changing fields affects store, service, UI, and tests.
+- Changing fields affects store, operations, retrieval, UI, and tests.
 
 Subsystem: memory models.
 
-### App/memory_service.py
+### App/memory_v2/normalize.py
 
-Purpose: authoritative memory execution layer.
-
-Important classes:
-
-- `MemoryActionResult`
-- `MemoryService`
+Purpose: deterministic text/key normalization.
 
 Responsibilities:
 
-- Process user messages according to memory mode.
-- Execute explicit create/update/delete/retrieve.
-- Handle Off, Explicit, Suggest, Automatic modes.
-- Resolve contextual commands.
-- Validate LLM classifier output.
-- Parse memories.
-- Create/update/supersede/archive/delete records.
-- Retrieve memories with hybrid ranking.
-- Prevent false confirmations.
-- Emit structured success/failure diagnostics.
+- Clean values (trim punctuation, collapse whitespace).
+- Canonicalize keys (casefold, remove filler words) so synonyms land on one slot.
+- Build canonical keys from category/subject/key.
 
 Important constraints:
 
-- All memory writes should go through this service.
-- LLMs may classify/interpret, but deterministic validation decides.
-- UI confirmation text is only included after confirmed success.
-- Failure results must be structured and honest.
+- Pure, deterministic, dependency-free.
+- Must be stable so retrieval and consolidation agree.
 
-Subsystem: memory execution.
+Subsystem: memory normalization.
 
-### App/memory_store.py
+### App/memory_v2/embeddings.py
 
-Purpose: SQLite persistence for long-term memory.
+Purpose: local deterministic embeddings for retrieval.
 
 Responsibilities:
 
-- Create schema.
-- Migrate category names such as `profile` to `User`.
-- Add/get/list/search/edit/archive/restore/delete memories.
-- Mark accessed.
-- Normalize category and normalized key.
-- Preserve provenance, active/archive state, superseding IDs.
+- Build hashed n-gram feature vectors.
+- Compute cosine similarity.
+- Provide synonym-aware token mapping.
 
 Important constraints:
 
-- Store should remain deterministic and dumb; avoid embedding application logic here.
+- Local-only and dependency-light.
+- Deterministic: the same input always yields the same vector.
+- Approximate but predictable; exact meaning still wins over loose similarity.
+
+Subsystem: memory retrieval.
+
+### App/memory_v2/store.py
+
+Purpose: SQLite persistence for Memory V2.
+
+Responsibilities:
+
+- `SCHEMA_VERSION = 2` with `v2_memories`, `v2_temporary_memories`, `v2_memory_events`, `v2_conversation_trackers`.
+- WAL mode.
+- Migrate from legacy: back up and drop the legacy `memories` table.
+- Insert/get/list/search/update/archive/restore/delete durable memories.
+- Insert/list/touch/update/expire/delete temporary memories.
+- Record auditable mutation events.
+- Track conversation activity and token counters.
+- Link supersede pairs and group by canonical key.
+
+Important constraints:
+
+- Store stays deterministic and dumb; application logic lives in operations/pipeline.
 - Do not bypass it with raw SQL elsewhere.
 - Runtime DB must not be committed.
 
 Subsystem: memory persistence.
+
+### App/memory_v2/extract.py
+
+Purpose: deterministic intent + fact extraction from the user message.
+
+Important class:
+
+- `Extractor`
+
+Responsibilities:
+
+- Detect explicit create/update/delete commands.
+- Resolve contextual commands (“Remember that.”) against the previous user message.
+- Extract durable personal facts (“my favorite color is purple”).
+- Extract temporary facts/tasks (“I'm working on X”, “remember to Y”).
+- Detect questions about memory (read-only) and suppression statements.
+- Decide when retrieval should run (threshold-gated vs `include_all` for meta questions).
+
+Important constraints:
+
+- It interprets and classifies only; it never writes.
+- No LLM dependency — fully deterministic and testable.
+- Must be conservative: ordinary conversation must not become memory writes.
+
+Subsystem: memory analysis.
+
+### App/memory_v2/operations.py
+
+Purpose: validated, atomic, typed mutation execution.
+
+Important class:
+
+- `Operations`
+
+Responsibilities:
+
+- Create/update/merge/supersede/archive/restore/delete durable memories.
+- Create/update temporary memories.
+- Enforce provenance (automatic vs explicit).
+- Resolve previous-user-message references.
+- Return structured `MutationOutcome` with `MutationStatus`.
+
+Important constraints:
+
+- Mutations only flow through here (validated/atomic/verified).
+- Ambiguous updates return `MULTIPLE_MATCHES` instead of guessing.
+- Failed writes never claim success.
+
+Subsystem: memory execution.
+
+### App/memory_v2/retrieval.py
+
+Purpose: hybrid retrieval and ranking.
+
+Important class:
+
+- `Retriever`
+
+Responsibilities:
+
+- Combine canonical-key token overlap, key/subject match, semantic similarity, importance, recency, and access count.
+- Suppress generic attribute slots (favorite/favourite/fav/preferred) from cross-matching, so favorite color never returns favorite drink.
+- Boost current-state temporary records for “what am I doing right now” queries.
+- Inject only when the score clears the threshold (or when explicitly asked via `include_all`).
+- Never inject archived or superseded records.
+
+Important constraints:
+
+- Exact meaning beats loose similarity.
+- Archived/old facts never override current facts.
+- Return `RetrievalOutcome` with `selected`, `injected`, `reason`.
+
+Subsystem: memory retrieval.
+
+### App/memory_v2/temporary.py
+
+Purpose: temporary cross-chat context lifecycle.
+
+Important classes:
+
+- `TemporaryConfig`
+- `TemporaryMemory`
+
+Responsibilities:
+
+- Begin turns with token counters and conversation indices.
+- Score temporary records by recency and context distance.
+- Expire records by token/conversation distance (never purely by time).
+- Enforce a budget via eviction.
+- Emit `temporary_expired` audit events with reasons.
+
+Subsystem: temporary memory lifecycle.
+
+### App/memory_v2/consolidation.py
+
+Purpose: periodic memory hygiene.
+
+Important classes:
+
+- `ConsolidationConfig`
+- `ConsolidationResult`
+- `Consolidator`
+
+Responsibilities:
+
+- Merge duplicate records on the same canonical key (archive older + link supersede).
+- Refuse to merge conflicting values (emit skip-conflict events).
+- Archive stale, unaccessed, low-importance records.
+- Recompute importance boosts.
+
+Important constraints:
+
+- Never merge different meanings (favorite color vs favorite drink).
+- Keep history via archival rather than hard deletion.
+
+Subsystem: memory consolidation.
+
+### App/memory_v2/pipeline.py
+
+Purpose: `MemorySystem` facade — the single application entry point for memory.
+
+Important classes:
+
+- `MemorySystemConfig`, `MemorySystemStats`
+- `MemorySystem`
+
+Responsibilities:
+
+- Wire extractor, operations, retriever, temporary memory, and consolidator.
+- `handle_user_message()`: analyze, retrieve, optionally mutate, sweep, consolidate periodically.
+- Enforce: questions are read-only; suppression is honored; mutations flow only through operations.
+- Expose `retrieve()`, `archive()`, `restore()`, `delete()`, `clear_durable()`, `stats()`, and other manager APIs.
+
+Important constraints:
+
+- The app talks to `MemorySystem` and nothing else for memory.
+- A memory question never triggers a write or delete.
+- No false confirmations; mutations report structured outcomes.
+
+Subsystem: memory orchestration.
 
 ### App/ollama_client.py
 
@@ -452,8 +531,7 @@ Purpose: small JSON preference store.
 Responsibilities:
 
 - Selected model.
-- Memory mode.
-- Memory diagnostics enabled flag.
+- Memory-related flags are read defensively and ignored (Memory V2 is always on).
 
 Important constraints:
 
@@ -469,14 +547,13 @@ Purpose: system prompt and message assembly.
 Responsibilities:
 
 - Base system prompt grounding current capabilities.
-- Inject relevant memories into normal chat prompts.
-- Build constrained post-memory follow-up prompts.
+- Inject relevant memories into the single conversational prompt via `format_relevant_memories`.
 
 Important constraints:
 
 - Do not let VioletAI claim unimplemented capabilities.
 - Retrieved memories are context, not verified facts.
-- Post-memory prompt must not force or repeat memory confirmation.
+- Memory is invisible to the user: no confirmation or follow-up prompts are generated.
 
 Subsystem: prompt construction.
 
@@ -541,122 +618,92 @@ Subsystem: reusable UI widgets.
 
 ## 3. Memory System
 
-> **Legacy reference for the Memory-V2 branch:** This section describes the pre-Memory-V2 implementation. It is useful for understanding integrations, data, previous decisions, and known failure modes, but it is not an architecture-preservation requirement. Replace it and update this section once Memory V2 is verified.
-
-The memory architecture is intentionally split into interpretation, validation, execution, persistence, and UI confirmation.
+Memory V2 is a four-layer, deterministic, invisible memory system. It replaces the legacy `MemoryService`/`MemoryStore`/`MemoryIntentClassifier`/`MemoryDiagnostics` stack entirely; those modules were deleted.
 
 Core rule:
 
 ```text
-LLM interprets meaning.
-Application validates.
-MemoryService executes.
-MemoryStore persists.
-UI confirms only after SUCCESS.
+Extractor interprets (deterministically, never writes).
+Operations validates and executes typed mutations.
+Store persists.
+Retriever decides whether retrieval genuinely helps.
+One visible response comes from the conversational model, always.
 ```
 
-Full intended pipeline:
+Full pipeline for a user turn (`MemorySystem.handle_user_message`):
 
 ```text
 User message
     ↓
-Memory opportunity detection
+Extractor: analyze (intent, facts, questions, suppression)
     ↓
-Explicit memory-intent detection or durability classification
+Retriever: hybrid scoring against durable + temporary layers
     ↓
-Structured memory decision
+Threshold gating: inject only when it genuinely helps
     ↓
-MemoryService validation
+Operations: validated create/update/supersede/archive/delete if needed
     ↓
-Database operation
+Temporary: current-state tracking, token-budget sweep
     ↓
-Structured success/failure result
+Consolidator: periodic hygiene (duplicates, staleness, importance)
     ↓
-Natural-language response generation
-    ↓
-UI confirmation only after success
+Structured TurnOutcome returned to main.py
 ```
 
-Modes:
+Layers:
 
-- Off: memory pipeline is skipped and no durable memory write occurs.
-- Explicit: only explicit user memory commands are handled.
-- Suggest: automatic durable fact detection can ask for confirmation before saving.
-- Automatic: high-confidence durable user facts can be saved automatically after validation.
+- Durable: validated long-term facts (`v2_memories`).
+- Archived: retired/old values, kept for history, never injected.
+- Temporary: current-state facts/tasks (`v2_temporary_memories`), expired by token/conversation distance, never by time alone.
+- Evidence: auditable `v2_memory_events` of every mutation.
 
-Explicit intent detection:
+Intent extraction (`Extractor`):
 
-- `MemoryIntentClassifier.analyze()` handles direct commands like remember/save/store/update/delete/retrieve.
-- Contextual commands such as “Remember that.” resolve to the previous user message, not the assistant response.
-- Natural updates like “My favorite color is now blue” route to update.
-- “What do you remember?” routes to retrieval.
+- Detects explicit create/update/delete commands.
+- Resolves contextual commands (“Remember that.”) against the previous user message.
+- Extracts durable personal facts (“my favorite color is purple”).
+- Extracts temporary facts/tasks (“I'm working on X”, “remember to Y”).
+- Detects questions about memory and suppression statements.
+- Fully deterministic and conservative — ordinary conversation must never become a write.
 
-LLM durability classification:
+Validation and execution (`Operations`):
 
-- Used for Suggest/Automatic memory opportunity detection.
-- Returns structured `DurableMemoryDecision`.
-- The service rejects low confidence, unsupported classes, invalid categories, missing keys/values, temporary state, casual statements, and classifier failures.
+- Every mutation flows through validated, atomic, typed operations with provenance (automatic vs explicit).
+- Ambiguous updates return `MULTIPLE_MATCHES` (plus `clarification_needed`) instead of guessing.
+- Supersession archives the old value and links `superseded_by_id`; old facts never override current facts.
 
-Deterministic validation:
+Retrieval (`Retriever`):
 
-- `MemoryService._validated_automatic_decision()` checks classifier output.
-- `MemoryService.parse_memory()` extracts category/subject/key/value.
-- `clean_memory_value()` trims punctuation/emoticons.
-- `normalize_memory_value()` normalizes device names like iPhone/iPad/MacBook/PC.
+- Hybrid score: canonical-key token overlap, key/subject match, semantic similarity, importance, recency, access count.
+- Generic attribute slots (`favorite/favourite/fav/preferred`) are suppressed from cross-matching — favorite color never returns favorite drink.
+- Injection happens only when the score clears the threshold (or on `include_all` for explicit memory questions).
+- Archived and superseded records are never injected.
 
-Memory Store:
+Durability guarantees (asserted by `tests/test_memory_v2_adversarial.py`):
 
-- SQLite table stores value, normalized key, provenance, timestamps, active/archive state, superseding ID, expiry, language, manual edit flag.
-- `profile` is migrated to `User`.
+- Memory questions are read-only: zero writes, zero deletes.
+- Suppression statements write nothing.
+- No-match deletions return `NO_MATCH` and change nothing.
+- Unrelated queries inject nothing.
+- Durable and temporary layers never cross-inject.
+
+Persistence (`Store`):
+
+- `SCHEMA_VERSION = 2`, WAL mode; migrates by backing up and dropping the legacy `memories` table.
+- Insert/get/list/search/update/archive/restore/delete durable memories; insert/list/touch/update/expire/delete temporary memories; auditable mutation events.
 - Runtime DB is ignored by git.
 
-Semantic retrieval:
+Memory Manager (`App/memory_manager.py`):
 
-- `memory_embeddings.py` uses local hash n-gram vectors.
-- Retrieval combines term overlap, key/subject match, cosine similarity, importance, access count, and recency.
-- Expired temporary records are ignored.
+- Settings overlay: search/filter/sort, edit, archive/restore, delete, clear.
+- Manual edits route through `MemoryStore.update_memory(...)` with manual provenance.
+- No memory mode or diagnostics toggles — memory is always on and invisible.
 
-Duplicate handling:
+Invisibility:
 
-- Exact normalized-key conflicts supersede older records.
-- Semantic duplicate detection can archive older equivalent records.
-- `migrate_duplicates()` archives older duplicates on service initialization.
-
-Updates/superseding:
-
-- Updates find matching active memories.
-- If one clear match exists, the previous record is archived and the new value is inserted with `supersedes_memory_id`.
-- Ambiguous matches return structured clarification instead of guessing.
-
-Archiving/deletion:
-
-- “Forget/delete/remove” operations archive matching active memories.
-- Manual Memory Manager delete permanently deletes a record.
-- Archive preserves history; delete removes the row.
-
-Provenance:
-
-- Records keep source conversation ID, source message ID, and source user text.
-- Duplicate same-value saves update provenance rather than creating redundant active records.
-
-False-confirmation prevention:
-
-- Memory UI confirmations are stored in `MemoryActionResult.confirmation`.
-- `✓ Remembered`, `Memory updated.`, and `Memory removed.` only appear after `SUCCESS`.
-- Failed writes return failure reasons and do not attach success confirmations.
-- The LLM is specifically instructed not to claim memory success.
-
-Post-memory response generation:
-
-- After a successful memory operation, `build_memory_result_response_messages()` builds a constrained prompt.
-- A second Ollama streaming request generates one short natural follow-up.
-- The UI confirmation remains the authoritative result.
-- If follow-up generation fails, memory success is preserved and the app uses an honest fallback rather than “Done.”
-
-Failure handling:
-
-- Known structured statuses include `SUCCESS`, `NO_MATCH`, `MULTIPLE_MATCHES`, `INVALID_REFERENCE`, `WRITE_FAILED`, `INVALID_MEMORY_REQUEST`, `RETRIEVAL_EMPTY`, `DISABLED_BY_MODE`, and `PENDING_CONFIRMATION`.
-- Failures identify the stage where possible: context resolution, candidate retrieval, validation, database execution, prompt/Ollama/generation.
+- `main.py` has exactly one response path per turn: preparation (memory work) then a single conversational-model stream.
+- No post-memory follow-up request, no confirmation labels, no diagnostics UI.
+- The user never sees a memory success/failure message.
 
 ## 4. Request Lifecycle
 
@@ -669,18 +716,17 @@ User presses Enter
 → user message appended to conversation
 → conversation saved if non-empty
 → RequestPreparationWorker starts on QThread
-→ MemoryService.process_user_message()
-→ if not handled, retrieve relevant memories
+→ MemorySystem.handle_user_message() (analyze/retrieve/mutate)
+→ relevant memories injected as context when threshold cleared
 → build_ollama_messages()
 → MainWindow receives PreparedRequest
-→ OllamaWorker starts on QThread
+→ OllamaWorker starts on QThread (always)
 → POST /api/chat stream=true
 → parse NDJSON stream
 → chunk_received signals update streamed_answer
 → render timer updates assistant bubble
 → finished signal finalizes full assistant response
 → conversation JSON saved
-→ diagnostics finalized
 → controls return to Ready
 ```
 
@@ -693,13 +739,12 @@ Thread ownership:
   - final render
   - conversation/sidebar UI refresh
 - Request preparation thread:
-  - memory intent/classifier work
-  - memory retrieval
+  - deterministic memory analysis (`MemorySystem.handle_user_message`)
+  - memory retrieval/injection
   - prompt assembly
 - Ollama thread:
   - HTTP request
   - streaming response iteration
-  - stream diagnostics
 - Model discovery thread:
   - `/api/tags` request
 
@@ -718,17 +763,17 @@ Errors:
 - Empty responses are distinguished from timeout, invalid JSON, missing model, and connection failure.
 - If partial output exists before an error, visible partial response is preserved.
 
-Post-memory vs normal chat:
+Single response path:
 
-- Normal chat injects relevant memories and streams a full answer.
-- Post-memory success uses a short constrained second Ollama call with `num_predict: 64`, `temperature: 0.5`, and shorter read timeout.
-- Post-memory confirmation is attached after the natural response, but only because the memory operation already succeeded.
+- Every user turn is prepared once (memory analysis/retrieval inside `RequestPreparationWorker`) and then streamed once from the conversational model.
+- There is no post-memory second call and no confirmation attachment.
+- Relevant memories are injected into the single prompt as context.
 
 Request ownership:
 
 - `_finalized_current_response` prevents duplicate assistant appends.
 - Active `thread` and `prep_thread` checks prevent sending/regenerating/model-switching while a request is active.
-- Memory-handled responses and normal chat generation are routed through distinct branches in `_receive_prepared_request()`.
+- `_receive_prepared_request()` is the only entry point into generation.
 
 Timers/deferred rendering:
 
@@ -752,11 +797,11 @@ VioletAI’s architecture is guided by a few strong principles:
 - Native UI: PySide6 widgets, no Electron, no browser UI.
 - Lightweight dependencies: standard library, PySide6, requests; no large frameworks.
 - Deterministic execution: database writes are controlled by application code, not by LLM text.
-- LLM interprets; app validates and executes.
-- No false confirmations: never show memory success unless the service returned success.
+- Deterministic interpretation: memory analysis is fully deterministic and conservative; ordinary conversation never becomes a write.
+- No false confirmations: there are no memory confirmations at all — memory is invisible.
 - Structured failures: expose specific failure reasons instead of generic replies.
 - Preserve provenance/history: superseding archives older records instead of silently overwriting.
-- Fail safely: ask clarification or skip when confidence is insufficient.
+- Exact meaning wins: old facts never override current facts; favorite color is never confused with favorite drink.
 - Do not hallucinate capabilities: prompts explicitly forbid claiming tools that are not implemented.
 - Keep Qt widget access on the UI thread.
 - Move blocking work to workers.
@@ -770,39 +815,51 @@ VioletAI’s architecture is guided by a few strong principles:
 
 The reasoning behind the main decisions:
 
-- Memory is split into classifier/service/store because LLM output is useful for interpretation but unsafe as an execution authority.
-- UI confirmations are separate from assistant prose because conversational language can be wrong, delayed, cancelled, or filtered.
+- Memory is deterministic and layered because LLM output is useful as prose but unsafe as an execution authority; a fully deterministic extractor with validated typed operations removes that risk.
+- Memory is invisible because conversational confirmations can be wrong, delayed, cancelled, or filtered; with no second response path there is nothing to go wrong.
 - Streaming has its own worker because network and NDJSON iteration must never freeze Qt.
-- Diagnostics span the full lifecycle because many failures happen after analysis/prompting, especially in Ollama streaming.
 - Startup opens to a clean chat because it avoids surprising the user with stale context and keeps the app feeling instant.
 - The prompt explicitly grounds capabilities because VioletAI’s planned future tools do not exist yet.
 
 ## 6. Current Memory-V2 Work
 
-The Settings and UI-polish work has been completed and merged into `master`. The active `Memory-V2` branch is dedicated to replacing the legacy memory system.
+The Settings and UI-polish work has been completed and merged into `master`. The active `Memory-V2` branch replaced the legacy memory system.
 
-Known legacy failures motivating the rewrite include:
+Legacy failures that motivated the rewrite and are now resolved by Memory V2:
 
-- Questions about memory can be mistaken for memory commands.
-- Normal conversational responses can be replaced by a separate memory-response path.
-- Vague deletion such as “forget it” can affect multiple unrelated memories.
-- Exact attributes can be confused, such as favorite color versus favorite drink.
-- Memory-related replies can feel detached from VioletAI's normal conversational model.
-- Similarity-based matching can outrank exact subject, entity, attribute, recency, or temporal validity.
-- Updates, duplicates, contradictions, failures, and confirmations are not consistently reliable enough for the final product.
+- Questions about memory could be mistaken for memory commands.
+- Normal conversational responses could be replaced by a separate memory-response path.
+- Vague deletion such as “forget it” could affect multiple unrelated memories.
+- Exact attributes could be confused, such as favorite color versus favorite drink.
+- Memory-related replies could feel detached from VioletAI's normal conversational model.
+- Similarity-based matching could outrank exact subject, entity, attribute, recency, or temporal validity.
+- Updates, duplicates, contradictions, failures, and confirmations were not reliably consistent.
 
-Memory V2 must include:
+Memory V2 now provides:
 
 - One natural response path using VioletAI's primary conversational model.
 - Current-chat context, temporary cross-chat episodic memory, durable memory, and archived history as distinct layers.
-- A configurable context budget for cross-chat awareness.
 - Hybrid RAG using exact, lexical, semantic, structured, temporal, and provenance-aware retrieval.
 - Typed, atomic, verified create/update/merge/supersede/archive/restore/delete operations.
-- Conservative deletion and natural clarification when a target is ambiguous.
-- Provenance, version history, contradiction handling, consolidation, decay, and migration or safe reset behavior.
-- Extensive deterministic, adversarial, real-Ollama, and real-Windows-GUI testing.
+- Conservative deletion and structured clarification when a target is ambiguous.
+- Provenance, version history, contradiction handling, consolidation, and migration with legacy backup.
+- Extensive deterministic and adversarial testing (230 tests passing, including real-store UI tests).
 
-Do not describe Memory V2 as complete until the legacy pipeline is removed, one authoritative replacement exists, no known reproducible defects remain, and the documentation describes the implemented system accurately.
+Status: Memory V2 is implemented and verified as an alpha. The legacy pipeline is removed and one authoritative replacement exists. The sole remaining v0.2 task is the Settings page UI polish:
+
+- Open Settings on the Settings tab.
+- All tabs should navigate correctly.
+- Unimplemented tabs may display clean placeholders.
+- Memory Manager remains fully functional.
+- Reduce excessive padding.
+- Darker content area.
+- Slightly lighter navigation/sidebar.
+- Reduce spacing between tabs.
+- Move tabs closer to the top.
+- Settings starts hidden.
+- No unrelated chat or memory changes.
+
+v0.2 should not be tagged until the remaining task is complete and verified.
 
 ## 7. Coding Conventions
 
@@ -835,7 +892,10 @@ Before every significant commit:
 python -m unittest discover -s tests -v
 python -m compileall -q App tests
 git diff --check
+git status --short
 ```
+
+Headless UI tests use `QT_QPA_PLATFORM=offscreen`. Memory V2 has dedicated coverage: `tests/test_memory_v2_*` for each layer plus `tests/test_memory_v2_adversarial.py`, which asserts the corruption guards (question read-only, exact meaning wins, no-match deletion, suppression, threshold-gated injection, no layer cross-injection).
 
 Manual verification is required whenever changes affect:
 
@@ -855,7 +915,7 @@ After v0.2 the project roadmap is:
 
 ### Memory V2 foundation — current work
 
-Temporary cross-chat awareness is part of the active Memory V2 rewrite, not a later feature. A new chat should begin with a fresh conversational focus while relevant recent conversations remain retrievable within a configurable token budget. Temporary episodes must decay, consolidate, or expire and must remain separate from durable saved memory.
+Implemented in Memory V2 (`App/memory_v2/temporary.py`): temporary facts/tasks are remembered across chats and expired by token/conversation distance rather than time, keeping long-term memory clean. A new chat begins with a fresh conversational focus while relevant recent conversation stays retrievable within a token budget; temporary episodes decay and expire separately from durable saved memory.
 
 ---
 
@@ -968,6 +1028,8 @@ v0.1 completed
 Current work:
 
 `Memory-V2` — final memory architecture rewrite
+
+Memory V2 rewrite: legacy `memory_service` / `memory_store` / `memory_intent` / `memory_models` / `memory_embeddings` / `memory_diagnostics` modules were removed and replaced by the deterministic `App/memory_v2` package with a single visible response path.
 
 Development model:
 
