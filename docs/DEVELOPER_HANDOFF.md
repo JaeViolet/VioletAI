@@ -2,7 +2,8 @@
 
 Version: v0.2 Pre-Release  
 Last Updated: August 2026  
-Status: Living document
+Status: Living document  
+Branch scope: `Memory-V2`
 
 ## Read This First
 
@@ -18,6 +19,24 @@ Before modifying the project:
 6. Never claim a feature works without verification.
 
 When this document and the implementation disagree, inspect the current code and explain the discrepancy before making changes.
+
+## Memory-V2 Branch Authority
+
+This branch exists specifically to replace VioletAI's memory architecture. For memory-related work, this section overrides any conflicting instruction elsewhere in this handoff.
+
+On `Memory-V2`, the coding agent is authorized to:
+
+- Replace the existing memory subsystem completely.
+- Delete, rename, redesign, or replace memory-related files, classes, schemas, prompts, diagnostics, UI integration, and tests.
+- Introduce a new storage schema, hybrid RAG pipeline, temporary cross-chat memory, durable memory, provenance, temporal reasoning, consolidation, and migration strategy.
+- Remove legacy memory paths after their replacements are implemented and verified.
+- Make broad architectural changes inside the memory subsystem when a clean final design requires them.
+
+The agent must not preserve legacy memory behavior merely because older sections describe it. Those sections are historical context until Memory V2 replaces them.
+
+All non-memory constraints remain in force. Do not redesign unrelated chat rendering, composer behavior, Ollama streaming, conversation persistence, sidebar, themes, or general Settings behavior unless a narrowly required integration change is necessary.
+
+Memory V2 must end with one authoritative pipeline, not parallel legacy and replacement systems. Build replacements safely, test them, switch integrations, then remove obsolete memory code.
 
 ## Project Goals
 
@@ -35,6 +54,7 @@ Every architectural decision should support one or more of these goals.
 ## Table of Contents
 
 - [Read This First](#read-this-first)
+- [Memory-V2 Branch Authority](#memory-v2-branch-authority)
 - [Project Goals](#project-goals)
 - [1. Overall Architecture](#1-overall-architecture)
 - [2. File-by-File Explanation](#2-file-by-file-explanation)
@@ -521,6 +541,8 @@ Subsystem: reusable UI widgets.
 
 ## 3. Memory System
 
+> **Legacy reference for the Memory-V2 branch:** This section describes the pre-Memory-V2 implementation. It is useful for understanding integrations, data, previous decisions, and known failure modes, but it is not an architecture-preservation requirement. Replace it and update this section once Memory V2 is verified.
+
 The memory architecture is intentionally split into interpretation, validation, execution, persistence, and UI confirmation.
 
 Core rule:
@@ -755,61 +777,39 @@ The reasoning behind the main decisions:
 - Startup opens to a clean chat because it avoids surprising the user with stale context and keeps the app feeling instant.
 - The prompt explicitly grounds capabilities because VioletAI’s planned future tools do not exist yet.
 
-## 6. Current State Before v0.2
+## 6. Current Memory-V2 Work
 
-The project is not fully complete yet.
+The Settings and UI-polish work has been completed and merged into `master`. The active `Memory-V2` branch is dedicated to replacing the legacy memory system.
 
-Two tasks remain before tagging and pushing v0.2.
+Known legacy failures motivating the rewrite include:
 
-### 1. Fix false memory interception
+- Questions about memory can be mistaken for memory commands.
+- Normal conversational responses can be replaced by a separate memory-response path.
+- Vague deletion such as “forget it” can affect multiple unrelated memories.
+- Exact attributes can be confused, such as favorite color versus favorite drink.
+- Memory-related replies can feel detached from VioletAI's normal conversational model.
+- Similarity-based matching can outrank exact subject, entity, attribute, recency, or temporal validity.
+- Updates, duplicates, contradictions, failures, and confirmations are not consistently reliable enough for the final product.
 
-A question containing words such as "remember" or "memory" can incorrectly be treated as a memory operation.
+Memory V2 must include:
 
-Confirmed example:
+- One natural response path using VioletAI's primary conversational model.
+- Current-chat context, temporary cross-chat episodic memory, durable memory, and archived history as distinct layers.
+- A configurable context budget for cross-chat awareness.
+- Hybrid RAG using exact, lexical, semantic, structured, temporal, and provenance-aware retrieval.
+- Typed, atomic, verified create/update/merge/supersede/archive/restore/delete operations.
+- Conservative deletion and natural clarification when a target is ambiguous.
+- Provenance, version history, contradiction handling, consolidation, decay, and migration or safe reset behavior.
+- Extensive deterministic, adversarial, real-Ollama, and real-Windows-GUI testing.
 
-> Do you have access to remember other chats, or just this one and memories saved in the Memory module?
-
-Incorrect behavior:
-
-- Normal response generation begins.
-- The memory pipeline incorrectly triggers.
-- The assistant response is overwritten or replaced.
-- ✓ Remembered appears even though no memory write was requested.
-- On the following message the assistant has no awareness of the overwritten response.
-
-Expected behavior:
-
-- Questions about how memory works remain normal conversation.
-- Mentioning "remember", "memory", "forget", etc. alone must never trigger memory execution.
-- Exactly one response pipeline owns a request.
-- Memory results may never overwrite an already-started normal response.
-- ✓ Remembered appears only after a confirmed database write allowed by the active memory mode.
-
----
-
-### 2. Settings page UI polish
-
-Remaining requirements:
-
-- Open Settings on the Settings tab.
-- All tabs should navigate correctly.
-- Unimplemented tabs may display clean placeholders.
-- Memory Manager remains fully functional.
-- Reduce excessive padding.
-- Darker content area.
-- Slightly lighter navigation/sidebar.
-- Reduce spacing between tabs.
-- Move tabs closer to the top.
-- Settings starts hidden.
-- No unrelated chat or memory changes.
-
-v0.2 should not be tagged until both tasks are complete and verified.
+Do not describe Memory V2 as complete until the legacy pipeline is removed, one authoritative replacement exists, no known reproducible defects remain, and the documentation describes the implemented system accurately.
 
 ## 7. Coding Conventions
 
 General principles:
 
-- Keep fixes focused.
+- Keep fixes focused outside the explicitly authorized subsystem.
+- Broad redesign is allowed for Memory V2 when required for one clean final architecture.
 - Avoid unrelated refactoring.
 - Measure before optimizing.
 - Preserve UI behavior whenever possible.
@@ -853,13 +853,9 @@ Automated tests should focus on regressions rather than implementation details.
 
 After v0.2 the project roadmap is:
 
-### Temporary conversational memory
+### Memory V2 foundation — current work
 
-Remember information across multiple chats automatically.
-
-Information should expire after enough subsequent conversation rather than becoming permanent.
-
-This provides short-term continuity without polluting long-term memory.
+Temporary cross-chat awareness is part of the active Memory V2 rewrite, not a later feature. A new chat should begin with a fresh conversational focus while relevant recent conversations remain retrievable within a configurable token budget. Temporary episodes must decay, consolidate, or expire and must remain separate from durable saved memory.
 
 ---
 
@@ -971,7 +967,7 @@ v0.1 completed
 
 Current work:
 
-v0.2
+`Memory-V2` — final memory architecture rewrite
 
 Development model:
 
