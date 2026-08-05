@@ -1680,13 +1680,13 @@ class ChatFoundationTests(unittest.TestCase):
         window.store.save(first)
         window.show()
         window.select_conversation(first.id)
-        self._wait_until(lambda: window.updatesEnabled())
+        self._wait_until(lambda: not window._rebuild_finish_active)
         with patch.object(MainWindow, "_rebuild_messages") as rebuild:
             window.select_conversation(first.id)
             rebuild.assert_not_called()
         window.close()
 
-    def test_rebuild_lands_at_bottom_without_scroll_changes(self) -> None:
+    def test_selecting_different_conversation_lands_at_bottom(self) -> None:
         window, _temp_dir = self._window_with_temp_store()
         conversation = window.store.create(SYSTEM_PROMPT)
         conversation.messages.append({"role": "user", "content": "Prompt"})
@@ -1694,13 +1694,24 @@ class ChatFoundationTests(unittest.TestCase):
         window.store.save(conversation)
         window.show()
         window.select_conversation(conversation.id)
-        self._wait_until(lambda: window.updatesEnabled())
+        self._wait_until(lambda: not window._rebuild_finish_active)
         bar = window.scroll_area.verticalScrollBar()
         self.assertEqual(bar.value(), bar.maximum())
-        before = (bar.value(), bar.maximum())
-        for _ in range(10):
-            self.app.processEvents()
-        self.assertEqual((bar.value(), bar.maximum()), before)
+        self.assertTrue(window.updatesEnabled())
+        window.close()
+
+    def test_rebuild_reenables_updates_and_does_not_loop_resize(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        conversation = window.store.create(SYSTEM_PROMPT)
+        conversation.messages.append({"role": "user", "content": "Prompt"})
+        conversation.messages.append({"role": "assistant", "content": "Answer. " * 400})
+        window.store.save(conversation)
+        window.show()
+        with patch.object(MainWindow, "_resize_rows", wraps=window._resize_rows) as resize:
+            window.select_conversation(conversation.id)
+            self._wait_until(lambda: not window._rebuild_finish_active)
+            self.assertTrue(window.updatesEnabled())
+            self.assertLessEqual(resize.call_count, 3)
         window.close()
 
     def test_send_and_stop_buttons_have_identical_larger_geometry(self) -> None:

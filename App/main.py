@@ -251,9 +251,8 @@ class MainWindow(QMainWindow):
         self._composer_total_state_changes = 0
         self._composer_layout_diagnostics: list[dict[str, object]] = []
         self._bulk_rebuilding_messages = False
+        self._message_rebuild_active = False
         self._rebuild_finish_active = False
-        self._rebuild_finish_tick = 0
-        self._last_finish_max: int | None = None
         self._composer_mode_timer = QTimer(self)
         self._composer_mode_timer.setSingleShot(True)
         self._composer_mode_timer.timeout.connect(self._update_composer_mode)
@@ -610,9 +609,8 @@ class MainWindow(QMainWindow):
         self.thinking_row = None
 
     def _rebuild_messages(self) -> None:
+        self._message_rebuild_active = True
         self.setUpdatesEnabled(False)
-        self._rebuild_finish_tick = 0
-        self._last_finish_max = None
         try:
             self._clear_message_rows()
             visible_messages = [
@@ -633,38 +631,28 @@ class MainWindow(QMainWindow):
                     self._bulk_rebuilding_messages = False
             self._resize_rows()
         finally:
-            QTimer.singleShot(0, self._finish_message_rebuild)
+            self._message_rebuild_active = False
+            self.setUpdatesEnabled(True)
+        QTimer.singleShot(0, self._scroll_to_rebuild_bottom)
+        QTimer.singleShot(30, self._scroll_to_rebuild_bottom)
 
-    def _finish_message_rebuild(self) -> None:
+    def _scroll_to_rebuild_bottom(self) -> None:
         bar = self.scroll_area.verticalScrollBar()
         if bar is None:
-            self.setUpdatesEnabled(True)
             return
         self._rebuild_finish_active = True
-        self._rebuild_finish_tick += 1
-        if self._last_finish_max is not None:
-            self._resize_rows()
-        current_max = bar.maximum()
-        if self._last_finish_max == current_max and self._last_finish_max is not None:
-            self._finish_rebuild_scroll(current_max)
-            return
-        if self._rebuild_finish_tick > 8:
-            self._finish_rebuild_scroll(current_max)
-            return
-        self._last_finish_max = current_max
         self._programmatic_scroll = True
-        bar.setValue(current_max)
+        bar.setValue(bar.maximum())
         self._programmatic_scroll = False
-        QTimer.singleShot(0, self._finish_message_rebuild)
+        QTimer.singleShot(60, self._release_rebuild_scroll_lock)
 
-    def _finish_rebuild_scroll(self, current_max: int) -> None:
-        bar = self.scroll_area.verticalScrollBar()
+    def _release_rebuild_scroll_lock(self) -> None:
         self._rebuild_finish_active = False
-        if bar is not None:
+        bar = self.scroll_area.verticalScrollBar()
+        if bar is not None and bar.maximum() != bar.value():
             self._programmatic_scroll = True
-            bar.setValue(current_max)
+            bar.setValue(bar.maximum())
             self._programmatic_scroll = False
-        self.setUpdatesEnabled(True)
 
     def _rebuild_range_changed(self, _minimum: int, _maximum: int) -> None:
         if not self._rebuild_finish_active:
@@ -727,7 +715,8 @@ class MainWindow(QMainWindow):
             if event.type() == QEvent.Type.Resize:
                 QTimer.singleShot(0, self._position_confirm_overlay)
         if watched is self.scroll_area.viewport() and event.type() == QEvent.Type.Resize:
-            QTimer.singleShot(0, self._resize_rows)
+            if not self._message_rebuild_active:
+                QTimer.singleShot(0, self._resize_rows)
         if watched is self.scroll_area.viewport() and event.type() == QEvent.Type.MouseButtonPress:
             if event.button() == Qt.MouseButton.MiddleButton:
                 self._toggle_middle_scroll(event.position().toPoint())
