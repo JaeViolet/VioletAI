@@ -8,7 +8,6 @@ from PySide6.QtWidgets import (
     QFrame,
     QGraphicsOpacityEffect,
     QHBoxLayout,
-    QInputDialog,
     QLineEdit,
     QLabel,
     QMenu,
@@ -23,6 +22,16 @@ from config import APP_NAME
 from conversation_store import Conversation
 from design import Motion, icon
 from widgets import apply_interaction_cursors
+
+
+class InlineRenameEditor(QLineEdit):
+    cancelled = Signal()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self.cancelled.emit()
+            return
+        super().keyPressEvent(event)
 
 
 class ConversationRow(QFrame):
@@ -46,6 +55,7 @@ class ConversationRow(QFrame):
 
         self.title = QLabel(conversation.title)
         self.title.setObjectName("conversationTitle")
+        self.title.setProperty("active", active)
         self.title.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
 
         layout.addWidget(self.title, 1)
@@ -78,14 +88,25 @@ class ConversationRow(QFrame):
         self.title.setText(metrics.elidedText(self._full_title, Qt.TextElideMode.ElideRight, max(24, self.width() - 20)))
 
     def _rename(self) -> None:
-        title, accepted = QInputDialog.getText(
-            self,
-            "Rename conversation",
-            "Title",
-            text=self.conversation.title,
-        )
-        if accepted:
+        editor = InlineRenameEditor(self.conversation.title, self)
+        editor.setObjectName("conversationEditor")
+        editor.selectAll()
+        self.layout().replaceWidget(self.title, editor)
+        self.title.hide()
+        editor.setFocus(Qt.FocusReason.OtherFocusReason)
+        editor.cancelled.connect(lambda: self._end_rename(editor))
+        editor.editingFinished.connect(lambda: self._commit_rename(editor))
+
+    def _commit_rename(self, editor: QLineEdit) -> None:
+        title = editor.text().strip()
+        self._end_rename(editor)
+        if title and title != self.conversation.title:
             self.rename_requested.emit(self.conversation.id, title)
+
+    def _end_rename(self, editor: QLineEdit) -> None:
+        self.layout().replaceWidget(editor, self.title)
+        editor.deleteLater()
+        self.title.show()
 
 
 class SearchOverlay(QFrame):
@@ -237,6 +258,14 @@ class ChatSidebar(QFrame):
         self.new_chat_button.clicked.connect(self.new_chat_requested.emit)
         expanded_layout.addWidget(self.new_chat_button)
 
+        self.pinned_widget = QWidget()
+        self.pinned_widget.setObjectName("sidebarList")
+        self.pinned_layout = QVBoxLayout(self.pinned_widget)
+        self.pinned_layout.setContentsMargins(0, 4, 0, 0)
+        self.pinned_layout.setSpacing(3)
+        self.pinned_layout.addStretch(1)
+        expanded_layout.addWidget(self.pinned_widget)
+
         self.scroll_area = QScrollArea()
         self.scroll_area.setObjectName("sidebarScroll")
         self.scroll_area.setWidgetResizable(True)
@@ -321,6 +350,28 @@ class ChatSidebar(QFrame):
         content_width = max(1, self.width() - margins.left() - margins.right())
         self.list_widget.setMinimumWidth(content_width)
         self.list_widget.setMaximumWidth(content_width)
+        self.pinned_widget.setMinimumWidth(content_width)
+        self.pinned_widget.setMaximumWidth(content_width)
+
+    def set_active(self, conversation_id: str) -> None:
+        def update(layout: QVBoxLayout) -> None:
+            for index in range(layout.count()):
+                widget = layout.itemAt(index).widget()
+                if widget is not None and widget.objectName() == "conversationRow":
+                    active = widget.conversation.id == conversation_id
+                    if widget.property("active") != active:
+                        widget.setProperty("active", active)
+                        widget.style().unpolish(widget)
+                        widget.style().polish(widget)
+                        widget.update()
+                        title = widget.title
+                        title.setProperty("active", active)
+                        title.style().unpolish(title)
+                        title.style().polish(title)
+                        title.update()
+
+        update(self.pinned_layout)
+        update(self.list_layout)
 
     def set_generating(self, generating: bool) -> None:
         self.new_chat_button.setEnabled(not generating)
@@ -330,31 +381,42 @@ class ChatSidebar(QFrame):
         self.settings_button.setEnabled(not generating)
         self.collapsed_settings_button.setEnabled(not generating)
 
+    def _clear_layout(self, layout: QVBoxLayout) -> None:
+        while layout.count() > 1:
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    def _insert_group(self, layout: QVBoxLayout, group_name: str, conversations: list[Conversation], active_conversation_id: str) -> None:
+        label = QLabel(group_name)
+        label.setObjectName("conversationGroup")
+        layout.insertWidget(layout.count() - 1, label)
+        for conversation in conversations:
+            row = ConversationRow(
+                conversation,
+                active=conversation.id == active_conversation_id,
+            )
+            row.selected.connect(self.conversation_selected.emit)
+            row.pin_requested.connect(self.pin_requested.emit)
+            row.rename_requested.connect(self.rename_requested.emit)
+            row.delete_requested.connect(self.delete_requested.emit)
+            layout.insertWidget(layout.count() - 1, row)
+
     def rebuild(
         self,
         groups: dict[str, list[Conversation]],
         active_conversation_id: str,
     ) -> None:
-        while self.list_layout.count() > 1:
-            item = self.list_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        self._clear_layout(self.pinned_layout)
+        self._clear_layout(self.list_layout)
+
+        pinned = groups.get("Pinned") or []
+        if pinned:
+            self._insert_group(self.pinned_layout, "Pinned", pinned, active_conversation_id)
 
         for group_name, conversations in groups.items():
-            if not conversations:
+            if group_name == "Pinned" or not conversations:
                 continue
-            label = QLabel(group_name)
-            label.setObjectName("conversationGroup")
-            self.list_layout.insertWidget(self.list_layout.count() - 1, label)
-            for conversation in conversations:
-                row = ConversationRow(
-                    conversation,
-                    active=conversation.id == active_conversation_id,
-                )
-                row.selected.connect(self.conversation_selected.emit)
-                row.pin_requested.connect(self.pin_requested.emit)
-                row.rename_requested.connect(self.rename_requested.emit)
-                row.delete_requested.connect(self.delete_requested.emit)
-                self.list_layout.insertWidget(self.list_layout.count() - 1, row)
+            self._insert_group(self.list_layout, group_name, conversations, active_conversation_id)
         self._sync_list_width()
         apply_interaction_cursors(self)

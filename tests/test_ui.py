@@ -16,9 +16,9 @@ import requests
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
-from PySide6.QtCore import Qt  # noqa: E402
-from PySide6.QtGui import QKeyEvent  # noqa: E402
-from PySide6.QtWidgets import QApplication, QFrame, QLabel, QMessageBox, QToolButton, QWidget  # noqa: E402
+from PySide6.QtCore import QEvent, QPointF, Qt  # noqa: E402
+from PySide6.QtGui import QKeyEvent, QMouseEvent  # noqa: E402
+from PySide6.QtWidgets import QApplication, QFrame, QLabel, QToolButton, QWidget  # noqa: E402
 
 from config import DEFAULT_MODEL_NAME, SYSTEM_PROMPT  # noqa: E402
 from conversation_store import ConversationStore  # noqa: E402
@@ -40,6 +40,7 @@ from memory_service import (  # noqa: E402
 )
 from memory_store import MemoryStore, MemoryStoreError, normalize_category, normalize_key  # noqa: E402
 from ollama_client import InvalidStreamError, OllamaWorker, discover_models, iter_message_chunks  # noqa: E402
+from preferences import Preferences  # noqa: E402
 from prompts import build_memory_result_response_messages, build_ollama_messages, format_relevant_memories  # noqa: E402
 from sidebar import ChatSidebar  # noqa: E402
 from widgets import AutoGrowingInput, CodeBlock, MarkdownView, MessageActions, MessageBubble  # noqa: E402
@@ -1510,6 +1511,198 @@ class ChatFoundationTests(unittest.TestCase):
         self.assertEqual(window.settings_overlay.store.search("favorite", include_archived=True), [])
         window.close()
 
+    def test_settings_overlay_opens_on_settings_tab(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        window.open_settings_overlay()
+        self.assertTrue(window.settings_overlay.isVisible())
+        self.assertIs(
+            window.settings_overlay.content_stack.currentWidget(),
+            window.settings_overlay.tab_pages["Settings"],
+        )
+        window.close()
+
+    def test_settings_button_toggles_overlay_open_and_close(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        self.assertFalse(window.settings_overlay.isVisible())
+        window.sidebar.settings_button.click()
+        self._wait_until(lambda: window.settings_overlay.isVisible())
+        window.sidebar.settings_button.click()
+        self._wait_until(lambda: not window.settings_overlay.isVisible())
+        window.sidebar.settings_button.click()
+        self._wait_until(lambda: window.settings_overlay.isVisible())
+        window.close()
+
+    def test_settings_tabs_clickable_and_switch_pages(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        window.open_settings_overlay()
+        self.assertTrue(all(button.isEnabled() for button in window.settings_overlay.tab_buttons))
+        for name in window.settings_overlay.tab_pages:
+            window.settings_overlay.select_tab(name)
+            self.assertIs(
+                window.settings_overlay.content_stack.currentWidget(),
+                window.settings_overlay.tab_pages[name],
+            )
+        window.settings_overlay.tab_buttons[2].click()
+        self.assertIs(
+            window.settings_overlay.content_stack.currentWidget(),
+            window.settings_overlay.tab_pages["Memory"],
+        )
+        window.close()
+
+    def test_theme_tab_applies_presets_and_manages_custom_presets(self) -> None:
+        window, temp_dir = self._window_with_temp_store()
+        window.show()
+        window.preferences.path = Path(temp_dir.name) / "prefs.json"
+        window.preferences.theme_name = "Violet"
+        window.preferences.theme_accent = "#8b5cf6"
+        window.preferences.custom_themes = []
+        window.preferences.save()
+        window.open_settings_overlay()
+        window.settings_overlay.select_tab("Theme")
+        self.assertIs(
+            window.settings_overlay.content_stack.currentWidget(),
+            window.settings_overlay.tab_pages["Theme"],
+        )
+        window.settings_overlay._apply_theme("Ocean")
+        self.assertEqual(window.preferences.theme_name, "Ocean")
+        self.assertEqual(window.preferences.theme_accent, "#0ea5e9")
+        window.settings_overlay._set_custom_accent("#112233")
+        self.assertEqual(window.preferences.theme_name, "Custom")
+        self.assertEqual(window.preferences.theme_accent, "#112233")
+        window.settings_overlay.preset_name_input.setText("My Theme")
+        window.settings_overlay._save_preset()
+        self.assertIn({"name": "My Theme", "accent": "#112233"}, window.preferences.custom_themes)
+        self.assertEqual(window.preferences.theme_name, "My Theme")
+        window.settings_overlay._delete_preset("My Theme")
+        self.assertNotIn({"name": "My Theme", "accent": "#112233"}, window.preferences.custom_themes)
+        self.assertEqual(window.preferences.theme_name, "Violet")
+        self.assertEqual(window.preferences.theme_accent, "#8b5cf6")
+        reloaded = Preferences()
+        reloaded.path = Path(temp_dir.name) / "prefs.json"
+        reloaded.load()
+        self.assertEqual(reloaded.theme_name, "Violet")
+        self.assertEqual(reloaded.theme_accent, "#8b5cf6")
+        window.close()
+
+    def test_settings_overlay_closes_on_outside_click_but_not_inside(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        window.open_settings_overlay()
+        self.assertTrue(window.settings_overlay.isVisible())
+        rect = window.settings_overlay.geometry()
+        inside = QPointF(rect.center().x(), rect.center().y())
+        inside_event = QMouseEvent(
+            QEvent.Type.MouseButtonPress, inside, inside,
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+        )
+        QApplication.sendEvent(window.chat_panel, inside_event)
+        self.assertTrue(window.settings_overlay.isVisible())
+        outside = QPointF(rect.center().x(), 0)
+        outside_event = QMouseEvent(
+            QEvent.Type.MouseButtonPress, outside, outside,
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+        )
+        QApplication.sendEvent(window.chat_panel, outside_event)
+        self._wait_until(lambda: not window.settings_overlay.isVisible())
+        window.close()
+
+    def test_sidebar_pinned_section_fixed_above_scroll_list(self) -> None:
+        sidebar = ChatSidebar()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ConversationStore(Path(temp_dir))
+            pinned = store.create(SYSTEM_PROMPT)
+            pinned.messages.append({"role": "user", "content": "Pinned one"})
+            store.save(pinned)
+            store.set_pinned(pinned.id, True)
+            normal = store.create(SYSTEM_PROMPT)
+            normal.messages.append({"role": "user", "content": "Normal one"})
+            store.save(normal)
+            sidebar.rebuild(store.grouped(), normal.id)
+
+            def rows_in(layout) -> list:
+                rows = []
+                for index in range(layout.count()):
+                    widget = layout.itemAt(index).widget()
+                    if widget is not None and widget.objectName() == "conversationRow":
+                        rows.append(widget)
+                return rows
+
+            pinned_rows = rows_in(sidebar.pinned_layout)
+            list_rows = rows_in(sidebar.list_layout)
+            self.assertEqual(len(pinned_rows), 1)
+            self.assertEqual(pinned_rows[0].conversation.id, pinned.id)
+            self.assertEqual(len(list_rows), 1)
+            self.assertEqual(list_rows[0].conversation.id, normal.id)
+            self.assertNotIn(pinned.id, [row.conversation.id for row in list_rows])
+        sidebar.close()
+
+    def test_set_active_moves_active_property_and_title_across_rows(self) -> None:
+        sidebar = ChatSidebar()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ConversationStore(Path(temp_dir))
+            a = store.create(SYSTEM_PROMPT)
+            store.rename(a.id, "Alpha")
+            a.messages.append({"role": "user", "content": "a"})
+            store.save(a)
+            b = store.create(SYSTEM_PROMPT)
+            store.rename(b.id, "Beta")
+            b.messages.append({"role": "user", "content": "b"})
+            store.save(b)
+            sidebar.rebuild(store.grouped(), a.id)
+
+            def rows() -> list:
+                found = []
+                for layout in (sidebar.pinned_layout, sidebar.list_layout):
+                    for index in range(layout.count()):
+                        widget = layout.itemAt(index).widget()
+                        if widget is not None and widget.objectName() == "conversationRow":
+                            found.append(widget)
+                return found
+
+            sidebar.set_active(b.id)
+            all_rows = rows()
+            active_rows = [row for row in all_rows if row.property("active")]
+            self.assertEqual(len(active_rows), 1)
+            self.assertEqual(active_rows[0].conversation.id, b.id)
+            self.assertEqual(active_rows[0].title.property("active"), True)
+            previous = [row for row in all_rows if row.conversation.id == a.id][0]
+            self.assertEqual(previous.property("active"), False)
+            self.assertEqual(previous.title.property("active"), False)
+        sidebar.close()
+
+    def test_selecting_active_conversation_does_not_rebuild(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        first = window.store.create(SYSTEM_PROMPT)
+        first.messages.append({"role": "user", "content": "Hello"})
+        window.store.save(first)
+        window.show()
+        window.select_conversation(first.id)
+        self._wait_until(lambda: window.updatesEnabled())
+        with patch.object(MainWindow, "_rebuild_messages") as rebuild:
+            window.select_conversation(first.id)
+            rebuild.assert_not_called()
+        window.close()
+
+    def test_rebuild_lands_at_bottom_without_scroll_changes(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        conversation = window.store.create(SYSTEM_PROMPT)
+        conversation.messages.append({"role": "user", "content": "Prompt"})
+        conversation.messages.append({"role": "assistant", "content": "Answer. " * 400})
+        window.store.save(conversation)
+        window.show()
+        window.select_conversation(conversation.id)
+        self._wait_until(lambda: window.updatesEnabled())
+        bar = window.scroll_area.verticalScrollBar()
+        self.assertEqual(bar.value(), bar.maximum())
+        before = (bar.value(), bar.maximum())
+        for _ in range(10):
+            self.app.processEvents()
+        self.assertEqual((bar.value(), bar.maximum()), before)
+        window.close()
+
     def test_send_and_stop_buttons_have_identical_larger_geometry(self) -> None:
         window, _temp_dir = self._window_with_temp_store()
         window.show()
@@ -1691,11 +1884,14 @@ class ChatFoundationTests(unittest.TestCase):
 
     def test_delete_active_conversation_confirms_and_returns_to_empty_chat(self) -> None:
         window, _temp_dir = self._window_with_temp_store()
+        window.show()
         window.messages.append({"role": "user", "content": "delete me"})
         window.store.save(window.conversation)
         deleted_id = window.conversation.id
-        with patch("main.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
-            window.delete_conversation(deleted_id)
+        window.delete_conversation(deleted_id)
+        self.assertTrue(window.confirm_overlay.isVisible())
+        window.confirm_overlay.confirm_button.click()
+        self.assertFalse(window.confirm_overlay.isVisible())
         self.assertIsNone(window.store.load_by_id(deleted_id))
         self.assertEqual(len(window.messages), 1)
         self.assertEqual(window.messages[0]["role"], "system")

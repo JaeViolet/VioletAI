@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMenu,
-    QMessageBox,
+    QPushButton,
     QLayout,
     QScrollArea,
     QSizePolicy,
@@ -136,6 +136,66 @@ class RequestPreparationWorker(QObject):
             self.stopped.emit()
 
 
+class ConfirmBackdrop(QFrame):
+    confirmed = Signal()
+    cancelled = Signal()
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setObjectName("confirmBackdrop")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.hide()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._card = QFrame(objectName="confirmCard")
+        layout.addWidget(self._card, 0, Qt.AlignmentFlag.AlignCenter)
+
+        card_layout = QVBoxLayout(self._card)
+        card_layout.setContentsMargins(24, 20, 24, 20)
+        card_layout.setSpacing(10)
+        self.title_label = QLabel(objectName="confirmCardTitle")
+        self.text_label = QLabel(objectName="confirmCardText")
+        self.text_label.setWordWrap(True)
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        buttons.addStretch()
+        self.cancel_button = QPushButton("Cancel", objectName="settingsActionButton")
+        self.confirm_button = QPushButton(objectName="settingsDangerButton")
+        self.cancel_button.clicked.connect(self._cancel)
+        self.confirm_button.clicked.connect(self.confirmed.emit)
+        buttons.addWidget(self.cancel_button)
+        buttons.addWidget(self.confirm_button)
+        card_layout.addWidget(self.title_label)
+        card_layout.addWidget(self.text_label)
+        card_layout.addLayout(buttons)
+
+    def set_message(self, title: str, text: str, confirm_text: str) -> None:
+        self.title_label.setText(title)
+        self.text_label.setText(text)
+        self.confirm_button.setText(confirm_text)
+
+    def show_overlay(self) -> None:
+        parent = self.parentWidget()
+        if parent is not None:
+            self.setGeometry(parent.rect())
+        self.raise_()
+        self.show()
+
+    def hide_overlay(self) -> None:
+        self.hide()
+
+    def mousePressEvent(self, event) -> None:
+        if not self._card.geometry().contains(event.position().toPoint()):
+            self._cancel()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def _cancel(self) -> None:
+        self.cancelled.emit()
+        self.hide_overlay()
+
+
 class MainWindow(QMainWindow):
     CONTENT_MAX_WIDTH = 760
     NEAR_BOTTOM_PX = 90
@@ -191,6 +251,9 @@ class MainWindow(QMainWindow):
         self._composer_total_state_changes = 0
         self._composer_layout_diagnostics: list[dict[str, object]] = []
         self._bulk_rebuilding_messages = False
+        self._rebuild_finish_active = False
+        self._rebuild_finish_tick = 0
+        self._last_finish_max: int | None = None
         self._composer_mode_timer = QTimer(self)
         self._composer_mode_timer.setSingleShot(True)
         self._composer_mode_timer.timeout.connect(self._update_composer_mode)
@@ -222,7 +285,7 @@ class MainWindow(QMainWindow):
         self.sidebar = ChatSidebar()
         self.sidebar.new_chat_requested.connect(self.new_chat)
         self.sidebar.search_requested.connect(self.open_search_overlay)
-        self.sidebar.settings_requested.connect(self.open_settings_overlay)
+        self.sidebar.settings_requested.connect(self.toggle_settings_overlay)
         self.sidebar.conversation_selected.connect(self.select_conversation)
         self.sidebar.pin_requested.connect(self.pin_conversation)
         self.sidebar.rename_requested.connect(self.rename_conversation)
@@ -248,6 +311,7 @@ class MainWindow(QMainWindow):
         self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll_area.verticalScrollBar().valueChanged.connect(self._handle_scroll_change)
+        self.scroll_area.verticalScrollBar().rangeChanged.connect(self._rebuild_range_changed)
         self.scroll_area.setWidget(self.message_container)
         self.scroll_area.viewport().installEventFilter(self)
         main_layout.addWidget(self.scroll_area, 1)
@@ -353,7 +417,10 @@ class MainWindow(QMainWindow):
         self.search_overlay.selected.connect(self._select_from_search)
         self.search_overlay.search_changed.connect(self._rebuild_search_results)
         self.settings_overlay = SettingsOverlay(self.memory_store, self.preferences, self.chat_panel)
-        
+        self.settings_overlay.theme_changed.connect(self._apply_style)
+        self.confirm_overlay = ConfirmBackdrop(self.chat_panel)
+        self.confirm_overlay.confirmed.connect(self._confirmed_delete_conversation)
+        self._pending_delete_conversation_id: str | None = None
 
     def _configure_model_selector(self, selector: QComboBox) -> None:
         selector.setToolTip("Select local Ollama model")
@@ -543,31 +610,80 @@ class MainWindow(QMainWindow):
         self.thinking_row = None
 
     def _rebuild_messages(self) -> None:
-        self._clear_message_rows()
-        visible_messages = [
-            (index, message)
-            for index, message in enumerate(self.messages)
-            if message.get("role") != "system"
-        ]
-        if not visible_messages:
-            self.message_layout.insertStretch(0, 2)
-            self.message_layout.insertWidget(1, self._make_welcome())
-            self.message_layout.insertStretch(2, 4)
-        else:
-            self._bulk_rebuilding_messages = True
-            try:
-                for index, message in visible_messages:
-                    self._add_message(message.get("content", ""), message.get("role", "assistant"), index)
-            finally:
-                self._bulk_rebuilding_messages = False
-        self._resize_rows()
-        self._scroll_to_bottom()
+        self.setUpdatesEnabled(False)
+        self._rebuild_finish_tick = 0
+        self._last_finish_max = None
+        try:
+            self._clear_message_rows()
+            visible_messages = [
+                (index, message)
+                for index, message in enumerate(self.messages)
+                if message.get("role") != "system"
+            ]
+            if not visible_messages:
+                self.message_layout.insertStretch(0, 2)
+                self.message_layout.insertWidget(1, self._make_welcome())
+                self.message_layout.insertStretch(2, 4)
+            else:
+                self._bulk_rebuilding_messages = True
+                try:
+                    for index, message in visible_messages:
+                        self._add_message(message.get("content", ""), message.get("role", "assistant"), index)
+                finally:
+                    self._bulk_rebuilding_messages = False
+            self._resize_rows()
+        finally:
+            QTimer.singleShot(0, self._finish_message_rebuild)
+
+    def _finish_message_rebuild(self) -> None:
+        bar = self.scroll_area.verticalScrollBar()
+        if bar is None:
+            self.setUpdatesEnabled(True)
+            return
+        self._rebuild_finish_active = True
+        self._rebuild_finish_tick += 1
+        if self._last_finish_max is not None:
+            self._resize_rows()
+        current_max = bar.maximum()
+        if self._last_finish_max == current_max and self._last_finish_max is not None:
+            self._finish_rebuild_scroll(current_max)
+            return
+        if self._rebuild_finish_tick > 8:
+            self._finish_rebuild_scroll(current_max)
+            return
+        self._last_finish_max = current_max
+        self._programmatic_scroll = True
+        bar.setValue(current_max)
+        self._programmatic_scroll = False
+        QTimer.singleShot(0, self._finish_message_rebuild)
+
+    def _finish_rebuild_scroll(self, current_max: int) -> None:
+        bar = self.scroll_area.verticalScrollBar()
+        self._rebuild_finish_active = False
+        if bar is not None:
+            self._programmatic_scroll = True
+            bar.setValue(current_max)
+            self._programmatic_scroll = False
+        self.setUpdatesEnabled(True)
+
+    def _rebuild_range_changed(self, _minimum: int, _maximum: int) -> None:
+        if not self._rebuild_finish_active:
+            return
+        bar = self.scroll_area.verticalScrollBar()
+        if bar is not None:
+            self._programmatic_scroll = True
+            bar.setValue(bar.maximum())
+            self._programmatic_scroll = False
 
     def _rebuild_sidebar(self) -> None:
-        self.sidebar.rebuild(
-            self.store.grouped(),
-            self.conversation.id,
-        )
+        self.setUpdatesEnabled(False)
+        try:
+            self.sidebar.rebuild(
+                self.store.grouped(),
+                self.conversation.id,
+            )
+        finally:
+            self.setUpdatesEnabled(True)
 
     def open_search_overlay(self) -> None:
         self._rebuild_search_results("")
@@ -597,9 +713,19 @@ class MainWindow(QMainWindow):
             watched is self.chat_panel
             and hasattr(self, "settings_overlay")
             and self.settings_overlay.isVisible()
-            and event.type() == QEvent.Type.Resize
         ):
-            QTimer.singleShot(0, self._position_settings_overlay)
+            if event.type() == QEvent.Type.MouseButtonPress:
+                if not self.settings_overlay.geometry().contains(event.position().toPoint()):
+                    self.settings_overlay.close_overlay()
+            if event.type() == QEvent.Type.Resize:
+                QTimer.singleShot(0, self._position_settings_overlay)
+        if (
+            watched is self.chat_panel
+            and hasattr(self, "confirm_overlay")
+            and self.confirm_overlay.isVisible()
+        ):
+            if event.type() == QEvent.Type.Resize:
+                QTimer.singleShot(0, self._position_confirm_overlay)
         if watched is self.scroll_area.viewport() and event.type() == QEvent.Type.Resize:
             QTimer.singleShot(0, self._resize_rows)
         if watched is self.scroll_area.viewport() and event.type() == QEvent.Type.MouseButtonPress:
@@ -619,9 +745,19 @@ class MainWindow(QMainWindow):
     def open_settings_overlay(self) -> None:
         self.settings_overlay.show_overlay()
 
+    def toggle_settings_overlay(self) -> None:
+        if self.settings_overlay.isVisible():
+            self.settings_overlay.close_overlay()
+        else:
+            self.settings_overlay.show_overlay()
+
     def _position_settings_overlay(self) -> None:
         if self.settings_overlay.isVisible():
             self.settings_overlay.show_overlay()
+
+    def _position_confirm_overlay(self) -> None:
+        if self.confirm_overlay.isVisible():
+            self.confirm_overlay.setGeometry(self.chat_panel.rect())
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
@@ -858,12 +994,15 @@ class MainWindow(QMainWindow):
         if conversation is None:
             self._rebuild_sidebar()
             return
+        if conversation_id == self.conversation.id:
+            self.input_box.setFocus()
+            return
         self.conversation = conversation
         self.messages = self.conversation.messages
         self.active_model = self.conversation.model or self.active_model
         self._set_model_selector(self.available_models)
         self._set_status("Ready")
-        self._rebuild_sidebar()
+        self.sidebar.set_active(conversation.id)
         self._rebuild_messages()
         self.input_box.setFocus()
 
@@ -886,14 +1025,19 @@ class MainWindow(QMainWindow):
         self._rebuild_sidebar()
 
     def delete_conversation(self, conversation_id: str) -> None:
-        response = QMessageBox.question(
-            self,
+        self._pending_delete_conversation_id = conversation_id
+        self.confirm_overlay.set_message(
             "Delete conversation",
             "Delete this conversation? This removes the saved JSON file.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+            "Delete",
         )
-        if response != QMessageBox.StandardButton.Yes:
+        self.confirm_overlay.show_overlay()
+
+    def _confirmed_delete_conversation(self) -> None:
+        self.confirm_overlay.hide_overlay()
+        conversation_id = self._pending_delete_conversation_id
+        self._pending_delete_conversation_id = None
+        if not conversation_id:
             return
         self.store.delete(conversation_id)
         if conversation_id == self.conversation.id:
@@ -1618,7 +1762,7 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def _apply_style(self) -> None:
-        self.setStyleSheet(app_stylesheet())
+        self.setStyleSheet(app_stylesheet(accent=self.preferences.theme_accent))
 
 
 def main() -> int:
