@@ -1,75 +1,97 @@
 # VioletAI Architecture
 
-VioletAI is a local desktop chat assistant. The UI is built with PySide6, the
-backend talks to a locally running [Ollama](https://ollama.com) server, and all
-state is stored as plain files under `data/`.
+## Purpose
 
-## Package layout
+VioletAI is a local-first personal AI assistant designed around continuity and growth.
 
-| Path | Purpose |
-| --- | --- |
-| `app/main.py` | Entry point. Builds the `QApplication`, creates `MainWindow`, runs the event loop. |
-| `core/config.py` | Central configuration: app name, Ollama endpoints, timeouts, data paths, `SYSTEM_PROMPT`. |
-| `core/engine.py` | `Engine` — chat orchestration. Owns a `QThread` + `OllamaWorker` per request and re-emits worker signals for the UI. Also re-exports `ModelManager`. |
-| `core/identity.py` | Personality. Contains `BASE_SYSTEM_PROMPT`, the assistant's behavioral identity. |
-| `core/prompts.py` | Prompt assembly. `build_ollama_messages()` produces the final message list sent to Ollama. |
-| `memory/manager.py` | Memory bridge. Defines the `MemoryBackend` interface (`save`, `get`, `search`, `delete`, `archive`, `restore`, `clear`) with `LocalMemoryBackend` (SQLite) and a `MemoryManager` facade. Deliberately an interface, not intelligence — the future home of a Letta adapter. |
-| `models/ollama.py` | Low-level Ollama client. `OllamaWorker` streams a chat request off the UI thread; `iter_message_chunks`, `parse_stream_line`, and the error hierarchy. |
-| `models/manager.py` | Model discovery. `discover_models()`, `ModelDiscoveryWorker`, and `ModelManager` (threaded wrapper). |
-| `conversations/manager.py` | Chat history. `ConversationStore` persists conversations as JSON files (grouping, search, pin, rename, delete). |
-| `ui/window.py` | `MainWindow` + `ConfirmBackdrop`. Composition and coordination: sidebar, chat view, composer modes, overlays, engine wiring. |
-| `ui/chat_view.py` | `ChatView` — message rendering, scrolling, and streaming display (`viewport_resized`/`regenerate_requested` signals). |
-| `ui/sidebar.py` | `ChatSidebar` + `SearchOverlay`. |
-| `ui/settings.py` | `SettingsOverlay` — settings page, theme page, and the memory tab. |
-| `ui/widgets.py` | Reusable widgets: `AutoGrowingInput`, `MessageBubble`, `MarkdownView`, `CodeBlock`, `MessageActions`, `ThinkingBubble`, `ModelSelector`. |
-| `ui/design.py` | Visual tokens: colors, `Motion`, and PNG icon helpers (`asset_icon_path`, `icon`). |
-| `ui/styles.py` | QSS application stylesheet. `app_stylesheet()` plus `lighten`/`darken` color helpers. |
-| `ui/themes.py` | Theme presets and accent colors. |
-| `ui/icons/` | PNG icon assets used by buttons and message actions. |
-| `ui/preferences.py` | `Preferences` — persisted user settings (selected model, theme, accent). |
-| `tools/manager.py` | Tool registry. `ToolSpec(name, description, handler)` dataclass and `available_tools()`; unimplemented tools render disabled ("Coming soon"). |
+The goal is to create an assistant that feels like a persistent extension of the user rather than a collection of disconnected conversations.
 
-## Runtime data
+## Core Principles
 
-`data/` is gitignored and holds:
+- Local-first design
+- Modular architecture
+- Clear separation of responsibilities
+- Replaceable components
+- User-controlled data
 
-- `data/conversations/*.json` — one JSON file per conversation.
-- `data/preferences.json` — user preferences.
-- `data/memory.db` — SQLite memory store.
+## Structure
 
-Paths are resolved from `core/config.py` (`PROJECT_ROOT` → `data/`).
+### Core
 
-## Request flow
+Responsible for VioletAI's main behavior and orchestration.
 
-1. User sends a message; `MainWindow.send_message()` appends it and calls
-   `_start_generation()`.
-2. `_start_generation()` builds Ollama messages via
-   `core.prompts.build_ollama_messages()` and calls `self.engine.start(...)`.
-3. `Engine` creates an `OllamaWorker` on a `QThread`; the worker streams
-   chunks from Ollama.
-4. Worker signals are re-emitted by `Engine` to `MainWindow`, which delegates
-   to `ChatView` for the streaming bubble, finalizes the answer, and persists
-   the conversation.
-5. On completion the thread is cleaned up and the controls re-enable.
+Includes:
 
-Model discovery (`ModelManager`) runs the same way: a `ModelDiscoveryWorker`
-fetches `/api/tags` off the UI thread and updates the model selectors.
+- assistant logic
+- identity and behavior
+- prompt construction
 
-## Concurrency notes
+### Models
 
-- `Engine` and `ModelManager` own their worker threads. The UI only observes
-  their signals, so widgets are never touched from worker threads.
-- `closeEvent` calls `engine.shutdown()` (cancel + join with timeout); if the
-  worker does not stop in time, the window defers closing until the thread
-  finishes.
+Handles AI model communication.
+
+Current support:
+
+- Ollama local models
+- model selection and management
+
+### Memory
+
+The memory layer provides an interface for persistent context.
+
+It is intentionally designed as a bridge between VioletAI and future memory systems. It should not contain AI decision-making, retrieval intelligence, or personality logic.
+
+Future integrations, such as Letta, should be replaceable without changing the rest of VioletAI.
+
+### Conversations
+
+Handles conversation history and storage.
+
+### UI
+
+Responsible for the desktop experience:
+
+- main window
+- chat interface
+- sidebar
+- settings
+- reusable components
+- themes
+
+### Tools
+
+Provides a foundation for future capabilities and integrations.
+
+## Design Goal
+
+VioletAI should grow with the user.
+
+Future systems should enhance the same assistant identity instead of creating disconnected features.
+
+## Current State
+
+Completed:
+
+- Desktop application foundation
+- Local model integration
+- Conversation system
+- Settings and themes
+- Modular project structure
+- Memory interface foundation
+
+In progress:
+
+- Persistent AI memory
+- Long-term continuity
+- Expanded assistant capabilities
+
+## Development Direction
+
+VioletAI is designed to evolve over time. New systems should extend the assistant while preserving a consistent identity and user experience.
 
 ## Testing
 
-The suite runs without an Ollama server: HTTP calls are mocked, and a temporary
-`ConversationStore`/`LocalMemoryBackend` is injected via `patch` on
-`ui.window`. Tests are split by domain in `tests/` (`test_core.py`,
-`test_ollama.py`, `test_chat_view.py`, `test_composer.py`, `test_sidebar.py`,
-`test_settings.py`) with a shared harness in `tests/base.py`. Run:
+Run:
 
 ```sh
 $env:QT_QPA_PLATFORM="offscreen"
