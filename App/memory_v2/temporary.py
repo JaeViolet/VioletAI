@@ -41,15 +41,18 @@ class TemporaryMemory:
     def __init__(self, store: MemoryStore, config: TemporaryConfig | None = None) -> None:
         self.store = store
         self.config = config or TemporaryConfig()
-        self.token_counter = 0
-        self.conversation_index = 0
-        self._last_conversation_id: str | None = None
+        self.token_counter = self.store.get_global("token_counter")
+        self.conversation_index = self.store.get_global("conversation_index")
+        self._last_conversation_id = self.store.get_global_str("last_conversation_id") or None
 
     def begin_turn(self, conversation_id: str, token_count: int = 0) -> tuple[int, int]:
         self.token_counter += token_count
         if conversation_id != self._last_conversation_id:
             self.conversation_index += 1
             self._last_conversation_id = conversation_id
+        self.store.set_global("token_counter", self.token_counter)
+        self.store.set_global("conversation_index", self.conversation_index)
+        self.store.set_global_str("last_conversation_id", self._last_conversation_id or "")
         return self.token_counter, self.conversation_index
 
     def sweep(self) -> list[tuple[TemporaryRecord, str]]:

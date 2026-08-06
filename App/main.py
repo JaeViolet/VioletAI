@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 import sys
 import os
 from time import perf_counter
@@ -38,7 +39,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from config import APP_FOOTER_TEXT, APP_NAME, DEFAULT_MODEL_NAME, MEMORY_DB_PATH, SYSTEM_PROMPT
+from config import (
+    APP_FOOTER_TEXT,
+    APP_NAME,
+    DEFAULT_MODEL_NAME,
+    MEMORY_DB_PATH,
+    MEMORY_LOG_PATH,
+    SYSTEM_PROMPT,
+)
 from conversation_store import Conversation, ConversationStore
 from design import Motion, PNG_CONTROL_ICON_SIZE, app_stylesheet, icon
 from memory_manager import SettingsOverlay
@@ -1062,7 +1070,25 @@ class MainWindow(QMainWindow):
         self.prep_thread.start()
 
     def _receive_prepared_request(self, prepared: PreparedRequest) -> None:
+        self._record_memory_mutation(prepared.outcome)
         self._start_generation(prepared.ollama_messages, prompt_already_recorded=True, show_thinking=False)
+
+    def _record_memory_mutation(self, outcome: object) -> None:
+        if os.environ.get("VIOLETAI_MEMORY_LOG") != "1":
+            return
+        action = getattr(outcome, "action", None)
+        if action is None:
+            return
+        kind = getattr(action, "value", str(action))
+        status = getattr(getattr(outcome, "action_status", None), "value", "?")
+        retrieval = getattr(outcome, "retrieval", None)
+        injected = bool(getattr(retrieval, "injected", False))
+        try:
+            MEMORY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(MEMORY_LOG_PATH, "a", encoding="utf-8") as handle:
+                handle.write(f"{datetime.now(UTC).isoformat()} action={kind} status={status} injected={injected}\n")
+        except OSError:
+            pass
 
     def _request_preparation_failed(self, error: str) -> None:
         render_started = perf_counter()
@@ -1131,7 +1157,11 @@ class MainWindow(QMainWindow):
                 (message.get("content", "") for message in reversed(self.messages) if message.get("role") == "user"),
                 "",
             )
-            retrieval = self.memory_service.retrieve(last_user_message)
+            retrieval = self.memory_service.retrieve(
+                last_user_message,
+                token_counter=self.memory_service.temporary.token_counter,
+                conversation_index=self.memory_service.temporary.conversation_index,
+            )
             relevant_memories = [item.record for item in retrieval.selected]
             prompt_started = perf_counter()
             ollama_messages = build_ollama_messages(self.messages, relevant_memories, SYSTEM_PROMPT)

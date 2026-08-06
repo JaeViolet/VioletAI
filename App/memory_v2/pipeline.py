@@ -31,6 +31,7 @@ from memory_v2.models import (
 )
 from memory_v2.operations import OperationContext, Operations
 from memory_v2.retrieval import Retriever
+from memory_v2.semantic import SemanticEmbedder
 from memory_v2.store import MemoryStore
 from memory_v2.temporary import TemporaryConfig, TemporaryMemory
 
@@ -58,6 +59,7 @@ class MemorySystem:
         config: MemorySystemConfig | None = None,
         temporary_config: TemporaryConfig | None = None,
         consolidation_config: ConsolidationConfig | None = None,
+        embedder: SemanticEmbedder | None = None,
     ) -> None:
         self.store = store
         self.config = config or MemorySystemConfig()
@@ -67,6 +69,7 @@ class MemorySystem:
             store,
             max_results=self.config.max_results,
             injection_threshold=self.config.injection_threshold,
+            embedder=embedder,
         )
         self.temporary = TemporaryMemory(store, temporary_config)
         self.consolidator = Consolidator(store, consolidation_config)
@@ -99,9 +102,15 @@ class MemorySystem:
 
         if analysis.is_question_about_memory:
             if _is_meta_memory_question(user_text):
-                retrieval = self.retriever.retrieve(user_text, include_all=True, mark_accessed=True)
+                retrieval = self.retriever.retrieve(
+                    user_text, include_all=True, mark_accessed=True,
+                    token_counter=token_counter, conversation_index=conversation_index,
+                )
             else:
-                retrieval = self.retriever.retrieve(user_text, include_all=False, mark_accessed=True)
+                retrieval = self.retriever.retrieve(
+                    user_text, include_all=False, mark_accessed=True,
+                    token_counter=token_counter, conversation_index=conversation_index,
+                )
             return TurnOutcome(
                 memory_related=True,
                 messages=[],
@@ -119,7 +128,10 @@ class MemorySystem:
                 diagnostics=self._diagnostics(context),
             )
 
-        retrieval = self.retriever.retrieve(user_text, include_all=False, mark_accessed=True)
+        retrieval = self.retriever.retrieve(
+            user_text, include_all=False, mark_accessed=True,
+            token_counter=token_counter, conversation_index=conversation_index,
+        )
 
         outcome: MutationOutcome | None = None
         if analysis.command is not None:
@@ -145,8 +157,26 @@ class MemorySystem:
             extra={"analysis_reason": analysis.reason},
         )
 
-    def retrieve(self, query: str, *, include_all: bool = False, mark_accessed: bool = True) -> RetrievalOutcome:
-        return self.retriever.retrieve(query, include_all=include_all, mark_accessed=mark_accessed)
+    def retrieve(
+        self,
+        query: str,
+        *,
+        include_all: bool = False,
+        mark_accessed: bool = True,
+        token_counter: int | None = None,
+        conversation_index: int | None = None,
+    ) -> RetrievalOutcome:
+        if token_counter is None:
+            token_counter = self.temporary.token_counter
+        if conversation_index is None:
+            conversation_index = self.temporary.conversation_index
+        return self.retriever.retrieve(
+            query,
+            include_all=include_all,
+            mark_accessed=mark_accessed,
+            token_counter=token_counter,
+            conversation_index=conversation_index,
+        )
 
     # ------------------------------------------------------------ lifecycle
 

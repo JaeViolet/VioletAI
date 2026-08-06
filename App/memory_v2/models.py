@@ -80,6 +80,14 @@ class ParsedMemory:
     provenance: Provenance = field(default_factory=Provenance)
     unresolved: bool = False
     language: str = "en"
+    attribute: str = ""
+    attribute_core: str = ""
+    statement: str = ""
+    aliases: list[str] = field(default_factory=list)
+    related_entities: list[str] = field(default_factory=list)
+    qualifiers: dict[str, Any] = field(default_factory=dict)
+    valid_from: str | None = None
+    valid_to: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -106,6 +114,14 @@ class MemoryRecord:
     manually_edited: bool = False
     edit_count: int = 0
     language: str = "en"
+    attribute: str = ""
+    attribute_core: str = ""
+    statement: str = ""
+    aliases: list[str] = field(default_factory=list)
+    related_entities: list[str] = field(default_factory=list)
+    qualifiers: dict[str, Any] = field(default_factory=dict)
+    valid_from: str | None = None
+    valid_to: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -139,6 +155,28 @@ class TemporaryRecord:
     unresolved: int = 0
     status: str = "active"
     language: str = "en"
+    attribute: str = ""
+    attribute_core: str = ""
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def layer(self) -> MemoryLayer:
+        return MemoryLayer.TEMPORARY
+
+
+@dataclass(slots=True)
+class Episode:
+    id: str
+    created_at: str
+    kind: str
+    subject: str
+    title: str
+    content: str
+    source_conversation_id: str | None = None
+    start_at: str | None = None
+    end_at: str | None = None
+    importance: int = 5
+    entity_ids: list[str] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
 
 

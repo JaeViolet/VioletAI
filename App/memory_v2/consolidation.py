@@ -45,6 +45,11 @@ class ConsolidationConfig:
         {"favorite", "favourite", "fav", "preferred", "current", "old", "best", "worst"}
     )
     value_similarity_threshold: float = 0.9
+    protected_attribute_cores: frozenset[str] = frozenset({
+        "name", "occupation", "birthday", "birthdate", "phone number", "phone",
+        "email", "email address", "location", "address", "home address",
+        "primary language", "gender", "pronouns",
+    })
 
 
 @dataclass(slots=True)
@@ -98,6 +103,18 @@ class Consolidator:
                         }
                     )
                     continue
+                if other.manually_edited:
+                    result.skipped_conflicts.append(
+                        {
+                            "keeper": keeper.id,
+                            "other": other.id,
+                            "key": keeper.key,
+                            "reason": "protected_manually_edited",
+                            "keeper_value": keeper.value,
+                            "other_value": other.value,
+                        }
+                    )
+                    continue
                 self.store.archive_memory(other.id)
                 self.store.set_supersede(other.id, keeper.id)
                 self.store.record_event(
@@ -126,6 +143,8 @@ class Consolidator:
         for record in self.store.list_memories(include_archived=False):
             if record.layer != MemoryLayer.DURABLE:
                 continue
+            if self._is_protected(record):
+                continue
             if record.importance > self.config.stale_max_importance:
                 continue
             if record.access_count > 0:
@@ -140,6 +159,12 @@ class Consolidator:
                 detail={"key": record.key, "value": record.value, "age_days": self.config.stale_days},
             )
             result.archived_stale.append(record.id)
+
+    def _is_protected(self, record: MemoryRecord) -> bool:
+        if record.manually_edited:
+            return True
+        core = record.attribute_core or attribute_core(record.key)
+        return core in self.config.protected_attribute_cores
 
     def _recompute_importance(self, result: ConsolidationResult) -> None:
         count = 0

@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 
 from memory_v2.models import MemoryCommand, MutationKind, ParsedMemory, Provenance, TurnAnalysis
-from memory_v2.normalize import canonical_text
+from memory_v2.normalize import SYNONYMS, canonical_text
 
 _TRAILING_EMOTICON = re.compile(
     r"\s*(?:[:;=8xX][-']?[)(DPpOo/\\]|[🙂😊😉😄😃😂🤣😅🥲]+)\s*$"
@@ -33,6 +33,9 @@ _QUESTION_PATTERNS = (
     re.compile(r"^do\s+you\s+remember\s+me\b", re.IGNORECASE),
     re.compile(r"^(?:do you\s+)?(?:still\s+)?(?:remember|know)\s+(?:my|what)\b", re.IGNORECASE),
     re.compile(r"^what(?:'s| is)\s+my\b", re.IGNORECASE),
+    re.compile(r"^what(?:'s| is)\s+(?:your|our)\b", re.IGNORECASE),
+    re.compile(r"^what(?:'s| is| was| are)\s+[A-Za-z][\w-]*'s\b", re.IGNORECASE),
+    re.compile(r"^when(?:'s| is| was)\s+[A-Za-z][\w-]*'s\b", re.IGNORECASE),
     re.compile(r"^(?:tell me|what do you know)\s+(?:about\s+)?(?:me|my)\b", re.IGNORECASE),
     re.compile(r"^what\s+have\s+you\s+(?:saved|remembered)\b", re.IGNORECASE),
     re.compile(r"^(?:can\s+)?you\s+see\s+(?:my\s+)?memor", re.IGNORECASE),
@@ -64,6 +67,7 @@ _UPDATES = (
     re.compile(r"^(?:update|change|edit) my (?P<key>.+?) to (?P<value>.+)$", re.IGNORECASE),
     re.compile(r"^replace my (?P<key>.+?) with (?P<value>.+)$", re.IGNORECASE),
     re.compile(r"^replace (?:the )?(?P<key>.+?) you have saved with (?P<value>.+)$", re.IGNORECASE),
+    re.compile(r"^(?:update|change|edit) (?P<key>[A-Za-z][\w-]*'s .+?) to (?P<value>.+)$", re.IGNORECASE),
     re.compile(r"^my (?P<key>.+?) is now (?P<value>.+)$", re.IGNORECASE),
     re.compile(r"^my (?P<key>.+?) is (?P<value>.+?) now$", re.IGNORECASE),
     re.compile(
@@ -100,6 +104,9 @@ _FACT_PATTERNS = (
     ("preference", r"^i like (?P<value>.+)$", "Preferences"),
     ("project", r"^i(?: am|'?m) building (?P<value>.+)$", "Projects"),
     ("project description", r"^project (?P<key>.+?) is (?P<value>.+)$", "Projects"),
+    ("people <attr>", r"^(?P<name>[A-Za-z][\w-]*)'s (?P<key>.+?) is (?P<value>.+)$", "People"),
+    ("people occupation", r"^(?P<name>[A-Za-z][\w-]*) works (?:as|at) (?P<value>.+)$", "People"),
+    ("people location", r"^(?P<name>[A-Za-z][\w-]*) lives in (?P<value>.+)$", "People"),
 )
 
 _TEMPORARY_PATTERNS = (
@@ -119,6 +126,16 @@ _DEVICE_NORMALIZATION = {
     "macbook": "MacBook",
     "pc": "PC",
 }
+
+_PERSON_NAME_BLOCKLIST = frozenset({
+    "my", "your", "our", "his", "her", "its", "their", "the",
+    "a", "an", "it", "this", "that", "these", "those", "they",
+    "we", "you", "i", "me", "us", "them",
+})
+
+_KEY_TOKEN_RE = re.compile(r"[\w']+")
+
+_KEY_SYNONYMS = {key: value for key, value in SYNONYMS.items() if key != "work"}
 
 _DELETE_PREFIXES = (
     re.compile(r"^forget\s+(?P<body>.*)$", re.IGNORECASE),
@@ -350,6 +367,27 @@ class Extractor:
                 if not key:
                     continue
                 key = _normalize_attribute_key(key)
+            if key_hint == "people <attr>":
+                name = clean_value(groups.get("name") or "")
+                if name.casefold() in _PERSON_NAME_BLOCKLIST:
+                    continue
+                key = clean_value(groups.get("key") or "")
+                if not key:
+                    continue
+                key = _normalize_attribute_key(key)
+                subject = name
+            if key_hint == "people occupation":
+                name = clean_value(groups.get("name") or "")
+                if name.casefold() in _PERSON_NAME_BLOCKLIST:
+                    continue
+                key = "occupation"
+                subject = name
+            if key_hint == "people location":
+                name = clean_value(groups.get("name") or "")
+                if name.casefold() in _PERSON_NAME_BLOCKLIST:
+                    continue
+                key = "location"
+                subject = name
             if key_hint == "device":
                 key = "device"
                 raw_value = _normalize_device(raw_value)
@@ -425,7 +463,10 @@ def _clean_delete_body(body: str) -> str:
 
 
 def _normalize_attribute_key(key: str) -> str:
-    text = canonical_text(key)
+    text = " ".join(str(key or "").split()).casefold()
+    words = _KEY_TOKEN_RE.findall(text)
+    words = [_KEY_SYNONYMS.get(word, word) for word in words]
+    text = " ".join(words)
     text = re.sub(r"\bfavorite\s+favorite\b", "favorite", text)
     return " ".join(text.split())
 

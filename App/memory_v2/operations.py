@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from memory_v2.attributes import attribute_identity, parse_reference, subject_matches
 from memory_v2.models import (
     MemoryCommand,
     MemoryLayer,
@@ -393,18 +394,37 @@ class Operations:
         query = canonical_text(key)
         if not query:
             return []
+        reference = parse_reference(key)
+        records = self.store.list_memories()
+        if reference is not None and reference.explicit_subject:
+            records = [record for record in records if subject_matches(reference.subject, record.subject)]
+        if not records:
+            return []
         scored: list[tuple[float, MemoryRecord]] = []
-        for record in self.store.list_memories():
+        for record in records:
             record_key = canonical_text(record.key)
             score = 0.0
-            if keys_equivalent(record_key, query):
-                score = 10.0
-            elif query in record_key or record_key in query:
-                score = 8.0
-            elif len(query.split()) >= 2 and subjects_overlap(record.subject, query):
-                score = 6.0
-            elif record.subject and canonical_text(record.subject) in query:
-                score = 6.0
+            if (
+                reference is not None
+                and not reference.is_generic_only
+                and reference.identity
+                and attribute_identity(record.key) == reference.identity
+            ):
+                score = 12.0
+                if (
+                    keys_equivalent(record_key, canonical_text(reference.phrase))
+                    or _phrase_equals(reference.phrase, record.key)
+                ):
+                    score = 14.0
+            else:
+                if keys_equivalent(record_key, query):
+                    score = 10.0
+                elif query in record_key or record_key in query:
+                    score = 8.0
+                elif len(query.split()) >= 2 and subjects_overlap(record.subject, query):
+                    score = 6.0
+                elif record.subject and canonical_text(record.subject) in query:
+                    score = 6.0
             if score:
                 scored.append((score, record))
         scored.sort(key=lambda item: (item[0], item[1].updated_at), reverse=True)
@@ -414,12 +434,25 @@ class Operations:
         query = canonical_text(key)
         if not query:
             return []
+        reference = parse_reference(key)
+        records = self.store.list_temporary()
+        if reference is not None and reference.explicit_subject:
+            records = [record for record in records if subject_matches(reference.subject, record.subject)]
+        if not records:
+            return []
         scored: list[tuple[float, TemporaryRecord]] = []
-        for record in self.store.list_temporary():
+        for record in records:
             record_key = canonical_text(record.key)
             record_value = canonical_text(record.value)
             score = 0.0
-            if keys_equivalent(record_key, query):
+            if (
+                reference is not None
+                and not reference.is_generic_only
+                and reference.identity
+                and attribute_identity(record.key) == reference.identity
+            ):
+                score = 12.0
+            elif keys_equivalent(record_key, query):
                 score = 10.0
             elif query in record_key or record_key in query:
                 score = 8.0
@@ -474,3 +507,7 @@ class Operations:
 
 def _values_equal(left: str, right: str) -> bool:
     return left.casefold() == right.casefold()
+
+
+def _phrase_equals(left: str, right: str) -> bool:
+    return " ".join((left or "").split()).casefold() == " ".join((right or "").split()).casefold()

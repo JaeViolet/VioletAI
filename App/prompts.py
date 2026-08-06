@@ -33,8 +33,16 @@ def format_relevant_memories(memories: list[object]) -> str:
         key = getattr(memory, "key", "")
         value = getattr(memory, "value", "")
         content = getattr(memory, "content", "")
-        label = key.replace("_", " ").strip().capitalize() if key else "Memory"
-        lines.append(f"- {label}: {value or content}")
+        statement = getattr(memory, "statement", "") or ""
+        if statement:
+            label = statement
+        else:
+            label = f"{key.replace('_', ' ').strip().capitalize() if key else 'Memory'}: {value or content}"
+        layer = getattr(memory, "layer", None)
+        layer_value = getattr(layer, "value", "") if layer is not None else ""
+        if layer_value == "temporary":
+            label = f"{label} (temporary context)"
+        lines.append(f"- {label}")
     lines.append("[/Relevant user memories]")
     return "\n".join(lines)
 

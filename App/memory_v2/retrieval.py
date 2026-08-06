@@ -16,9 +16,15 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 
-from memory_v2.embeddings import cosine_similarity, embed_key_value, embed_text
+from memory_v2.attributes import (
+    GENERIC_MODIFIERS,
+    attribute_identity,
+    parse_reference,
+    subject_matches,
+)
 from memory_v2.models import MemoryLayer, MemoryRecord, RankedMemory, RetrievalOutcome, TemporaryRecord
 from memory_v2.normalize import canonical_text, keys_equivalent, subjects_overlap
+from memory_v2.semantic import LocalHashSemanticEmbedder, SemanticEmbedder
 from memory_v2.store import MemoryStore
 
 STOPWORDS = frozenset({
@@ -33,8 +39,6 @@ STOPWORDS = frozenset({
 })
 
 _WORD_RE = re.compile(r"[\w']+")
-
-_GENERIC_ATTRIBUTE_MODIFIERS = frozenset({"favorite", "favourite", "fav", "preferred"})
 
 _CURRENT_STATE_QUERY = (
     re.compile(
@@ -59,11 +63,13 @@ class Retriever:
         max_results: int = 6,
         injection_threshold: float = 6.0,
         semantic_threshold: float = 0.20,
+        embedder: SemanticEmbedder | None = None,
     ) -> None:
         self.store = store
         self.max_results = max_results
         self.injection_threshold = injection_threshold
         self.semantic_threshold = semantic_threshold
+        self.embedder = embedder or LocalHashSemanticEmbedder()
 
     def retrieve(
         self,
@@ -72,6 +78,8 @@ class Retriever:
         include_all: bool = False,
         mark_accessed: bool = True,
         max_results: int | None = None,
+        token_counter: int | None = None,
+        conversation_index: int | None = None,
     ) -> RetrievalOutcome:
         query = (query or "").strip()
         outcome = RetrievalOutcome(query=query)
@@ -82,17 +90,20 @@ class Retriever:
 
         query_terms = set(_WORD_RE.findall(query.casefold()))
         query_content_terms = query_terms - STOPWORDS
-        query_embedding = embed_text(query)
+        query_embedding = self.embedder.embed_text(query)
+        reference = parse_reference(query)
 
         ranked: list[RankedMemory] = []
         current_state = any(pattern.search(query) for pattern in _CURRENT_STATE_QUERY)
         for record in self.store.list_memories():
-            score, reason = self._score_record(record, query, query_content_terms, query_embedding)
+            score, reason = self._score_record(
+                record, query, query_content_terms, query_embedding, reference
+            )
             if include_all or score > 0:
                 ranked.append(RankedMemory(record=record, score=score, reason=reason, layer=MemoryLayer.DURABLE))
         for record in self.store.list_temporary():
             score, reason = self._score_temporary(
-                record, query, query_content_terms, query_embedding, current_state=current_state
+                record, query, query_content_terms, query_embedding, reference, current_state=current_state
             )
             if include_all or score > 0:
                 ranked.append(RankedMemory(record=record, score=score, reason=reason, layer=MemoryLayer.TEMPORARY))
@@ -115,8 +126,10 @@ class Retriever:
                 if item.layer == MemoryLayer.TEMPORARY and isinstance(item.record, TemporaryRecord):
                     self.store.touch_temporary(
                         item.record.id,
-                        token_counter=item.record.token_at_last_seen,
-                        conversation_index=item.record.conversation_at_last_seen,
+                        token_counter=token_counter if token_counter is not None else item.record.token_at_last_seen,
+                        conversation_index=(
+                            conversation_index if conversation_index is not None else item.record.conversation_at_last_seen
+                        ),
                     )
         return outcome
 
@@ -126,9 +139,12 @@ class Retriever:
         query: str,
         query_content_terms: set[str],
         query_embedding: dict[str, float],
+        reference,
     ) -> tuple[float, str]:
-        record_key_terms = set(canonical_text(record.key).split()) - _GENERIC_ATTRIBUTE_MODIFIERS
-        query_key_terms = query_content_terms - _GENERIC_ATTRIBUTE_MODIFIERS
+        if reference is not None and reference.explicit_subject and not subject_matches(reference.subject, record.subject):
+            return 0.0, ""
+        record_key_terms = set(canonical_text(record.key).split()) - GENERIC_MODIFIERS
+        query_key_terms = query_content_terms - GENERIC_MODIFIERS
         record_subject_terms = set(canonical_text(record.subject).split())
         record_value_terms = set(canonical_text(record.value).split())
         key_overlap = len(query_key_terms & record_key_terms)
@@ -138,6 +154,18 @@ class Retriever:
 
         score = 0.0
         reasons: list[str] = []
+        if (
+            reference is not None
+            and not reference.is_generic_only
+            and reference.identity
+            and attribute_identity(record.key) == reference.identity
+            and subject_matches(reference.subject, record.subject)
+        ):
+            score += 14.0
+            reasons.append("attribute match")
+            if _phrase_equals(reference.phrase, record.key):
+                score += 4.0
+                reasons.append("exact attribute phrase")
         if exact_key:
             score += 18.0
             reasons.append("exact key")
@@ -154,9 +182,9 @@ class Retriever:
             score += 1.5 * value_overlap
             reasons.append("value tokens")
 
-        similarity = cosine_similarity(
+        similarity = self.embedder.cosine_similarity(
             query_embedding,
-            embed_key_value(record.key, record.value, record.subject, record.category),
+            self.embedder.embed_key_value(record.key, record.value, record.subject, record.category),
         )
         guard_suppressed = len(query_content_terms) >= 2 and key_overlap == 0 and subject_overlap == 0
         if similarity >= self.semantic_threshold and not guard_suppressed:
@@ -176,11 +204,14 @@ class Retriever:
         query: str,
         query_content_terms: set[str],
         query_embedding: dict[str, float],
+        reference,
         *,
         current_state: bool = False,
     ) -> tuple[float, str]:
-        record_key_terms = set(canonical_text(record.key).split()) - _GENERIC_ATTRIBUTE_MODIFIERS
-        query_key_terms = query_content_terms - _GENERIC_ATTRIBUTE_MODIFIERS
+        if reference is not None and reference.explicit_subject and not subject_matches(reference.subject, record.subject):
+            return 0.0, ""
+        record_key_terms = set(canonical_text(record.key).split()) - GENERIC_MODIFIERS
+        query_key_terms = query_content_terms - GENERIC_MODIFIERS
         record_value_terms = set(canonical_text(record.value).split())
         key_overlap = len(query_key_terms & record_key_terms)
         value_overlap = len(query_content_terms & record_value_terms)
@@ -191,6 +222,18 @@ class Retriever:
         if current_state and record.key in _TEMPORARY_CONTEXT_KEYS:
             score += 9.0
             reasons.append("current-state query")
+        if (
+            reference is not None
+            and not reference.is_generic_only
+            and reference.identity
+            and attribute_identity(record.key) == reference.identity
+            and subject_matches(reference.subject, record.subject)
+        ):
+            score += 12.0
+            reasons.append("attribute match")
+            if _phrase_equals(reference.phrase, record.key):
+                score += 3.0
+                reasons.append("exact attribute phrase")
         if key_overlap:
             score += 8.0 + 1.5 * key_overlap
             reasons.append("key tokens")
@@ -200,9 +243,9 @@ class Retriever:
         if subject_overlap:
             score += 3.0
             reasons.append("subject")
-        similarity = cosine_similarity(
+        similarity = self.embedder.cosine_similarity(
             query_embedding,
-            embed_key_value(record.key, record.value, record.subject, "Temporary"),
+            self.embedder.embed_key_value(record.key, record.value, record.subject, "Temporary"),
         )
         guard_suppressed = len(query_content_terms) >= 2 and key_overlap == 0 and subject_overlap == 0
         if similarity >= self.semantic_threshold and not guard_suppressed:
@@ -217,6 +260,10 @@ class Retriever:
 
 def _timestamp(value: str) -> str:
     return value or ""
+
+
+def _phrase_equals(left: str, right: str) -> bool:
+    return " ".join((left or "").split()).casefold() == " ".join((right or "").split()).casefold()
 
 
 def _recency(value: str) -> float:

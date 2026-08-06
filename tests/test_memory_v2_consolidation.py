@@ -139,6 +139,34 @@ class ConsolidatorTests(unittest.TestCase):
         result = self.consolidator.consolidate()
         self.assertNotIn(record.id, [u["id"] for u in result.importance_updates])
 
+    def test_protected_attribute_never_stale_archived(self) -> None:
+        occupation = self.store.insert_memory(
+            make_parsed(category="User", key="job", value="engineer", importance=2)
+        )
+        _set_age(self.store, occupation.id, days_old=200)
+        result = self.consolidator.consolidate()
+        self.assertNotIn(occupation.id, result.archived_stale)
+        self.assertEqual(self.store.get_memory(occupation.id).layer, MemoryLayer.DURABLE)
+
+    def test_manually_edited_never_stale_archived(self) -> None:
+        record = self.store.insert_memory(make_parsed(key="old note", value="confirmed detail", importance=2))
+        _set_age(self.store, record.id, days_old=200)
+        self.store.update_memory(record.id, manual=True)
+        result = self.consolidator.consolidate()
+        self.assertNotIn(record.id, result.archived_stale)
+        self.assertEqual(self.store.get_memory(record.id).layer, MemoryLayer.DURABLE)
+
+    def test_manually_edited_duplicate_not_archived_by_merge(self) -> None:
+        older = self.store.insert_memory(make_parsed(value="violet"))
+        self.store.update_memory(older.id, manual=True)
+        newer = self.store.insert_memory(make_parsed(value="violet"))
+        result = self.consolidator.consolidate()
+        self.assertEqual(result.merged, [])
+        self.assertEqual(len(result.skipped_conflicts), 1)
+        self.assertEqual(result.skipped_conflicts[0]["reason"], "protected_manually_edited")
+        self.assertEqual(self.store.get_memory(older.id).layer, MemoryLayer.DURABLE)
+        self.assertEqual(self.store.get_memory(newer.id).layer, MemoryLayer.DURABLE)
+
     def test_empty_store_result_unchanged(self) -> None:
         result = self.consolidator.consolidate()
         self.assertFalse(result.changed)

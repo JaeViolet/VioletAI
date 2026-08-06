@@ -66,6 +66,8 @@ Every architectural decision should support one or more of these goals.
   - [App/memory_v2/models.py](#appmemory_v2modelspy)
   - [App/memory_v2/normalize.py](#appmemory_v2normalizepy)
   - [App/memory_v2/embeddings.py](#appmemory_v2embeddingspy)
+  - [App/memory_v2/attributes.py](#appmemory_v2attributespy)
+  - [App/memory_v2/semantic.py](#appmemory_v2semanticpy)
   - [App/memory_v2/store.py](#appmemory_v2storepy)
   - [App/memory_v2/extract.py](#appmemory_v2extractpy)
   - [App/memory_v2/operations.py](#appmemory_v2operationspy)
@@ -240,6 +242,10 @@ Important architectural decisions:
 - Request preparation runs before Ollama generation and is offloaded to avoid UI blocking.
 - Every user message follows exactly one response path: preparation (which may save/retrieve memory invisibly) followed by a single conversational-model stream. There is no separate post-memory response path.
 - Memory operates automatically and invisibly; the app never renders memory confirmations.
+- `_receive_prepared_request()` records mutation details to the memory log when
+  `VIOLETAI_MEMORY_LOG=1` (opt-in, off in tests), then starts generation.
+- The regenerate path passes the current temporary counters to `retrieve()` so
+  reinforcement stays consistent.
 - Response ownership is guarded by `_finalized_current_response` so multiple paths do not append the same assistant message.
 - Streaming is throttled through a render timer so every chunk does not force full layout work.
 - Composer resizing uses deferred/stable event-loop updates to avoid layout feedback loops.
@@ -285,6 +291,7 @@ Important objects:
 - `ProvenanceKind` (explicit / automatic / imported / restored)
 - `MutationKind`, `MutationStatus`
 - `ParsedMemory`, `MemoryRecord`, `TemporaryRecord`
+- `Episode`
 - `Provenance`
 - `RankedMemory`, `RetrievalOutcome`
 - `MemoryCommand`, `TurnAnalysis`, `TurnOutcome`
@@ -293,6 +300,11 @@ Important constraints:
 
 - Category names are part of schema/UI behavior.
 - Changing fields affects store, operations, retrieval, UI, and tests.
+- `ParsedMemory`/`MemoryRecord` carry structured attribute fields (`attribute`,
+  `attribute_core`, `statement`, `aliases`, `related_entities`, `qualifiers`,
+  `valid_from`, `valid_to`) used by retrieval and prompt injection.
+- `TemporaryRecord.layer` is a property that always returns `TEMPORARY`, so
+  prompt/formatting code can treat records uniformly.
 
 Subsystem: memory models.
 
@@ -328,6 +340,55 @@ Important constraints:
 - Local-only and dependency-light.
 - Deterministic: the same input always yields the same vector.
 - Approximate but predictable; exact meaning still wins over loose similarity.
+- This is the concrete backend wrapped by `semantic.py`; keep the module-level
+  functions stable because tests import them directly.
+
+Subsystem: memory retrieval.
+
+### App/memory_v2/attributes.py
+
+Purpose: deterministic attribute ontology for precision matching.
+
+Responsibilities:
+
+- `GENERIC_MODIFIERS` (favorite/favourite/fav/fave/preferred/current/old/new/
+  main/primary/best/top/personal) that must never bridge unrelated attributes.
+- `attribute_identity(phrase)` maps attribute phrases to canonical cores
+  (job/profession/career/role -> occupation, mobile/cell/telephone -> phone
+  number, residence/house/home -> home address, favourite colour -> color, etc.).
+- `parse_reference(text)` -> `AttributeReference(subject, phrase, identity,
+  is_generic_only, explicit_subject, raw)`.
+- `references_record`, `subject_matches`, `is_user_subject`.
+
+Important constraints:
+
+- Pure, deterministic, dependency-free.
+- Generic-only references (e.g. "forget my favorite") have an empty identity
+  and may not bridge attributes.
+- Retrieval and operations use these to stop "what is my job" from matching
+  unrelated attributes and to keep person-scoped facts separated.
+
+Subsystem: memory retrieval.
+
+### App/memory_v2/semantic.py
+
+Purpose: semantic embedding abstraction with a safe default.
+
+Responsibilities:
+
+- `SemanticEmbedder` protocol (embed_text / embed_key_value / cosine_similarity /
+  available / name).
+- `LocalHashSemanticEmbedder` — the deterministic offline default and fallback.
+- `OllamaSemanticEmbedder` — optional remote `/api/embed` client that degrades
+  to the local embedder on any failure (network, timeout, malformed response).
+
+Important constraints:
+
+- Dense remote vectors use integer-index keys so the existing sparse cosine
+  computes correct dense cosine.
+- A single embedder must be used for both query and record embeddings.
+- Retrieval never depends on the network; the local embedder is always used
+  unless an embedder is explicitly injected.
 
 Subsystem: memory retrieval.
 
@@ -337,13 +398,22 @@ Purpose: SQLite persistence for Memory V2.
 
 Responsibilities:
 
-- `SCHEMA_VERSION = 2` with `v2_memories`, `v2_temporary_memories`, `v2_memory_events`, `v2_conversation_trackers`.
+- `SCHEMA_VERSION = 3` with `v2_memories`, `v2_temporary_memories`,
+  `v2_memory_events`, `v2_conversation_trackers`, `v2_episodes`,
+  `v2_global_state`, and an optional FTS5 virtual table `v2_memories_fts`
+  (created with content-sync triggers when FTS5 is available).
 - WAL mode.
 - Migrate from legacy: back up and drop the legacy `memories` table.
+- Migrate v2 -> v3: add structured attribute columns (`attribute`,
+  `attribute_core`, `statement`, `aliases`, `related_entities`, `qualifiers`,
+  `valid_from`, `valid_to`) and backfill `attribute_core` via
+  `attribute_identity`.
 - Insert/get/list/search/update/archive/restore/delete durable memories.
 - Insert/list/touch/update/expire/delete temporary memories.
 - Record auditable mutation events.
 - Track conversation activity and token counters.
+- Persist global counters (`token_counter`, `conversation_index`,
+  `last_conversation_id`) and episodes.
 - Link supersede pairs and group by canonical key.
 
 Important constraints:
@@ -413,11 +483,18 @@ Important class:
 
 Responsibilities:
 
-- Combine canonical-key token overlap, key/subject match, semantic similarity, importance, recency, and access count.
-- Suppress generic attribute slots (favorite/favourite/fav/preferred) from cross-matching, so favorite color never returns favorite drink.
+- Combine canonical-key token overlap, key/subject match, structured attribute
+  identity match, semantic similarity, importance, recency, and access count.
+- Parse the query through `parse_reference` and gate candidates by explicit
+  subject and attribute identity so generic modifiers never bridge unrelated
+  attributes (favorite color never returns favorite drink; "what is my job"
+  returns only the stored occupation).
+- Embed via the injected `SemanticEmbedder` (default `LocalHashSemanticEmbedder`).
 - Boost current-state temporary records for “what am I doing right now” queries.
 - Inject only when the score clears the threshold (or when explicitly asked via `include_all`).
 - Never inject archived or superseded records.
+- Reinforce accessed temporary records with the current token/conversation
+  counters (passed by the pipeline) instead of their stale `_last_seen` values.
 
 Important constraints:
 
@@ -443,6 +520,17 @@ Responsibilities:
 - Expire records by token/conversation distance (never purely by time).
 - Enforce a budget via eviction.
 - Emit `temporary_expired` audit events with reasons.
+- Persist `token_counter` / `conversation_index` / `last_conversation_id` in
+  `v2_global_state` so counters survive restarts; `begin_turn` writes them on
+  every turn.
+
+Important constraints:
+
+- Counter state must round-trip through `MemoryStore.get_global*` /
+  `set_global*`; a restarted `MemorySystem` continues token/context accounting.
+- Retrieval reinforcement advances `token_at_last_seen` /
+  `conversation_at_last_seen` to the *current* counters (see `retrieval.py`),
+  not the record's stale values.
 
 Subsystem: temporary memory lifecycle.
 
@@ -467,6 +555,11 @@ Important constraints:
 
 - Never merge different meanings (favorite color vs favorite drink).
 - Keep history via archival rather than hard deletion.
+- Durable-retention guard: never stale-archive records that are
+  `manually_edited` or whose `attribute_core` is in
+  `ConsolidationConfig.protected_attribute_cores` (identity attributes such as
+  name, occupation, phone, email, address, birthday), and never archive a
+  `manually_edited` record when merging duplicates.
 
 Subsystem: memory consolidation.
 
@@ -485,6 +578,8 @@ Responsibilities:
 - `handle_user_message()`: analyze, retrieve, optionally mutate, sweep, consolidate periodically.
 - Enforce: questions are read-only; suppression is honored; mutations flow only through operations.
 - Expose `retrieve()`, `archive()`, `restore()`, `delete()`, `clear_durable()`, `stats()`, and other manager APIs.
+- `retrieve()` forwards the temporary manager's current token/conversation
+  counters so temporary reinforcement is always current.
 
 Important constraints:
 
@@ -554,6 +649,8 @@ Important constraints:
 - Do not let VioletAI claim unimplemented capabilities.
 - Retrieved memories are context, not verified facts.
 - Memory is invisible to the user: no confirmation or follow-up prompts are generated.
+- `format_relevant_memories` prefers the structured `statement` field when
+  present and tags temporary records with "(temporary context)".
 
 Subsystem: prompt construction.
 
@@ -674,10 +771,18 @@ Validation and execution (`Operations`):
 
 Retrieval (`Retriever`):
 
-- Hybrid score: canonical-key token overlap, key/subject match, semantic similarity, importance, recency, access count.
-- Generic attribute slots (`favorite/favourite/fav/preferred`) are suppressed from cross-matching — favorite color never returns favorite drink.
+- Hybrid score: canonical-key token overlap, structured attribute identity
+  match, key/subject match, semantic similarity (via `SemanticEmbedder`),
+  importance, recency, access count.
+- Generic attribute slots (`favorite/favourite/fav/preferred/current/old/...`)
+  are never used to bridge unrelated attributes — favorite color never returns
+  favorite drink, and "what is my job" resolves to the stored occupation only.
+- Person-scoped references (e.g. "when is Alice's birthday") restrict matching
+  to that subject.
 - Injection happens only when the score clears the threshold (or on `include_all` for explicit memory questions).
 - Archived and superseded records are never injected.
+- Accessed temporary records are reinforced with the current token/conversation
+  counters, so active context stays alive while being used.
 
 Durability guarantees (asserted by `tests/test_memory_v2_adversarial.py`):
 
@@ -689,8 +794,8 @@ Durability guarantees (asserted by `tests/test_memory_v2_adversarial.py`):
 
 Persistence (`Store`):
 
-- `SCHEMA_VERSION = 2`, WAL mode; migrates by backing up and dropping the legacy `memories` table.
-- Insert/get/list/search/update/archive/restore/delete durable memories; insert/list/touch/update/expire/delete temporary memories; auditable mutation events.
+- `SCHEMA_VERSION = 3`, WAL mode; migrates by backing up and dropping the legacy `memories` table, then adds v3 structured attribute columns with backfilled `attribute_core`.
+- Insert/get/list/search/update/archive/restore/delete durable memories; insert/list/touch/update/expire/delete temporary memories; auditable mutation events; episodes; global counters; optional FTS5 search.
 - Runtime DB is ignored by git.
 
 Memory Manager (`App/memory_manager.py`):
@@ -843,21 +948,42 @@ Memory V2 now provides:
 - Typed, atomic, verified create/update/merge/supersede/archive/restore/delete operations.
 - Conservative deletion and structured clarification when a target is ambiguous.
 - Provenance, version history, contradiction handling, consolidation, and migration with legacy backup.
-- Extensive deterministic and adversarial testing (230 tests passing, including real-store UI tests).
+- Extensive deterministic and adversarial testing (265 tests passing, including real-store UI tests).
 
-Status: Memory V2 is implemented and verified as an alpha. The legacy pipeline is removed and one authoritative replacement exists. The sole remaining v0.2 task is the Settings page UI polish:
+Status: Memory V2 is implemented and verified as an alpha, with a stabilization
+pass underway on the `Memory-V2` branch. The stabilization pass covers:
 
-- Open Settings on the Settings tab.
-- All tabs should navigate correctly.
-- Unimplemented tabs may display clean placeholders.
-- Memory Manager remains fully functional.
-- Reduce excessive padding.
-- Darker content area.
-- Slightly lighter navigation/sidebar.
-- Reduce spacing between tabs.
-- Move tabs closer to the top.
-- Settings starts hidden.
-- No unrelated chat or memory changes.
+- Attribute precision: a deterministic attribute ontology
+  (`App/memory_v2/attributes.py`) maps phrases to canonical attribute cores and
+  stops generic modifiers from bridging unrelated attributes. Retrieval and
+  operations score on attribute identity and explicit subject, so "what is my
+  job" retrieves the stored occupation while negative controls ("what project
+  am I working on") never do.
+- Schema v3 (`store.py`): structured fields on durable/temporary records
+  (`attribute`, `attribute_core`, `statement`, `aliases`, `related_entities`,
+  `qualifiers`, `valid_from`, `valid_to`), a new `v2_episodes` table, a
+  `v2_global_state` table for persistent counters, and an optional FTS5
+  `search_memories` index. v2 databases migrate with backfilled
+  `attribute_core`.
+- Persistent temporary counters (`temporary.py`): `token_counter`,
+  `conversation_index`, and `last_conversation_id` are stored in
+  `v2_global_state` and survive restarts.
+- Reinforcement fix (`retrieval.py`): retrieved temporary records are touched
+  with the current counters, not their stale `_last_seen` values.
+- Semantic abstraction (`semantic.py`): retrieval depends on a
+  `SemanticEmbedder`; the deterministic local hash embedder is the default and
+  fallback, with an optional Ollama embedder that degrades safely.
+- Consolidation durable-retention guard (`consolidation.py`): identity
+  attributes and manually edited records are never stale-archived, and
+  manually edited records are never archived as merge duplicates.
+- Prompt/main wiring (`prompts.py`, `main.py`): injected memories prefer the
+  structured `statement` and tag temporary context; mutation details can be
+  logged opt-in via `VIOLETAI_MEMORY_LOG=1`; the regenerate path passes current
+  counters for consistent reinforcement.
+
+Remaining for this stabilization pass: none currently planned beyond the above;
+any future episodic/semantic work continues on the same branch. Do not commit or
+push unless explicitly asked.
 
 v0.2 should not be tagged until the remaining task is complete and verified.
 
@@ -895,7 +1021,7 @@ git diff --check
 git status --short
 ```
 
-Headless UI tests use `QT_QPA_PLATFORM=offscreen`. Memory V2 has dedicated coverage: `tests/test_memory_v2_*` for each layer plus `tests/test_memory_v2_adversarial.py`, which asserts the corruption guards (question read-only, exact meaning wins, no-match deletion, suppression, threshold-gated injection, no layer cross-injection).
+Headless UI tests use `QT_QPA_PLATFORM=offscreen`. Memory V2 has dedicated coverage: `tests/test_memory_v2_*` for each layer plus `tests/test_memory_v2_adversarial.py`, which asserts the corruption guards (question read-only, exact meaning wins, no-match deletion, suppression, threshold-gated injection, no layer cross-injection). `tests/test_memory_v2_attributes.py` covers the attribute-precision matrix end to end through `MemorySystem.handle_user_message`; `tests/test_memory_v2_semantic.py` covers the embedder abstraction and Ollama fallback.
 
 Manual verification is required whenever changes affect:
 

@@ -1,9 +1,14 @@
 """SQLite persistence for VioletAI Memory V2.
 
-Schema version 2 replaces the legacy explicit-memory store with a layered
+Schema version 3 replaces the legacy explicit-memory store with a layered
 model: durable + archived memories share the `v2_memories` table and
 temporary cross-chat memories live in `v2_temporary_memories`. An append-only
 `v2_memory_events` log records every mutation with before/after detail.
+
+Version 3 adds structured attribute representation (canonical attribute and
+core, natural statement, aliases, related entities, qualifiers, temporal
+validity), a full-text search index, cross-chat episodes, and persistent global
+counters for the temporary-memory lifecycle.
 
 On startup, if the legacy `memories` table (schema version 1) is present, the
 database file is backed up and the legacy table is dropped before the V2
@@ -13,6 +18,7 @@ schema is created, so no old code paths can interact with new data.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sqlite3
 import uuid
@@ -22,10 +28,11 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from config import MEMORY_DB_PATH
-from memory_v2.models import MemoryLayer, MemoryRecord, Provenance, ProvenanceKind, TemporaryRecord
+from memory_v2.attributes import attribute_identity
+from memory_v2.models import Episode, MemoryLayer, MemoryRecord, Provenance, ProvenanceKind, TemporaryRecord
 from memory_v2.normalize import canonical_key as build_canonical_key
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _LAYERS = tuple(layer.value for layer in MemoryLayer)
 _LEGACY_TABLES = ("memories",)
 _TIMESTAMP_FORMAT = "%Y%m%d%H%M%S"
@@ -42,6 +49,7 @@ def utc_now() -> str:
 class MemoryStore:
     def __init__(self, path: Path = MEMORY_DB_PATH) -> None:
         self.path = path
+        self.fts_available = True
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
 
@@ -75,6 +83,8 @@ class MemoryStore:
                 raise MemoryStoreError("Memory database schema is newer than this app.")
             if current < SCHEMA_VERSION:
                 self._migrate_from_legacy(connection)
+                if current < 3:
+                    self._migrate_to_v3(connection)
             self._create_v2_schema(connection)
             connection.execute(
                 "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', ?)",
@@ -127,6 +137,14 @@ class MemoryStore:
                 manually_edited INTEGER NOT NULL DEFAULT 0,
                 edit_count INTEGER NOT NULL DEFAULT 0,
                 language TEXT NOT NULL DEFAULT 'en',
+                attribute TEXT NOT NULL DEFAULT '',
+                attribute_core TEXT NOT NULL DEFAULT '',
+                statement TEXT NOT NULL DEFAULT '',
+                aliases TEXT NOT NULL DEFAULT '[]',
+                related_entities TEXT NOT NULL DEFAULT '[]',
+                qualifiers TEXT NOT NULL DEFAULT '{{}}',
+                valid_from TEXT,
+                valid_to TEXT,
                 extra TEXT NOT NULL DEFAULT '{{}}'
             )
             """
@@ -166,6 +184,8 @@ class MemoryStore:
                 unresolved INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'active',
                 language TEXT NOT NULL DEFAULT 'en',
+                attribute TEXT NOT NULL DEFAULT '',
+                attribute_core TEXT NOT NULL DEFAULT '',
                 extra TEXT NOT NULL DEFAULT '{{}}'
             )
             """
@@ -205,6 +225,125 @@ class MemoryStore:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS v2_episodes (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                subject TEXT NOT NULL DEFAULT 'user',
+                title TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL,
+                source_conversation_id TEXT,
+                start_at TEXT,
+                end_at TEXT,
+                importance INTEGER NOT NULL DEFAULT 5,
+                entity_ids TEXT NOT NULL DEFAULT '[]',
+                extra TEXT NOT NULL DEFAULT '{{}}'
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_v2_episodes_created ON v2_episodes(created_at)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS v2_global_state (
+                key TEXT PRIMARY KEY,
+                value INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        self._create_fts(connection)
+
+    def _create_fts(self, connection: sqlite3.Connection) -> None:
+        try:
+            connection.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS v2_memories_fts USING fts5(
+                    subject, key, value, content, statement, source_user_text,
+                    content='v2_memories'
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS v2_memories_fts_insert
+                AFTER INSERT ON v2_memories
+                BEGIN
+                    INSERT INTO v2_memories_fts(rowid, subject, key, value, content, statement, source_user_text)
+                    VALUES (new.rowid, new.subject, new.key, new.value, new.content, new.statement, new.source_user_text);
+                END
+                """
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS v2_memories_fts_delete
+                AFTER DELETE ON v2_memories
+                BEGIN
+                    INSERT INTO v2_memories_fts(v2_memories_fts, rowid, subject, key, value, content, statement, source_user_text)
+                    VALUES ('delete', old.rowid, old.subject, old.key, old.value, old.content, old.statement, old.source_user_text);
+                END
+                """
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS v2_memories_fts_update
+                AFTER UPDATE ON v2_memories
+                BEGIN
+                    INSERT INTO v2_memories_fts(v2_memories_fts, rowid, subject, key, value, content, statement, source_user_text)
+                    VALUES ('delete', old.rowid, old.subject, old.key, old.value, old.content, old.statement, old.source_user_text);
+                    INSERT INTO v2_memories_fts(rowid, subject, key, value, content, statement, source_user_text)
+                    VALUES (new.rowid, new.subject, new.key, new.value, new.content, new.statement, new.source_user_text);
+                END
+                """
+            )
+            self.fts_available = True
+        except sqlite3.OperationalError:
+            self.fts_available = False
+
+    def _migrate_to_v3(self, connection: sqlite3.Connection) -> None:
+        if not _table_exists(connection, "v2_memories"):
+            return
+        memory_columns = {row["name"] for row in connection.execute("PRAGMA table_info(v2_memories)")}
+        additions = {
+            "attribute": "TEXT NOT NULL DEFAULT ''",
+            "attribute_core": "TEXT NOT NULL DEFAULT ''",
+            "statement": "TEXT NOT NULL DEFAULT ''",
+            "aliases": "TEXT NOT NULL DEFAULT '[]'",
+            "related_entities": "TEXT NOT NULL DEFAULT '[]'",
+            "qualifiers": "TEXT NOT NULL DEFAULT '{}'",
+            "valid_from": "TEXT",
+            "valid_to": "TEXT",
+        }
+        for name, definition in additions.items():
+            if name not in memory_columns:
+                connection.execute(f"ALTER TABLE v2_memories ADD COLUMN {name} {definition}")
+        rows = connection.execute(
+            "SELECT id, key, content FROM v2_memories WHERE attribute_core=''"
+        ).fetchall()
+        for row in rows:
+            core = attribute_identity(row["key"])
+            statement = row["content"] or ""
+            connection.execute(
+                "UPDATE v2_memories SET attribute=?, attribute_core=?, statement=? WHERE id=?",
+                (row["key"], core, statement, row["id"]),
+            )
+        if not _table_exists(connection, "v2_temporary_memories"):
+            return
+        temporary_columns = {row["name"] for row in connection.execute("PRAGMA table_info(v2_temporary_memories)")}
+        for name, definition in (("attribute", "TEXT NOT NULL DEFAULT ''"), ("attribute_core", "TEXT NOT NULL DEFAULT ''")):
+            if name not in temporary_columns:
+                connection.execute(f"ALTER TABLE v2_temporary_memories ADD COLUMN {name} {definition}")
+        temp_rows = connection.execute(
+            "SELECT id, key, content FROM v2_temporary_memories WHERE attribute_core=''"
+        ).fetchall()
+        for row in temp_rows:
+            core = attribute_identity(row["key"])
+            connection.execute(
+                "UPDATE v2_temporary_memories SET attribute=?, attribute_core=? WHERE id=?",
+                (row["key"], core, row["id"]),
+            )
 
     def schema_version(self) -> int:
         with self.connect() as connection:
@@ -279,6 +418,9 @@ class MemoryStore:
         record_id = uuid.uuid4().hex
         canonical = build_canonical_key(parsed.category, parsed.subject, parsed.key)
         provenance = parsed.provenance
+        attribute = parsed.attribute or parsed.key
+        attribute_core = parsed.attribute_core or attribute_identity(parsed.key)
+        statement = parsed.statement or parsed.content or f"{parsed.key} is {parsed.value}"
         with self.connect() as connection:
             connection.execute(
                 """
@@ -286,8 +428,9 @@ class MemoryStore:
                     id, layer, category, subject, key, value, canonical_key, content,
                     importance, confidence, provenance_kind, source_conversation_id,
                     source_message_id, source_user_text, created_at, updated_at,
-                    language, extra
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    language, attribute, attribute_core, statement, aliases,
+                    related_entities, qualifiers, valid_from, valid_to, extra
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record_id,
@@ -307,6 +450,14 @@ class MemoryStore:
                     now,
                     now,
                     parsed.language,
+                    attribute,
+                    attribute_core,
+                    statement,
+                    json.dumps(parsed.aliases or [], ensure_ascii=False),
+                    json.dumps(parsed.related_entities or [], ensure_ascii=False),
+                    json.dumps(parsed.qualifiers or {}, ensure_ascii=False),
+                    parsed.valid_from,
+                    parsed.valid_to,
                     json.dumps(parsed.extra or {}, ensure_ascii=False),
                 ),
             )
@@ -374,6 +525,12 @@ class MemoryStore:
         confidence: float | None = None,
         provenance: Provenance | None = None,
         manual: bool = False,
+        statement: str | None = None,
+        aliases: list[str] | None = None,
+        related_entities: list[str] | None = None,
+        qualifiers: dict[str, Any] | None = None,
+        valid_from: str | None = None,
+        valid_to: str | None = None,
     ) -> MemoryRecord | None:
         existing = self.get_memory(memory_id)
         if existing is None:
@@ -383,6 +540,14 @@ class MemoryStore:
         new_key = key if key is not None else existing.key
         new_value = value if value is not None else existing.value
         canonical = build_canonical_key(new_category, new_subject, new_key)
+        new_attribute = existing.attribute or new_key
+        new_core = attribute_identity(new_key)
+        new_statement = statement if statement is not None else (content if content is not None else existing.statement or existing.content)
+        new_aliases = aliases if aliases is not None else existing.aliases
+        new_entities = related_entities if related_entities is not None else existing.related_entities
+        new_qualifiers = qualifiers if qualifiers is not None else existing.qualifiers
+        new_valid_from = valid_from if valid_from is not None else existing.valid_from
+        new_valid_to = valid_to if valid_to is not None else existing.valid_to
         now = utc_now()
         with self.connect() as connection:
             connection.execute(
@@ -391,6 +556,8 @@ class MemoryStore:
                 SET category=?, subject=?, key=?, value=?, canonical_key=?, content=?,
                     importance=?, confidence=?, source_user_text=?, source_conversation_id=?,
                     source_message_id=?, provenance_kind=?, updated_at=?,
+                    attribute=?, attribute_core=?, statement=?, aliases=?, related_entities=?,
+                    qualifiers=?, valid_from=?, valid_to=?,
                     manually_edited=CASE WHEN ? THEN 1 ELSE manually_edited END,
                     edit_count=edit_count + 1
                 WHERE id=?
@@ -409,6 +576,14 @@ class MemoryStore:
                     provenance.message_id if provenance else existing.provenance.message_id,
                     provenance.kind.value if provenance else existing.provenance.kind.value,
                     now,
+                    new_attribute,
+                    new_core,
+                    new_statement,
+                    json.dumps(new_aliases or [], ensure_ascii=False),
+                    json.dumps(new_entities or [], ensure_ascii=False),
+                    json.dumps(new_qualifiers or {}, ensure_ascii=False),
+                    new_valid_from,
+                    new_valid_to,
                     1 if manual else 0,
                     memory_id,
                 ),
@@ -484,6 +659,8 @@ class MemoryStore:
         record_id = uuid.uuid4().hex
         canonical = build_canonical_key("Temporary", parsed.subject, parsed.key)
         provenance = parsed.provenance
+        attribute = parsed.attribute or parsed.key
+        attribute_core = parsed.attribute_core or attribute_identity(parsed.key)
         with self.connect() as connection:
             connection.execute(
                 """
@@ -491,8 +668,9 @@ class MemoryStore:
                     id, subject, key, value, canonical_key, content, importance, confidence,
                     provenance_kind, source_conversation_id, source_message_id, source_user_text,
                     created_at, updated_at, token_at_created, token_at_last_seen,
-                    conversation_at_created, conversation_at_last_seen, unresolved, language, extra
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    conversation_at_created, conversation_at_last_seen, unresolved,
+                    language, attribute, attribute_core, extra
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record_id,
@@ -515,6 +693,8 @@ class MemoryStore:
                     conversation_index,
                     1 if parsed.unresolved else 0,
                     parsed.language,
+                    attribute,
+                    attribute_core,
                     json.dumps(parsed.extra or {}, ensure_ascii=False),
                 ),
             )
@@ -586,6 +766,121 @@ class MemoryStore:
         with self.connect() as connection:
             connection.execute("DELETE FROM v2_temporary_memories")
 
+    # ---------------------------------------------------------- global state
+
+    def get_global(self, key: str, default: int = 0) -> int:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM v2_global_state WHERE key=?", (key,)
+            ).fetchone()
+            if not row:
+                return default
+            try:
+                return int(row["value"])
+            except (TypeError, ValueError):
+                return default
+
+    def set_global(self, key: str, value: int) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO v2_global_state(key, value) VALUES(?, ?)",
+                (key, str(value)),
+            )
+
+    def get_global_str(self, key: str, default: str = "") -> str:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM v2_global_state WHERE key=?", (key,)
+            ).fetchone()
+            return row["value"] if row else default
+
+    def set_global_str(self, key: str, value: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO v2_global_state(key, value) VALUES(?, ?)",
+                (key, value),
+            )
+
+    # ---------------------------------------------------------------- episodes
+
+    def add_episode(
+        self,
+        kind: str,
+        title: str,
+        content: str,
+        *,
+        subject: str = "user",
+        source_conversation_id: str | None = None,
+        start_at: str | None = None,
+        end_at: str | None = None,
+        importance: int = 5,
+        entity_ids: list[str] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> Episode:
+        episode_id = uuid.uuid4().hex
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO v2_episodes (
+                    id, created_at, kind, subject, title, content,
+                    source_conversation_id, start_at, end_at, importance, entity_ids, extra
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    episode_id,
+                    utc_now(),
+                    kind,
+                    subject,
+                    title,
+                    content,
+                    source_conversation_id,
+                    start_at,
+                    end_at,
+                    importance,
+                    json.dumps(entity_ids or [], ensure_ascii=False),
+                    json.dumps(extra or {}, ensure_ascii=False),
+                ),
+            )
+        return self.get_episode(episode_id)  # type: ignore[return-value]
+
+    def get_episode(self, episode_id: str) -> Episode | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM v2_episodes WHERE id=?", (episode_id,)
+            ).fetchone()
+            return _row_to_episode(row) if row else None
+
+    def list_episodes(self, limit: int = 50) -> list[Episode]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM v2_episodes ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+            return [_row_to_episode(row) for row in rows]
+
+    # --------------------------------------------------------------- full text
+
+    def fts_search(self, query: str, limit: int = 20) -> list[MemoryRecord]:
+        if not self.fts_available or not query:
+            return []
+        tokens = _fts_query_terms(query)
+        if not tokens:
+            return []
+        search = " AND ".join(f'"{token}"' for token in tokens)
+        with self.connect() as connection:
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT m.* FROM v2_memories AS m
+                    JOIN v2_memories_fts AS f ON f.rowid = m.rowid
+                    WHERE v2_memories_fts MATCH ? AND m.layer='durable'
+                    ORDER BY bm25(v2_memories_fts) LIMIT ?
+                    """,
+                    (search, limit),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+            return [_row_to_memory(row) for row in rows]
+
 
 def _as_parsed(parsed_memory: object) -> object:
     if not hasattr(parsed_memory, "category"):
@@ -627,6 +922,14 @@ def _row_to_memory(row: sqlite3.Row) -> MemoryRecord:
         manually_edited=bool(row["manually_edited"]),
         edit_count=int(row["edit_count"]),
         language=row["language"],
+        attribute=row["attribute"] or "",
+        attribute_core=row["attribute_core"] or "",
+        statement=row["statement"] or "",
+        aliases=_load_list(row["aliases"]),
+        related_entities=_load_list(row["related_entities"]),
+        qualifiers=_load_dict(row["qualifiers"]),
+        valid_from=row["valid_from"],
+        valid_to=row["valid_to"],
         extra=extra,
     )
 
@@ -664,6 +967,8 @@ def _row_to_temporary(row: sqlite3.Row) -> TemporaryRecord:
         unresolved=int(row["unresolved"]),
         status=row["status"],
         language=row["language"],
+        attribute=row["attribute"] or "",
+        attribute_core=row["attribute_core"] or "",
         extra=extra,
     )
 
@@ -685,6 +990,66 @@ def _row_to_event(row: sqlite3.Row) -> dict[str, Any]:
         "source_message_id": row["source_message_id"],
         "detail": detail,
     }
+
+
+def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
+    return (
+        connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _row_to_episode(row: sqlite3.Row) -> Episode:
+    extra: dict[str, Any] = {}
+    try:
+        extra = json.loads(row["extra"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        extra = {}
+    return Episode(
+        id=row["id"],
+        created_at=row["created_at"],
+        kind=row["kind"],
+        subject=row["subject"],
+        title=row["title"],
+        content=row["content"],
+        source_conversation_id=row["source_conversation_id"],
+        start_at=row["start_at"],
+        end_at=row["end_at"],
+        importance=int(row["importance"]),
+        entity_ids=_load_list(row["entity_ids"]),
+        extra=extra,
+    )
+
+
+def _load_list(raw: object) -> list[str]:
+    try:
+        loaded = json.loads(raw or "[]")
+        return [str(item) for item in loaded] if isinstance(loaded, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def _load_dict(raw: object) -> dict[str, Any]:
+    try:
+        loaded = json.loads(raw or "{}")
+        return loaded if isinstance(loaded, dict) else {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+_FTS_TOKEN_RE = re.compile(r"[\w']+")
+_FTS_STOPWORDS = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "my", "your", "our", "their",
+    "of", "in", "on", "at", "to", "for", "and", "or", "what", "when", "where",
+    "who", "which", "how", "i", "you", "we", "it", "me", "us", "them", "do", "does",
+})
+
+
+def _fts_query_terms(query: str) -> list[str]:
+    tokens = [token for token in _FTS_TOKEN_RE.findall((query or "").casefold()) if token not in _FTS_STOPWORDS]
+    return tokens[:6]
 
 
 def _legacy_index_names(connection: sqlite3.Connection) -> list[str]:

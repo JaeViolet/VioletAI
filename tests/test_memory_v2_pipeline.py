@@ -167,7 +167,7 @@ class MemorySystemTests(unittest.TestCase):
         stats = self.system.stats()
         self.assertEqual(stats.durable, 1)
         self.assertEqual(stats.temporary_active, 1)
-        self.assertEqual(stats.schema_version, 2)
+        self.assertEqual(stats.schema_version, 3)
 
     def test_manager_apis(self) -> None:
         self.system.handle_user_message("my favorite color is violet", conversation_id="c1")
@@ -187,6 +187,28 @@ class MemorySystemTests(unittest.TestCase):
         record = self.system.list_memories()[0]
         self.system.retrieve("favorite color", include_all=True, mark_accessed=True)
         self.assertEqual(self.system.get_memory(record.id).access_count, 1)
+
+    def test_temporary_counters_survive_restart(self) -> None:
+        self.system.handle_user_message("remember the sidebar flickers", conversation_id="c1", token_count=100)
+        self.system.handle_user_message("we are refactoring store", conversation_id="c2", token_count=50)
+        first_tokens, first_index = self.system.temporary.token_counter, self.system.temporary.conversation_index
+        self.assertEqual(first_index, 2)
+        restarted = MemorySystem(self.store)
+        self.assertEqual(restarted.temporary.token_counter, first_tokens)
+        self.assertEqual(restarted.temporary.conversation_index, first_index)
+        restarted.handle_user_message("more context", conversation_id="c3")
+        self.assertEqual(restarted.temporary.conversation_index, first_index + 1)
+
+    def test_retrieve_passes_counters_for_reinforcement(self) -> None:
+        self.system.handle_user_message("remember to buy milk", conversation_id="c1")
+        record = self.system.store.list_temporary(status="active")[0]
+        self.system.handle_user_message("we are refactoring store", conversation_id="c2", token_count=80)
+        tokens, index = self.system.temporary.token_counter, self.system.temporary.conversation_index
+        outcome = self.system.retrieve("buy milk", include_all=True, mark_accessed=True)
+        self.assertTrue(outcome.injected)
+        refreshed = self.system.store.get_temporary(record.id)
+        self.assertEqual(refreshed.token_at_last_seen, tokens)
+        self.assertEqual(refreshed.conversation_at_last_seen, index)
 
 
 if __name__ == "__main__":

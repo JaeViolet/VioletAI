@@ -42,7 +42,7 @@ class MemoryStoreTests(unittest.TestCase):
 
     def test_schema_version(self) -> None:
         self.assertEqual(self.store.schema_version(), SCHEMA_VERSION)
-        self.assertEqual(SCHEMA_VERSION, 2)
+        self.assertEqual(SCHEMA_VERSION, 3)
 
     def test_insert_and_get_memory(self) -> None:
         record = self.store.insert_memory(make_parsed())
@@ -145,6 +145,75 @@ class MemoryStoreTests(unittest.TestCase):
         activity = self.store.conversation_activity()
         self.assertEqual(activity["c1"], 2)
 
+    def test_v3_rich_fields_roundtrip(self) -> None:
+        record = self.store.insert_memory(
+            make_parsed(
+                statement="my favorite color is violet",
+                aliases=["color", "colour"],
+                related_entities=["paint"],
+                qualifiers={"when": "always"},
+                valid_from="2026-01-01T00:00:00Z",
+            )
+        )
+        fetched = self.store.get_memory(record.id)
+        self.assertEqual(fetched.statement, "my favorite color is violet")
+        self.assertEqual(fetched.aliases, ["color", "colour"])
+        self.assertEqual(fetched.related_entities, ["paint"])
+        self.assertEqual(fetched.qualifiers, {"when": "always"})
+        self.assertEqual(fetched.valid_from, "2026-01-01T00:00:00Z")
+        self.assertEqual(fetched.attribute, "favorite color")
+        self.assertEqual(fetched.attribute_core, "color")
+
+    def test_episodes_roundtrip(self) -> None:
+        episode = self.store.add_episode(
+            "chat",
+            "Refactor discussion",
+            "We discussed the store rewrite.",
+            subject="alice",
+            source_conversation_id="c1",
+            entity_ids=["alice", "bob"],
+            importance=7,
+        )
+        self.assertIsNotNone(episode.id)
+        fetched = self.store.get_episode(episode.id)
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.title, "Refactor discussion")
+        self.assertEqual(fetched.subject, "alice")
+        self.assertEqual(fetched.entity_ids, ["alice", "bob"])
+        self.assertEqual(fetched.importance, 7)
+        listed = self.store.list_episodes()
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0].kind, "chat")
+
+    def test_global_state_int_and_str(self) -> None:
+        self.assertEqual(self.store.get_global("missing"), 0)
+        self.assertEqual(self.store.get_global_str("missing"), "")
+        self.store.set_global("token_counter", 42)
+        self.store.set_global_str("last_conversation_id", "c9")
+        self.assertEqual(self.store.get_global("token_counter"), 42)
+        self.assertEqual(self.store.get_global_str("last_conversation_id"), "c9")
+        self.store.set_global("token_counter", 43)
+        self.assertEqual(self.store.get_global("token_counter"), 43)
+
+    def test_fts_search_finds_content(self) -> None:
+        self.store.insert_memory(make_parsed(key="favorite color", value="violet"))
+        self.store.insert_memory(
+            make_parsed(
+                category="User",
+                key="name",
+                value="Ada",
+                content="name is Ada",
+                provenance=Provenance(conversation_id="c2", message_id="m2", user_text="my name is Ada"),
+            )
+        )
+        if not self.store.fts_available:
+            self.skipTest("FTS5 not available in this SQLite build")
+        found = self.store.fts_search("violet")
+        self.assertEqual([record.key for record in found], ["favorite color"])
+        found = self.store.fts_search("Ada")
+        self.assertEqual([record.key for record in found], ["name"])
+        self.assertEqual(self.store.fts_search("missing"), [])
+
 
 class TemporaryStoreTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -226,7 +295,7 @@ class LegacyMigrationTests(unittest.TestCase):
             connection.close()
 
             store = MemoryStore(path)
-            self.assertEqual(store.schema_version(), 2)
+            self.assertEqual(store.schema_version(), 3)
 
             connection = sqlite3.connect(path)
             tables = {
@@ -241,6 +310,8 @@ class LegacyMigrationTests(unittest.TestCase):
             self.assertIn("v2_temporary_memories", tables)
             self.assertIn("v2_memory_events", tables)
             self.assertIn("v2_conversation_trackers", tables)
+            self.assertIn("v2_episodes", tables)
+            self.assertIn("v2_global_state", tables)
 
             backups = list(Path(temp_dir.name).glob("*.legacy-backup-*.db"))
             self.assertEqual(len(backups), 1)
@@ -254,9 +325,55 @@ class LegacyMigrationTests(unittest.TestCase):
             store = MemoryStore(path)
             record = store.insert_memory(make_parsed())
             reopened = MemoryStore(path)
-            self.assertEqual(reopened.schema_version(), 2)
+            self.assertEqual(reopened.schema_version(), 3)
             self.assertEqual(len(reopened.list_memories()), 1)
             self.assertEqual(reopened.get_memory(record.id).value, "violet")
+        finally:
+            temp_dir.cleanup()
+
+    def test_v2_to_v3_migration_backfills_attributes(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        try:
+            path = Path(temp_dir.name) / "memory.db"
+            connection = sqlite3.connect(path)
+            connection.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            connection.execute("INSERT INTO schema_meta(key, value) VALUES('version', '2')")
+            connection.execute(
+                """
+                CREATE TABLE v2_memories (
+                    id TEXT PRIMARY KEY, layer TEXT NOT NULL, category TEXT NOT NULL,
+                    subject TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+                    canonical_key TEXT NOT NULL, content TEXT NOT NULL,
+                    importance INTEGER NOT NULL DEFAULT 5, confidence REAL NOT NULL DEFAULT 0.0,
+                    provenance_kind TEXT NOT NULL DEFAULT 'explicit',
+                    source_conversation_id TEXT, source_message_id TEXT, source_user_text TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_accessed_at TEXT,
+                    access_count INTEGER NOT NULL DEFAULT 0, superseded_by_id TEXT,
+                    supersedes_id TEXT, archived_at TEXT, manually_edited INTEGER NOT NULL DEFAULT 0,
+                    edit_count INTEGER NOT NULL DEFAULT 0, language TEXT NOT NULL DEFAULT 'en',
+                    extra TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO v2_memories (
+                    id, layer, category, subject, key, value, canonical_key, content,
+                    created_at, updated_at
+                ) VALUES ('m1', 'durable', 'User', 'user', 'job', 'engineer', 'user:user:job',
+                          'job is engineer', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            store = MemoryStore(path)
+            self.assertEqual(store.schema_version(), 3)
+            record = store.get_memory("m1")
+            self.assertIsNotNone(record)
+            self.assertEqual(record.attribute_core, "occupation")
+            self.assertEqual(record.attribute, "job")
+            self.assertEqual(record.statement, "job is engineer")
         finally:
             temp_dir.cleanup()
 
