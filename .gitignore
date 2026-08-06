@@ -1,29 +1,42 @@
-# Python
+# Python caches and build artifacts
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
 .venv/
 venv/
-*.py[cod]
 
-# VS Code
-.vscode/
+# Test and tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Logs
 logs/
 *.log
 
-# Local app data
-memory/conversations/
-memory/preferences.json
-memory/*.db
-memory/*.db-shm
-memory/*.db-wal
+# Private secrets
+.env
+.env.*
+!.env.example
 
-# Ollama models
+# Runtime app data
+data/conversations/
+data/preferences.json
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# Ollama models and downloads
 ollama/models/
-models/
 
-# Windows
+# OS / editor junk
 *.lnk
 Thumbs.db
 Desktop.ini

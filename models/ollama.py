@@ -1,4 +1,4 @@
-"""Background Ollama streaming worker."""
+﻿"""Background Ollama streaming worker."""
 
 from __future__ import annotations
 
@@ -10,13 +10,12 @@ from typing import Any
 import requests
 from PySide6.QtCore import QObject, Signal, Slot
 
-from config import (
+from core.config import (
     CONNECT_TIMEOUT_SECONDS,
     DEFAULT_MODEL_NAME,
     KEEP_ALIVE,
-    OLLAMA_BASE_URL,
     OLLAMA_URL,
-READ_TIMEOUT_SECONDS,
+    READ_TIMEOUT_SECONDS,
 )
 
 
@@ -85,24 +84,6 @@ def _http_error_message(response: requests.Response, model_name: str) -> str:
     if response.status_code == 404 or "not found" in error_text.lower():
         return f"Configured model '{model_name}' is missing. Run: ollama pull {model_name}"
     return f"Ollama request failed with HTTP {response.status_code}: {error_text}"
-
-
-def discover_models() -> list[str]:
-    response = requests.get(
-        f"{OLLAMA_BASE_URL}/api/tags",
-        timeout=(CONNECT_TIMEOUT_SECONDS, 20),
-    )
-    response.raise_for_status()
-    data = response.json()
-    models = data.get("models", [])
-    if not isinstance(models, list):
-        raise OllamaError("Ollama returned an invalid model list.")
-    names = sorted(
-        str(model.get("name", ""))
-        for model in models
-        if isinstance(model, dict) and model.get("name")
-    )
-    return names
 
 
 class OllamaWorker(QObject):
@@ -255,22 +236,3 @@ class OllamaWorker(QObject):
             "Ollama completed the stream before sending visible assistant text "
             f"(events={event_count}, empty_events={empty_event_count}, done={done_seen})."
         )
-
-
-class ModelDiscoveryWorker(QObject):
-    finished = Signal(list)
-    failed = Signal(str)
-    stopped = Signal()
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            self.finished.emit(discover_models())
-        except requests.ConnectionError:
-            self.failed.emit("Could not connect to Ollama for model discovery.")
-        except requests.Timeout:
-            self.failed.emit("Ollama model discovery timed out.")
-        except (requests.RequestException, OllamaError) as error:
-            self.failed.emit(str(error))
-        finally:
-            self.stopped.emit()

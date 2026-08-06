@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "violetai"
+version = "0.1.0"
+description = "VioletAI - a local Ollama chat client with memory and tools."
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.6",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+]
+
+[project.scripts]
+violetai = "app.main:main"
+
+[tool.setuptools]
+packages = ["app", "conversations", "core", "memory", "models", "tools", "ui"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+qt_api = "pyqt5"
+addopts = "--import-mode=importlib"
+
+[tool.unittest.discovery]
+start-dir = "tests"
+pattern = "test_*.py"

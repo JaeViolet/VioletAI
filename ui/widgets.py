@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from design import Colors, PNG_CONTROL_ICON_SIZE, icon
+from ui.design import Colors, PNG_CONTROL_ICON_SIZE, icon
 
 
 def apply_interaction_cursors(root: QWidget) -> None:

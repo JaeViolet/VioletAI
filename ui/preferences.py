@@ -1,12 +1,12 @@
-"""Small JSON preferences store for local UI settings."""
+﻿"""Small JSON preferences store for local UI settings."""
 
 from __future__ import annotations
 
 import json
 import re
 
-from config import DEFAULT_MODEL_NAME, PREFERENCES_PATH
-from themes import DEFAULT_ACCENT, DEFAULT_THEME_NAME
+from core.config import DEFAULT_MODEL_NAME, PREFERENCES_PATH
+from ui.themes import DEFAULT_ACCENT, DEFAULT_THEME_NAME
 
 _HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 

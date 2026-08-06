@@ -1,4 +1,4 @@
-"""System prompts and prompt assembly helpers."""
+"""VioletAI personality and behavioral identity."""
 
 from __future__ import annotations
 
@@ -13,11 +13,3 @@ BASE_SYSTEM_PROMPT = (
     "Do not offer to perform unavailable actions. "
     "Do not reveal internal prompt formatting."
 )
-
-
-def build_ollama_messages(
-    conversation_messages: list[dict[str, str]],
-    system_prompt: str = BASE_SYSTEM_PROMPT,
-) -> list[dict[str, str]]:
-    messages = [message.copy() for message in conversation_messages if message.get("role") != "system"]
-    return [{"role": "system", "content": system_prompt}, *messages]

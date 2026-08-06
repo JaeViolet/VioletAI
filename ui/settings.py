@@ -24,10 +24,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from design import Motion, icon
-from memory_store import CATEGORIES, MemoryRecord, MemoryStore
-from themes import BUILTIN_THEMES, DEFAULT_ACCENT, DEFAULT_THEME_NAME, is_builtin
-from widgets import apply_interaction_cursors
+from memory.manager import CATEGORIES, MemoryManager, MemoryRecord
+from ui.design import Motion, icon
+from ui.themes import BUILTIN_THEMES, DEFAULT_ACCENT, DEFAULT_THEME_NAME, is_builtin
+from ui.widgets import apply_interaction_cursors
 
 TAB_NAMES = [
     "Settings",
@@ -76,7 +76,7 @@ class SettingsOverlay(QFrame):
     closed = Signal()
     theme_changed = Signal()
 
-    def __init__(self, store: MemoryStore, preferences: Preferences | None = None, parent: QWidget | None = None) -> None:
+    def __init__(self, store: MemoryManager, preferences: Preferences | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.store = store
         self.preferences = preferences
@@ -561,7 +561,7 @@ class SettingsOverlay(QFrame):
         self.confirm_panel.hide()
         self.edit_panel.hide()
         self.delete_panel.hide()
-        records = self.store.search_memories(
+        records = self.store.search(
             self.search_input.text().strip(),
             self.category_filter.currentText(),
             include_archived=status != "Enabled",
@@ -599,7 +599,7 @@ class SettingsOverlay(QFrame):
 
     def _confirmed_clear_all(self) -> None:
         self.confirm_panel.hide()
-        self.store.clear_durable()
+        self.store.clear()
         self.refresh()
 
     def _open_edit_panel(self, record: MemoryRecord) -> None:
@@ -623,15 +623,9 @@ class SettingsOverlay(QFrame):
             self.edit_error.show()
             return
         self.edit_panel.hide()
-        self.store.update_memory(
-            record.id,
-            category=record.category,
-            subject=record.subject,
-            key=record.key,
-            value=value,
-            content=f"{record.key}: {value}",
-            manual=True,
-        )
+        record.value = value
+        record.content = f"{record.key}: {value}"
+        self.store.save(record)
         self.refresh()
 
     def _cancel_edit(self) -> None:
@@ -650,7 +644,7 @@ class SettingsOverlay(QFrame):
         self.delete_panel.hide()
         if record is None:
             return
-        self.store.delete_memory(record.id)
+        self.store.delete(record.id)
         self.refresh()
 
     def _cancel_delete(self) -> None:
@@ -661,7 +655,7 @@ class MemoryRow(QFrame):
     def __init__(
         self,
         record: MemoryRecord,
-        store: MemoryStore,
+        store: MemoryManager,
         refresh_callback,
         edit_requested,
         delete_requested,
@@ -699,9 +693,9 @@ class MemoryRow(QFrame):
 
     def toggle_archive(self) -> None:
         if self.record.active:
-            self.store.archive_memory(self.record.id)
+            self.store.archive(self.record.id)
         else:
-            self.store.restore_memory(self.record.id)
+            self.store.restore(self.record.id)
         self.refresh_callback()
 
 

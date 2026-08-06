@@ -1,4 +1,4 @@
-"""JSON persistence for local chat conversations."""
+﻿"""JSON persistence for local chat conversations."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from config import CONVERSATIONS_DIR, DEFAULT_MODEL_NAME
+from core.config import CONVERSATIONS_DIR, DEFAULT_MODEL_NAME
 
 
 def utc_now() -> str:

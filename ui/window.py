@@ -1,26 +1,19 @@
-"""Native desktop chat interface for VioletAI."""
+﻿"""Main window UI for VioletAI."""
 
 from __future__ import annotations
 
-import sys
 import os
-from time import perf_counter
 
 from PySide6.QtCore import (
-    QEasingCurve,
     QEvent,
     QObject,
-    QPropertyAnimation,
-    QPoint,
     QSize,
     Signal,
-    QThread,
     Qt,
     QTimer,
 )
-from PySide6.QtGui import QCloseEvent, QCursor, QFont, QResizeEvent
+from PySide6.QtGui import QCloseEvent, QResizeEvent
 from PySide6.QtWidgets import (
-    QApplication,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -29,34 +22,33 @@ from PySide6.QtWidgets import (
     QMenu,
     QPushButton,
     QLayout,
-    QScrollArea,
-    QSizePolicy,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from config import (
+from core.config import (
     APP_FOOTER_TEXT,
     APP_NAME,
     DEFAULT_MODEL_NAME,
     MEMORY_DB_PATH,
     SYSTEM_PROMPT,
 )
-from conversation_store import Conversation, ConversationStore
-from design import Motion, PNG_CONTROL_ICON_SIZE, app_stylesheet, icon
-from memory_manager import SettingsOverlay
-from memory_store import MemoryStore
-from ollama_client import ModelDiscoveryWorker, OllamaWorker
-from preferences import Preferences
-from prompts import build_ollama_messages
-from sidebar import ChatSidebar, SearchOverlay
-from widgets import (
+from conversations.manager import Conversation, ConversationStore
+from core.prompts import build_ollama_messages
+from core.engine import Engine, ModelManager
+from memory.manager import LocalMemoryBackend, MemoryManager
+from tools.manager import available_tools
+from ui.chat_view import ChatView
+from ui.design import PNG_CONTROL_ICON_SIZE, icon
+from ui.styles import app_stylesheet
+from ui.preferences import Preferences
+from ui.settings import SettingsOverlay
+from ui.sidebar import ChatSidebar, SearchOverlay
+from ui.widgets import (
     AutoGrowingInput,
-    MessageActions,
     MessageBubble,
     ModelSelector,
-    ThinkingBubble,
     apply_interaction_cursors,
 )
 
@@ -123,7 +115,6 @@ class ConfirmBackdrop(QFrame):
 
 class MainWindow(QMainWindow):
     CONTENT_MAX_WIDTH = 760
-    NEAR_BOTTOM_PX = 90
 
     def __init__(self) -> None:
         super().__init__()
@@ -131,43 +122,29 @@ class MainWindow(QMainWindow):
         self.active_model = self.preferences.selected_model or DEFAULT_MODEL_NAME
         self.available_models: list[str] = []
         self.store = ConversationStore()
-        self.memory_store = MemoryStore(MEMORY_DB_PATH)
+        self.memory_store = MemoryManager(LocalMemoryBackend(MEMORY_DB_PATH))
         self.conversation = self._load_or_create_conversation()
         self.messages = self.conversation.messages
 
-        self.thread: QThread | None = None
-        self.worker: OllamaWorker | None = None
-        self.model_thread: QThread | None = None
-        self.model_worker: ModelDiscoveryWorker | None = None
-        self.pending_bubble: MessageBubble | None = None
-        self.pending_row: QWidget | None = None
-        self.pending_column: QWidget | None = None
-        self.thinking_row: QWidget | None = None
-        self.streamed_answer = ""
-        self._first_token_at: float | None = None
-        self._finalized_current_response = False
-        self._generation_cancel_requested = False
-        self._scroll_animation: QPropertyAnimation | None = None
-        self._programmatic_scroll = False
-        self._auto_scroll_enabled = True
-        self._middle_scroll_origin: QPoint | None = None
-        self._middle_scroll_timer = QTimer(self)
-        self._middle_scroll_timer.setInterval(16)
-        self._middle_scroll_timer.timeout.connect(self._perform_middle_scroll)
+        self.engine = Engine(self)
+        self.engine.connected.connect(lambda: self._set_status("Thinking"))
+        self.engine.chunk_received.connect(self._receive_chunk)
+        self.engine.finished.connect(self._receive_response)
+        self.engine.cancelled.connect(self._receive_cancelled)
+        self.engine.failed.connect(self._receive_error)
+        self.engine.stopped.connect(self._cleanup_worker)
+        self.model_manager = ModelManager(self)
+        self.model_manager.finished.connect(self._models_discovered)
+        self.model_manager.failed.connect(self._models_failed)
 
-        self._render_timer = QTimer(self)
-        self._render_timer.setSingleShot(True)
-        self._render_timer.setInterval(Motion.STREAM_INTERVAL)
-        self._render_timer.timeout.connect(self._render_stream)
+        self._generation_cancel_requested = False
+
         self._composer_multiline = False
         self._updating_composer_mode = False
         self._composer_edit_sequence = 0
         self._composer_state_changes_this_edit = 0
         self._composer_total_state_changes = 0
         self._composer_layout_diagnostics: list[dict[str, object]] = []
-        self._bulk_rebuilding_messages = False
-        self._message_rebuild_active = False
-        self._rebuild_finish_active = False
         self._composer_mode_timer = QTimer(self)
         self._composer_mode_timer.setSingleShot(True)
         self._composer_mode_timer.timeout.connect(self._update_composer_mode)
@@ -213,22 +190,10 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(0)
         root.addWidget(self.chat_panel, 1)
 
-        self.message_container = QWidget(objectName="messageContainer")
-        self.message_layout = QVBoxLayout(self.message_container)
-        self.message_layout.setContentsMargins(24, 28, 24, 24)
-        self.message_layout.setSpacing(22)
-        self.message_layout.setSizeConstraint(QLayout.SizeConstraint.SetMinAndMaxSize)
-        self.message_layout.addStretch(1)
-
-        self.scroll_area = QScrollArea(objectName="chatScroll")
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
-        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.scroll_area.verticalScrollBar().valueChanged.connect(self._handle_scroll_change)
-        self.scroll_area.verticalScrollBar().rangeChanged.connect(self._rebuild_range_changed)
-        self.scroll_area.setWidget(self.message_container)
-        self.scroll_area.viewport().installEventFilter(self)
-        main_layout.addWidget(self.scroll_area, 1)
+        self.chat_view = ChatView()
+        self.chat_view.regenerate_requested.connect(self.regenerate_response)
+        self.chat_view.viewport_resized.connect(self._on_chat_viewport_resized)
+        main_layout.addWidget(self.chat_view, 1)
 
         self.input_panel = QFrame(objectName="inputPanel")
         input_outer = QHBoxLayout(self.input_panel)
@@ -347,17 +312,14 @@ class MainWindow(QMainWindow):
 
     def _build_tools_menu(self) -> QMenu:
         menu = QMenu(self)
-        tools = [
-            "Web Search",
-            "Upload Files",
-            "Upload Images",
-            "Deep Research",
-            "Image Generation",
-        ]
-        for tool_name in tools:
-            action = menu.addAction(f"{tool_name} - Coming soon")
-            action.setEnabled(False)
-            action.setData(tool_name)
+        for tool in available_tools():
+            if tool.handler is None:
+                action = menu.addAction(f"{tool.name} - Coming soon")
+                action.setEnabled(False)
+            else:
+                action = menu.addAction(tool.name)
+                action.triggered.connect(lambda checked=False, handler=tool.handler: handler(self))
+            action.setData(tool.name)
         return menu
 
     def _set_composer_layout_mode(self, multiline: bool) -> None:
@@ -384,16 +346,16 @@ class MainWindow(QMainWindow):
                 self.stop_button.hide()
                 self.toolbar_tools_button.show()
                 self.toolbar_model_selector.show()
-                self.toolbar_send_button.setVisible(self.thread is None)
-                self.toolbar_stop_button.setVisible(self.thread is not None)
+                self.toolbar_send_button.setVisible(not self.engine.running)
+                self.toolbar_stop_button.setVisible(self.engine.running)
                 self.toolbar_widget.setMaximumHeight(16_777_215)
                 self.toolbar_widget.show()
             else:
                 self.composer_layout.setContentsMargins(12, 4, 6, 4)
                 self.tools_button.show()
                 self.model_selector.show()
-                self.send_button.setVisible(self.thread is None)
-                self.stop_button.setVisible(self.thread is not None)
+                self.send_button.setVisible(not self.engine.running)
+                self.stop_button.setVisible(self.engine.running)
                 self.toolbar_widget.hide()
                 self.toolbar_widget.setMaximumHeight(0)
             self.composer_layout.activate()
@@ -436,7 +398,7 @@ class MainWindow(QMainWindow):
             self._set_visible_if_needed(self.model_selector, not multiline)
             self._set_visible_if_needed(self.toolbar_tools_button, multiline)
             self._set_visible_if_needed(self.toolbar_model_selector, multiline)
-            if self.thread is None:
+            if not self.engine.running:
                 self._set_visible_if_needed(self.send_button, not multiline)
                 self._set_visible_if_needed(self.toolbar_send_button, multiline)
                 self._set_visible_if_needed(self.stop_button, False)
@@ -454,7 +416,7 @@ class MainWindow(QMainWindow):
     def _stable_composer_text_width(self) -> int:
         row_spacing = self.input_row.spacing()
         control_width = 0
-        visible_controls = (self.tools_button, self.model_selector, self.send_button if self.thread is None else self.stop_button)
+        visible_controls = (self.tools_button, self.model_selector, self.send_button if not self.engine.running else self.stop_button)
         for control in visible_controls:
             hint = control.sizeHint()
             control_width += max(control.width(), hint.width(), control.minimumWidth())
@@ -483,100 +445,9 @@ class MainWindow(QMainWindow):
         if os.environ.get("VIOLETAI_COMPOSER_DIAGNOSTICS") == "1":
             print(f"Composer {record}", flush=True)
 
-    def _make_welcome(self) -> QWidget:
-        row = QWidget()
-        row.setProperty("messageRow", True)
-        row_layout = QHBoxLayout(row)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.setSpacing(0)
-
-        content = QWidget(objectName="welcomeContentColumn")
-        content.setProperty("welcomeContentColumn", True)
-        content_layout = QHBoxLayout(content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(0)
-
-        welcome = QWidget(objectName="welcome")
-        layout = QVBoxLayout(welcome)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(7)
-        icon = QLabel(APP_NAME, objectName="welcomeIcon")
-        title = QLabel("How can I help you today?", objectName="welcomeTitle")
-        subtitle = QLabel("Private, local, and running on your machine.", objectName="welcomeSubtitle")
-        for label in (icon, title, subtitle):
-            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            layout.addWidget(label)
-        content_layout.addWidget(welcome)
-        row.setProperty("contentColumn", content)
-        row_layout.addStretch(1)
-        row_layout.addWidget(content)
-        row_layout.addStretch(1)
-        return row
-
-    def _clear_message_rows(self) -> None:
-        while self.message_layout.count() > 1:
-            item = self.message_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self.pending_bubble = None
-        self.pending_row = None
-        self.pending_column = None
-        self.thinking_row = None
-
     def _rebuild_messages(self) -> None:
-        self._message_rebuild_active = True
-        self.setUpdatesEnabled(False)
-        try:
-            self._clear_message_rows()
-            visible_messages = [
-                (index, message)
-                for index, message in enumerate(self.messages)
-                if message.get("role") != "system"
-            ]
-            if not visible_messages:
-                self.message_layout.insertStretch(0, 2)
-                self.message_layout.insertWidget(1, self._make_welcome())
-                self.message_layout.insertStretch(2, 4)
-            else:
-                self._bulk_rebuilding_messages = True
-                try:
-                    for index, message in visible_messages:
-                        self._add_message(message.get("content", ""), message.get("role", "assistant"), index)
-                finally:
-                    self._bulk_rebuilding_messages = False
-            self._resize_rows()
-        finally:
-            self._message_rebuild_active = False
-            self.setUpdatesEnabled(True)
-        QTimer.singleShot(0, self._scroll_to_rebuild_bottom)
-        QTimer.singleShot(30, self._scroll_to_rebuild_bottom)
-
-    def _scroll_to_rebuild_bottom(self) -> None:
-        bar = self.scroll_area.verticalScrollBar()
-        if bar is None:
-            return
-        self._rebuild_finish_active = True
-        self._programmatic_scroll = True
-        bar.setValue(bar.maximum())
-        self._programmatic_scroll = False
-        QTimer.singleShot(60, self._release_rebuild_scroll_lock)
-
-    def _release_rebuild_scroll_lock(self) -> None:
-        self._rebuild_finish_active = False
-        bar = self.scroll_area.verticalScrollBar()
-        if bar is not None and bar.maximum() != bar.value():
-            self._programmatic_scroll = True
-            bar.setValue(bar.maximum())
-            self._programmatic_scroll = False
-
-    def _rebuild_range_changed(self, _minimum: int, _maximum: int) -> None:
-        if not self._rebuild_finish_active:
-            return
-        bar = self.scroll_area.verticalScrollBar()
-        if bar is not None:
-            self._programmatic_scroll = True
-            bar.setValue(bar.maximum())
-            self._programmatic_scroll = False
+        self.chat_view.rebuild_messages(self.messages)
+        self._resize_rows()
 
     def _rebuild_sidebar(self) -> None:
         self.setUpdatesEnabled(False)
@@ -600,7 +471,7 @@ class MainWindow(QMainWindow):
         self.select_conversation(conversation_id)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if not hasattr(self, "scroll_area"):
+        if not hasattr(self, "chat_panel"):
             return super().eventFilter(watched, event)
         if (
             watched is self.chat_panel
@@ -629,17 +500,6 @@ class MainWindow(QMainWindow):
         ):
             if event.type() == QEvent.Type.Resize:
                 QTimer.singleShot(0, self._position_confirm_overlay)
-        if watched is self.scroll_area.viewport() and event.type() == QEvent.Type.Resize:
-            if not self._message_rebuild_active:
-                QTimer.singleShot(0, self._resize_rows)
-        if watched is self.scroll_area.viewport() and event.type() == QEvent.Type.MouseButtonPress:
-            if event.button() == Qt.MouseButton.MiddleButton:
-                self._toggle_middle_scroll(event.position().toPoint())
-                return True
-            if self._middle_scroll_timer.isActive():
-                self._stop_middle_scroll()
-        if event.type() == QEvent.Type.KeyPress and event.key() == Qt.Key.Key_Escape:
-            self._stop_middle_scroll()
         return super().eventFilter(watched, event)
 
     def _position_search_overlay(self) -> None:
@@ -668,8 +528,7 @@ class MainWindow(QMainWindow):
         self._resize_rows()
 
     def _resize_rows(self) -> None:
-        viewport_width = self.scroll_area.viewport().width()
-        available = max(280, min(self.CONTENT_MAX_WIDTH, viewport_width - 96))
+        available = self.chat_view._available_width()
         if self.composer.width() != available:
             self.composer.setFixedWidth(available)
         if hasattr(self, "input_panel") and self.input_panel.layout() is not None:
@@ -677,220 +536,28 @@ class MainWindow(QMainWindow):
         if hasattr(self, "input_box"):
             self.input_box._update_height()
         self._schedule_composer_mode_update()
-        for index in range(self.message_layout.count() - 1):
-            row = self.message_layout.itemAt(index).widget()
-            if row and row.property("messageRow"):
-                content = row.property("contentColumn")
-                if isinstance(content, QWidget):
-                    content.setMinimumWidth(available)
-                    content.setMaximumWidth(available)
-                bubble = row.property("bubble")
-                if isinstance(bubble, MessageBubble):
-                    max_width = int(available * 2 / 3) if bubble.role == "user" else available
-                    if bubble.role == "user":
-                        compact_width = bubble.preferred_width(max_width)
-                        bubble.setFixedWidth(compact_width)
-                        parent = bubble.parentWidget()
-                        if parent is not None:
-                            parent.setMinimumWidth(compact_width)
-                            parent.setMaximumWidth(compact_width)
-                    else:
-                        parent = bubble.parentWidget()
-                        if parent is not None:
-                            parent.setMinimumWidth(min(260, max_width))
-                            parent.setMaximumWidth(max_width)
-                        bubble.setMinimumWidth(min(260, max_width))
-                        bubble.setMaximumWidth(max_width)
-                    bubble.updateGeometry()
-                    self._settle_message_row(row, bubble)
-                else:
-                    self._settle_content_row(row, content if isinstance(content, QWidget) else None)
-        self.message_layout.activate()
-        self.message_container.setMinimumHeight(self.message_layout.sizeHint().height())
-        self.message_container.updateGeometry()
+        self.chat_view.resize_rows(available)
 
-    def _settle_message_row(self, row: QWidget, bubble: MessageBubble) -> None:
-        column = bubble.parentWidget()
-        content = row.property("contentColumn")
-        if column is not None:
-            if column.layout() is not None:
-                column.layout().activate()
-            column.setMinimumHeight(column.sizeHint().height())
-            column.updateGeometry()
-        if isinstance(content, QWidget):
-            if content.layout() is not None:
-                content.layout().activate()
-            content.setMinimumHeight(content.sizeHint().height())
-            content.updateGeometry()
-        if row.layout() is not None:
-            row.layout().activate()
-        row.setMinimumHeight(row.sizeHint().height())
-        row.updateGeometry()
-
-    def _settle_content_row(self, row: QWidget, content: QWidget | None) -> None:
-        if content is not None:
-            if content.layout() is not None:
-                content.layout().activate()
-            content.setMinimumHeight(content.sizeHint().height())
-            content.updateGeometry()
-        if row.layout() is not None:
-            row.layout().activate()
-        row.setMinimumHeight(row.sizeHint().height())
-        row.updateGeometry()
+    def _on_chat_viewport_resized(self) -> None:
+        QTimer.singleShot(0, self._resize_rows)
 
     def _add_message(self, text: str, role: str, message_index: int | None = None) -> MessageBubble:
-        row = QWidget()
-        row.setProperty("messageRow", True)
-        row_layout = QHBoxLayout(row)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.setSpacing(0)
-
-        content = QWidget()
-        content.setObjectName("messageContentColumn")
-        content_layout = QHBoxLayout(content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(0)
-
-        column = QWidget()
-        if role == "user":
-            column.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Minimum)
-        else:
-            column.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
-        column_layout = QVBoxLayout(column)
-        column_layout.setContentsMargins(0, 0, 0, 0)
-        column_layout.setSpacing(6)
-        if role == "user":
-            column_layout.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
-        bubble = MessageBubble(text, role)
-        row.setProperty("bubble", bubble)
-        row.setProperty("contentColumn", content)
-        column_layout.addWidget(bubble)
-        if role == "assistant" and message_index is not None:
-            self._attach_actions(column_layout, bubble, message_index)
-
-        if role == "user":
-            content_layout.addStretch()
-            content_layout.addWidget(column)
-        else:
-            content_layout.addWidget(column, 1)
-            content_layout.addStretch()
-        row_layout.addStretch(1)
-        row_layout.addWidget(content)
-        row_layout.addStretch(1)
-        self.message_layout.insertWidget(self.message_layout.count() - 1, row)
-        apply_interaction_cursors(row)
-        self._animate_appearance(row)
-        if not self._bulk_rebuilding_messages:
-            self._resize_rows()
-        return bubble
-
-    def _toggle_middle_scroll(self, position: QPoint) -> None:
-        if self._middle_scroll_timer.isActive():
-            self._stop_middle_scroll()
-            return
-        self._middle_scroll_origin = position
-        self.scroll_area.viewport().setCursor(Qt.CursorShape.SizeVerCursor)
-        self._middle_scroll_timer.start()
-
-    def _perform_middle_scroll(self) -> None:
-        if self._middle_scroll_origin is None:
-            return
-        local_pos = self.scroll_area.viewport().mapFromGlobal(QCursor.pos())
-        delta = local_pos.y() - self._middle_scroll_origin.y()
-        if abs(delta) < 8:
-            return
-        bar = self.scroll_area.verticalScrollBar()
-        bar.setValue(bar.value() + int(delta / 8))
-
-    def _stop_middle_scroll(self) -> None:
-        self._middle_scroll_timer.stop()
-        self._middle_scroll_origin = None
-        self.scroll_area.viewport().unsetCursor()
-
-    def _animate_appearance(self, row: QWidget) -> None:
-        row.setGraphicsEffect(None)
-
-    def _attach_actions(self, layout: QVBoxLayout, bubble: MessageBubble, message_index: int) -> None:
-        actions = MessageActions()
-        actions.copy_requested.connect(lambda: QApplication.clipboard().setText(bubble.text()))
-        actions.regenerate_requested.connect(lambda: self.regenerate_response(message_index))
-        layout.addWidget(actions)
-        apply_interaction_cursors(actions)
-
-    def _show_thinking(self) -> None:
-        self._remove_thinking()
-        row = QWidget()
-        row.setProperty("messageRow", True)
-        layout = QHBoxLayout(row)
-        layout.setContentsMargins(0, 0, 0, 0)
-        content = QWidget()
-        content.setObjectName("messageContentColumn")
-        content_layout = QHBoxLayout(content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.addWidget(ThinkingBubble())
-        content_layout.addStretch()
-        row.setProperty("contentColumn", content)
-        layout.addStretch(1)
-        layout.addWidget(content)
-        layout.addStretch(1)
-        self.message_layout.insertWidget(self.message_layout.count() - 1, row)
-        self.thinking_row = row
-        self._resize_rows()
-        self._scroll_to_bottom()
-
-    def _remove_thinking(self) -> None:
-        if self.thinking_row is not None:
-            self.message_layout.removeWidget(self.thinking_row)
-            self.thinking_row.deleteLater()
-            self.thinking_row = None
-
-    def _handle_scroll_change(self, _value: int) -> None:
-        if self._programmatic_scroll:
-            return
-        self._auto_scroll_enabled = self._is_near_bottom()
-
-    def _is_near_bottom(self) -> bool:
-        bar = self.scroll_area.verticalScrollBar()
-        return bar.maximum() - bar.value() <= self.NEAR_BOTTOM_PX
-
-    def _scroll_to_bottom(self, smooth: bool = False) -> None:
-        QTimer.singleShot(0, lambda: self._perform_scroll(smooth))
-
-    def _perform_scroll(self, smooth: bool) -> None:
-        bar = self.scroll_area.verticalScrollBar()
-        target = bar.maximum()
-        self._programmatic_scroll = True
-        try:
-            if not smooth or abs(target - bar.value()) < 30:
-                bar.setValue(target)
-                return
-            if self._scroll_animation is not None:
-                self._scroll_animation.stop()
-            self._scroll_animation = QPropertyAnimation(bar, b"value", self)
-            self._scroll_animation.setDuration(120)
-            self._scroll_animation.setStartValue(bar.value())
-            self._scroll_animation.setEndValue(target)
-            self._scroll_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-            self._scroll_animation.finished.connect(lambda: setattr(self, "_programmatic_scroll", False))
-            self._scroll_animation.start()
-        finally:
-            if self._scroll_animation is None or self._scroll_animation.state() != QPropertyAnimation.State.Running:
-                self._programmatic_scroll = False
+        return self.chat_view.add_message(text, role, message_index)
 
     def new_chat(self) -> None:
-        if self.thread is not None:
+        if self.engine.running:
             self.stop_generation()
             return
         self.conversation = self.store.create(SYSTEM_PROMPT, self.active_model)
         self.messages = self.conversation.messages
         self.input_box.clear()
-        self.streamed_answer = ""
+        self.chat_view.reset_stream()
         self._set_status("Ready")
         self._rebuild_sidebar()
         self._rebuild_messages()
 
     def select_conversation(self, conversation_id: str) -> None:
-        if self.thread is not None:
+        if self.engine.running:
             return
         conversation = self.store.load_by_id(conversation_id)
         if conversation is None:
@@ -950,7 +617,7 @@ class MainWindow(QMainWindow):
 
     def send_message(self) -> None:
         message = self.input_box.toPlainText().strip()
-        if not message or self.thread is not None:
+        if not message or self.engine.running:
             return
         self.input_box.remember_prompt(message)
         self._add_message(message, "user", len(self.messages))
@@ -959,7 +626,7 @@ class MainWindow(QMainWindow):
         self.store.save(self.conversation)
         self._rebuild_sidebar()
         self.input_box.clear()
-        self._scroll_to_bottom()
+        self.chat_view.scroll_to_bottom()
         self._start_generation()
 
     def _start_generation(
@@ -967,40 +634,19 @@ class MainWindow(QMainWindow):
         ollama_messages: list[dict[str, str]] | None = None,
         show_thinking: bool = True,
     ) -> None:
-        self.streamed_answer = ""
-        self.pending_bubble = None
-        self.pending_row = None
-        self._first_token_at = None
-        self._finalized_current_response = False
+        self.chat_view.reset_stream()
         self._generation_cancel_requested = False
-        self._auto_scroll_enabled = True
         if show_thinking:
-            self._show_thinking()
+            self.chat_view.show_thinking()
         self._set_controls_generating(True)
         self._set_status("Connecting")
 
-        self.thread = QThread(self)
         if ollama_messages is None:
             ollama_messages = build_ollama_messages(self.messages, SYSTEM_PROMPT)
-        self.worker = OllamaWorker(
-            ollama_messages,
-            self.active_model,
-            think=False,
-        )
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.connected.connect(lambda: self._set_status("Thinking"))
-        self.worker.chunk_received.connect(self._receive_chunk)
-        self.worker.finished.connect(self._receive_response)
-        self.worker.cancelled.connect(self._receive_cancelled)
-        self.worker.failed.connect(self._receive_error)
-        self.worker.stopped.connect(self.worker.deleteLater)
-        self.worker.stopped.connect(self.thread.quit)
-        self.thread.finished.connect(self._cleanup_worker)
-        self.thread.start()
+        self.engine.start(ollama_messages, self.active_model)
 
     def regenerate_response(self, message_index: int) -> None:
-        if self.thread is not None:
+        if self.engine.running:
             return
         if not 0 <= message_index < len(self.messages):
             return
@@ -1012,51 +658,27 @@ class MainWindow(QMainWindow):
         self._start_generation()
 
     def stop_generation(self) -> None:
-        if self.worker is None:
+        if not self.engine.running:
             return
         self._generation_cancel_requested = True
         self._set_status("Stopped")
-        self.worker.cancel()
-        self._render_stream(force=True)
+        self.engine.cancel()
+        self.chat_view.render_stream(force=True)
         self._finalize_partial_response(stopped=True)
 
     def _receive_chunk(self, chunk: str) -> None:
         if self._generation_cancel_requested:
             return
-        if self._first_token_at is None:
-            self._first_token_at = perf_counter()
-        if self.pending_bubble is None:
-            self._remove_thinking()
-            self.pending_bubble = self._add_message("", "assistant")
-            self.pending_row = self.pending_bubble.parentWidget().parentWidget()
-            self.pending_column = self.pending_bubble.parentWidget()
-        self.streamed_answer += chunk
+        self.chat_view.on_chunk(chunk)
         self._set_status("Generating")
-        if not self._render_timer.isActive():
-            self._render_timer.start()
-
-    def _render_stream(self, force: bool = False) -> None:
-        if self.pending_bubble is not None:
-            self.pending_bubble.set_text(self.streamed_answer)
-            self._finalize_message_geometry()
-            if self._auto_scroll_enabled or force:
-                self._scroll_to_bottom(smooth=True)
 
     def _receive_response(self, answer: str) -> None:
         if self._generation_cancel_requested:
             return
-        self._render_timer.stop()
-        self._remove_thinking()
-        if self.pending_bubble is None:
-            self.pending_bubble = self._add_message(answer, "assistant")
-            self.pending_row = self.pending_bubble.parentWidget().parentWidget()
-            self.pending_column = self.pending_bubble.parentWidget()
-        else:
-            self.pending_bubble.set_text(answer)
-        self._finalize_message_geometry()
+        self.chat_view.finalize_response(answer)
         self._append_assistant_message(answer)
-        if self._auto_scroll_enabled:
-            self._scroll_to_bottom(smooth=True)
+        if self.chat_view.auto_scroll_enabled():
+            self.chat_view.scroll_to_bottom(smooth=True)
         self._set_status("Ready")
 
     def _receive_cancelled(self) -> None:
@@ -1067,62 +689,47 @@ class MainWindow(QMainWindow):
         if self._generation_cancel_requested:
             return
         failed_stage = self._response_failure_stage(error)
-        self._render_timer.stop()
-        self._remove_thinking()
-        if self.pending_bubble is not None and self.streamed_answer.strip():
-            self.pending_bubble.set_text(self.streamed_answer)
+        self.chat_view.stop_render()
+        self.chat_view.remove_thinking()
+        if self.chat_view.has_pending_stream():
+            self.chat_view.set_pending_text(self.chat_view.streamed_answer)
             self._finalize_partial_response(stopped=True)
             error_message = self._format_generation_error(error, failed_stage, partial=True)
         else:
             error_message = self._format_generation_error(error, failed_stage)
-        self._add_message(error_message, "error")
+        self.chat_view.add_message(error_message, "error")
         self.store.save(self.conversation)
         self._set_status("Error")
-        self._scroll_to_bottom()
+        self.chat_view.scroll_to_bottom()
 
     def _append_assistant_message(self, answer: str) -> None:
-        if self._finalized_current_response:
+        if self.chat_view.is_finalized():
             return
         self.messages.append({"role": "assistant", "content": answer})
         self.conversation.model = self.active_model
         self.store.save(self.conversation)
-        self._finalized_current_response = True
+        self.chat_view.mark_finalized()
         self._rebuild_sidebar()
-        if self.pending_row is not None and self.pending_bubble is not None:
-            message_index = len(self.messages) - 1
-            column = self.pending_bubble.parentWidget()
-            if isinstance(column, QWidget) and column.layout() is not None:
-                self._attach_actions(column.layout(), self.pending_bubble, message_index)
-        self._finalize_message_geometry()
-
-    def _finalize_message_geometry(self) -> None:
-        if self.pending_bubble is not None:
-            self.pending_bubble.layout.invalidate()
-            self.pending_bubble.adjustSize()
-        self.message_container.layout().activate()
-        self.message_container.adjustSize()
-        self._resize_rows()
+        self.chat_view.attach_pending_actions(len(self.messages) - 1)
+        self.chat_view.finalize_geometry()
 
     def _finalize_partial_response(self, stopped: bool = False) -> None:
-        answer = self.streamed_answer.strip()
+        answer = self.chat_view.streamed_answer.strip()
         if stopped and answer:
             answer = f"{answer}\n\n_Response stopped._"
-            if self.pending_bubble is not None:
-                self.pending_bubble.set_text(answer)
+            self.chat_view.set_pending_text(answer)
         if answer:
             self._append_assistant_message(answer)
         else:
-            self._remove_thinking()
+            self.chat_view.remove_thinking()
             self.store.save(self.conversation)
 
     def _response_failure_stage(self, error: str) -> str:
         lowered = error.casefold()
         if "cancel" in lowered:
             return "Generation"
-        if self._first_token_at is None:
+        if self.chat_view.first_token_at is None:
             return "First Token"
-        if self.streamed_answer.strip():
-            return "Generate"
         return "Generate"
 
     def _format_generation_error(self, error: str, failed_stage: str, partial: bool = False) -> str:
@@ -1139,13 +746,7 @@ class MainWindow(QMainWindow):
         }.get(failed_stage, failed_stage or "generation")
 
     def _cleanup_worker(self) -> None:
-        if self.thread is not None:
-            self.thread.deleteLater()
-        self.worker = None
-        self.thread = None
-        self.pending_bubble = None
-        self.pending_row = None
-        self.pending_column = None
+        self.chat_view.clear_pending()
         self._set_controls_generating(False)
         if self.footer_status.text() in {"Connecting...", "Thinking...", "Generating..."}:
             self._set_status("Ready")
@@ -1172,18 +773,7 @@ class MainWindow(QMainWindow):
             self.send_button.setVisible(not generating)
 
     def _refresh_models(self) -> None:
-        if self.model_thread is not None:
-            return
-        self.model_thread = QThread(self)
-        self.model_worker = ModelDiscoveryWorker()
-        self.model_worker.moveToThread(self.model_thread)
-        self.model_thread.started.connect(self.model_worker.run)
-        self.model_worker.finished.connect(self._models_discovered)
-        self.model_worker.failed.connect(self._models_failed)
-        self.model_worker.stopped.connect(self.model_worker.deleteLater)
-        self.model_worker.stopped.connect(self.model_thread.quit)
-        self.model_thread.finished.connect(self._cleanup_model_worker)
-        self.model_thread.start()
+        self.model_manager.start()
 
     def _models_discovered(self, models: list[str]) -> None:
         self.available_models = models
@@ -1191,12 +781,6 @@ class MainWindow(QMainWindow):
 
     def _models_failed(self, _error: str) -> None:
         self._set_model_selector(self.available_models)
-
-    def _cleanup_model_worker(self) -> None:
-        if self.model_thread is not None:
-            self.model_thread.deleteLater()
-        self.model_thread = None
-        self.model_worker = None
 
     def _set_model_selector(self, models: list[str]) -> None:
         current = self.active_model or DEFAULT_MODEL_NAME
@@ -1215,7 +799,7 @@ class MainWindow(QMainWindow):
         self.toolbar_model_selector.blockSignals(False)
 
     def _model_changed(self, model_name: str) -> None:
-        if not model_name or self.thread is not None:
+        if not model_name or self.engine.running:
             return
         self.active_model = model_name
         self.preferences.selected_model = model_name
@@ -1237,34 +821,14 @@ class MainWindow(QMainWindow):
             self.footer_status.setText(f"{text}...")
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self.worker is not None:
-            self.worker.cancel()
-        if self.thread is not None:
-            self.thread.quit()
-            if not self.thread.wait(2500):
-                event.ignore()
-                self.thread.finished.connect(self.close)
-                return
-        if self.model_thread is not None:
-            self.model_thread.quit()
-            self.model_thread.wait(1000)
-        self._stop_middle_scroll()
+        if not self.engine.shutdown(2500):
+            event.ignore()
+            if self.engine.thread is not None:
+                self.engine.thread.finished.connect(self.close)
+            return
+        self.model_manager.shutdown(1000)
+        self.chat_view.stop_middle_scroll()
         event.accept()
 
     def _apply_style(self) -> None:
         self.setStyleSheet(app_stylesheet(accent=self.preferences.theme_accent))
-
-
-def main() -> int:
-    app = QApplication(sys.argv)
-    app.setApplicationName(APP_NAME)
-    app.setStyle("Fusion")
-    font = QFont("Segoe UI Variable", 10)
-    app.setFont(font)
-    window = MainWindow()
-    window.show()
-    return app.exec()
-
-
-if __name__ == "__main__":
-    sys.exit(main())

@@ -1,4 +1,4 @@
-"""Collapsible conversation sidebar and floating search overlay."""
+﻿"""Collapsible conversation sidebar and floating search overlay."""
 
 from __future__ import annotations
 
@@ -18,10 +18,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from config import APP_NAME
-from conversation_store import Conversation
-from design import Motion, icon
-from widgets import apply_interaction_cursors
+from core.config import APP_NAME
+from conversations.manager import Conversation
+from ui.design import Motion, icon
+from ui.widgets import apply_interaction_cursors
 
 
 class InlineRenameEditor(QLineEdit):
