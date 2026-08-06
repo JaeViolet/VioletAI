@@ -25,8 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from design import Motion, icon
-from memory_v2.models import CATEGORIES, MemoryRecord
-from memory_v2.store import MemoryStore
+from memory_store import CATEGORIES, MemoryRecord, MemoryStore
 from themes import BUILTIN_THEMES, DEFAULT_ACCENT, DEFAULT_THEME_NAME, is_builtin
 from widgets import apply_interaction_cursors
 
@@ -679,7 +678,7 @@ class MemoryRow(QFrame):
         value = QLabel(record.value)
         value.setObjectName("memoryValue")
         value.setWordWrap(True)
-        meta = QLabel(f"{record.category} · {record.key}")
+        meta = QLabel(f"{record.category} ┬╖ {record.key}")
         meta.setObjectName("memoryMeta")
         stamp = QLabel(_format_memory_stamp(record.created_at))
         stamp.setObjectName("memoryMeta")

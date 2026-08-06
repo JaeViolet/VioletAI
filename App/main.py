@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import UTC, datetime
 import sys
 import os
 from time import perf_counter
@@ -16,7 +14,6 @@ from PySide6.QtCore import (
     QPoint,
     QSize,
     Signal,
-    Slot,
     QThread,
     Qt,
     QTimer,
@@ -44,14 +41,12 @@ from config import (
     APP_NAME,
     DEFAULT_MODEL_NAME,
     MEMORY_DB_PATH,
-    MEMORY_LOG_PATH,
     SYSTEM_PROMPT,
 )
 from conversation_store import Conversation, ConversationStore
 from design import Motion, PNG_CONTROL_ICON_SIZE, app_stylesheet, icon
 from memory_manager import SettingsOverlay
-from memory_v2.pipeline import MemorySystem
-from memory_v2.store import MemoryStore
+from memory_store import MemoryStore
 from ollama_client import ModelDiscoveryWorker, OllamaWorker
 from preferences import Preferences
 from prompts import build_ollama_messages
@@ -64,56 +59,6 @@ from widgets import (
     ThinkingBubble,
     apply_interaction_cursors,
 )
-
-
-@dataclass
-class PreparedRequest:
-    outcome: object
-    ollama_messages: list[dict[str, str]]
-
-
-class RequestPreparationWorker(QObject):
-    finished = Signal(object)
-    failed = Signal(str)
-    stopped = Signal()
-
-    def __init__(
-        self,
-        memory_system: MemorySystem,
-        messages: list[dict[str, str]],
-        message: str,
-        conversation_id: str,
-        source_message_id: str,
-        previous_user_text: str | None,
-        system_prompt: str,
-    ) -> None:
-        super().__init__()
-        self._memory_system = memory_system
-        self._messages = messages
-        self._message = message
-        self._conversation_id = conversation_id
-        self._source_message_id = source_message_id
-        self._previous_user_text = previous_user_text
-        self._system_prompt = system_prompt
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            outcome = self._memory_system.handle_user_message(
-                self._message,
-                conversation_id=self._conversation_id,
-                message_id=self._source_message_id,
-                previous_user_text=self._previous_user_text,
-            )
-            relevant_memories = (
-                [item.record for item in outcome.retrieval.selected] if outcome.retrieval is not None else []
-            )
-            ollama_messages = build_ollama_messages(self._messages, relevant_memories, self._system_prompt)
-            self.finished.emit(PreparedRequest(outcome, ollama_messages))
-        except Exception as error:
-            self.failed.emit(str(error))
-        finally:
-            self.stopped.emit()
 
 
 class ConfirmBackdrop(QFrame):
@@ -187,14 +132,11 @@ class MainWindow(QMainWindow):
         self.available_models: list[str] = []
         self.store = ConversationStore()
         self.memory_store = MemoryStore(MEMORY_DB_PATH)
-        self.memory_service = MemorySystem(self.memory_store)
         self.conversation = self._load_or_create_conversation()
         self.messages = self.conversation.messages
 
         self.thread: QThread | None = None
         self.worker: OllamaWorker | None = None
-        self.prep_thread: QThread | None = None
-        self.prep_worker: RequestPreparationWorker | None = None
         self.model_thread: QThread | None = None
         self.model_worker: ModelDiscoveryWorker | None = None
         self.pending_bubble: MessageBubble | None = None
@@ -202,10 +144,7 @@ class MainWindow(QMainWindow):
         self.pending_column: QWidget | None = None
         self.thinking_row: QWidget | None = None
         self.streamed_answer = ""
-        self.current_diagnostics: object | None = None
-        self._ollama_request_started_at: float | None = None
         self._first_token_at: float | None = None
-        self._prompt_ready_at: float | None = None
         self._finalized_current_response = False
         self._generation_cancel_requested = False
         self._scroll_animation: QPropertyAnimation | None = None
@@ -939,8 +878,6 @@ class MainWindow(QMainWindow):
                 self._programmatic_scroll = False
 
     def new_chat(self) -> None:
-        if self.prep_thread is not None:
-            return
         if self.thread is not None:
             self.stop_generation()
             return
@@ -953,7 +890,7 @@ class MainWindow(QMainWindow):
         self._rebuild_messages()
 
     def select_conversation(self, conversation_id: str) -> None:
-        if self.thread is not None or self.prep_thread is not None:
+        if self.thread is not None:
             return
         conversation = self.store.load_by_id(conversation_id)
         if conversation is None:
@@ -1013,14 +950,9 @@ class MainWindow(QMainWindow):
 
     def send_message(self) -> None:
         message = self.input_box.toPlainText().strip()
-        if not message or self.thread is not None or self.prep_thread is not None:
+        if not message or self.thread is not None:
             return
-        previous_user_text = next(
-            (item.get("content", "") for item in reversed(self.messages) if item.get("role") == "user"),
-            None,
-        )
         self.input_box.remember_prompt(message)
-        source_message_id = str(len(self.messages))
         self._add_message(message, "user", len(self.messages))
         self.messages.append({"role": "user", "content": message})
         self.conversation.model = self.active_model
@@ -1028,121 +960,17 @@ class MainWindow(QMainWindow):
         self._rebuild_sidebar()
         self.input_box.clear()
         self._scroll_to_bottom()
-        self._start_request_preparation(message, source_message_id, previous_user_text)
-
-    def _start_request_preparation(
-        self,
-        message: str,
-        source_message_id: str,
-        previous_user_text: str | None,
-    ) -> None:
-        self.streamed_answer = ""
-        self.pending_bubble = None
-        self.pending_row = None
-        self.pending_column = None
-        self._ollama_request_started_at = None
-        self._first_token_at = None
-        self._prompt_ready_at = None
-        self._finalized_current_response = False
-        self._generation_cancel_requested = False
-        self._auto_scroll_enabled = True
-        self._show_thinking()
-        self._set_controls_preparing(True)
-        self._set_status("Thinking")
-
-        self.prep_thread = QThread(self)
-        self.prep_worker = RequestPreparationWorker(
-            self.memory_service,
-            [dict(item) for item in self.messages],
-            message,
-            self.conversation.id,
-            source_message_id,
-            previous_user_text,
-            SYSTEM_PROMPT,
-        )
-        self.prep_worker.moveToThread(self.prep_thread)
-        self.prep_thread.started.connect(self.prep_worker.run)
-        self.prep_worker.finished.connect(self._receive_prepared_request)
-        self.prep_worker.failed.connect(self._request_preparation_failed)
-        self.prep_worker.stopped.connect(self.prep_worker.deleteLater)
-        self.prep_worker.stopped.connect(self.prep_thread.quit)
-        self.prep_thread.finished.connect(self._cleanup_prep_worker)
-        self.prep_thread.start()
-
-    def _receive_prepared_request(self, prepared: PreparedRequest) -> None:
-        self._record_memory_mutation(prepared.outcome)
-        self._start_generation(prepared.ollama_messages, prompt_already_recorded=True, show_thinking=False)
-
-    def _record_memory_mutation(self, outcome: object) -> None:
-        if os.environ.get("VIOLETAI_MEMORY_LOG") != "1":
-            return
-        action = getattr(outcome, "action", None)
-        if action is None:
-            return
-        kind = getattr(action, "value", str(action))
-        status = getattr(getattr(outcome, "action_status", None), "value", "?")
-        retrieval = getattr(outcome, "retrieval", None)
-        injected = bool(getattr(retrieval, "injected", False))
-        try:
-            MEMORY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with open(MEMORY_LOG_PATH, "a", encoding="utf-8") as handle:
-                handle.write(f"{datetime.now(UTC).isoformat()} action={kind} status={status} injected={injected}\n")
-        except OSError:
-            pass
-
-    def _request_preparation_failed(self, error: str) -> None:
-        render_started = perf_counter()
-        self._remove_thinking()
-        message = f"**Response failed**\n\nStage: request preparation\n\nError: {error}"
-        self._add_message(message, "error")
-        self._record_diagnostics_elapsed("render_ms", render_started)
-        self._finalize_diagnostics(message, "Memory Pipeline", error)
-        self._set_controls_preparing(False)
-        self._set_status("Error")
-        self._scroll_to_bottom()
-
-    def _cleanup_prep_worker(self) -> None:
-        if self.prep_thread is not None:
-            self.prep_thread.deleteLater()
-        self.prep_thread = None
-        self.prep_worker = None
-
-    def _refresh_settings_if_visible(self) -> None:
-        if self.settings_overlay.isVisible():
-            QTimer.singleShot(0, self.settings_overlay.refresh)
-
-    def _append_assistant_direct(self, answer: str) -> MessageBubble:
-        bubble = self._add_message(answer, "assistant", len(self.messages))
-        self.messages.append({"role": "assistant", "content": answer})
-        self.conversation.model = self.active_model
-        self.store.save(self.conversation)
-        self._rebuild_sidebar()
-        return bubble
-
-    def regenerate_response(self, message_index: int) -> None:
-        if self.thread is not None or self.prep_thread is not None:
-            return
-        if not 0 <= message_index < len(self.messages):
-            return
-        if self.messages[message_index].get("role") != "assistant":
-            return
-        self.messages[:] = self.messages[:message_index]
-        self.store.save(self.conversation)
-        self._rebuild_messages()
         self._start_generation()
 
     def _start_generation(
         self,
         ollama_messages: list[dict[str, str]] | None = None,
-        prompt_already_recorded: bool = False,
         show_thinking: bool = True,
     ) -> None:
         self.streamed_answer = ""
         self.pending_bubble = None
         self.pending_row = None
-        self._ollama_request_started_at = None
         self._first_token_at = None
-        self._prompt_ready_at = None
         self._finalized_current_response = False
         self._generation_cancel_requested = False
         self._auto_scroll_enabled = True
@@ -1153,30 +981,14 @@ class MainWindow(QMainWindow):
 
         self.thread = QThread(self)
         if ollama_messages is None:
-            last_user_message = next(
-                (message.get("content", "") for message in reversed(self.messages) if message.get("role") == "user"),
-                "",
-            )
-            retrieval = self.memory_service.retrieve(
-                last_user_message,
-                token_counter=self.memory_service.temporary.token_counter,
-                conversation_index=self.memory_service.temporary.conversation_index,
-            )
-            relevant_memories = [item.record for item in retrieval.selected]
-            prompt_started = perf_counter()
-            ollama_messages = build_ollama_messages(self.messages, relevant_memories, SYSTEM_PROMPT)
-            if not prompt_already_recorded:
-                self._record_diagnostics_elapsed("prompt_ms", prompt_started)
-        self._prompt_ready_at = perf_counter()
+            ollama_messages = build_ollama_messages(self.messages, SYSTEM_PROMPT)
         self.worker = OllamaWorker(
             ollama_messages,
             self.active_model,
-            diagnostic_callback=self._record_ollama_diagnostic_event,
             think=False,
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
-        self.worker.request_started.connect(self._diagnostics_ollama_started)
         self.worker.connected.connect(lambda: self._set_status("Thinking"))
         self.worker.chunk_received.connect(self._receive_chunk)
         self.worker.finished.connect(self._receive_response)
@@ -1187,66 +999,17 @@ class MainWindow(QMainWindow):
         self.thread.finished.connect(self._cleanup_worker)
         self.thread.start()
 
-    def _diagnostics_ollama_started(self) -> None:
-        now = perf_counter()
-        self._ollama_request_started_at = now
-        if self._prompt_ready_at is not None:
-            self._record_diagnostics_value("ollama_start_ms", (now - self._prompt_ready_at) * 1000)
-
-    def _record_diagnostics_elapsed(self, key: str, started_at: float) -> None:
-        if self.current_diagnostics is not None:
-            self.current_diagnostics.record_elapsed(key, started_at)
-
-    def _record_diagnostics_value(self, key: str, milliseconds: float) -> None:
-        if self.current_diagnostics is not None:
-            self.current_diagnostics.record(**{key: round(milliseconds, 3)})
-
-    def _record_ollama_diagnostic_event(self, event: dict[str, object]) -> None:
-        if self.current_diagnostics is None:
+    def regenerate_response(self, message_index: int) -> None:
+        if self.thread is not None:
             return
-        request_kind = str(event.get("request_kind") or "chat")
-        key_name = "post_memory_events" if request_kind == "post_memory" else "ollama_events"
-        existing = list(self.current_diagnostics.data.get(key_name, []))
-        sanitized = {
-            key: value
-            for key, value in event.items()
-            if key
-            in {
-                "event",
-                "request_kind",
-                "model",
-                "message_count",
-                "roles",
-                "message_lengths",
-                "status_code",
-                "done",
-                "event_count",
-                "empty_event_count",
-                "visible_content_length",
-                "time_to_first_event_ms",
-                "time_to_first_visible_token_ms",
-                "cancellation_requested",
-                "source",
-                "stage",
-                "message",
-                "think",
-                "options",
-                "elapsed_ms",
-                "error",
-            }
-        }
-        existing.append(sanitized)
-        self.current_diagnostics.record(**{key_name: existing})
-
-    def _finalize_diagnostics(
-        self,
-        assistant_response: str,
-        failed_stage: str | None = None,
-        error: str | None = None,
-    ) -> None:
-        if self.current_diagnostics is not None:
-            self.current_diagnostics.finalize(assistant_response, failed_stage, error)
-            self.current_diagnostics = None
+        if not 0 <= message_index < len(self.messages):
+            return
+        if self.messages[message_index].get("role") != "assistant":
+            return
+        self.messages[:] = self.messages[:message_index]
+        self.store.save(self.conversation)
+        self._rebuild_messages()
+        self._start_generation()
 
     def stop_generation(self) -> None:
         if self.worker is None:
@@ -1260,11 +1023,8 @@ class MainWindow(QMainWindow):
     def _receive_chunk(self, chunk: str) -> None:
         if self._generation_cancel_requested:
             return
-        now = perf_counter()
         if self._first_token_at is None:
-            self._first_token_at = now
-            if self._ollama_request_started_at is not None:
-                self._record_diagnostics_value("first_token_ms", (now - self._ollama_request_started_at) * 1000)
+            self._first_token_at = perf_counter()
         if self.pending_bubble is None:
             self._remove_thinking()
             self.pending_bubble = self._add_message("", "assistant")
@@ -1285,10 +1045,6 @@ class MainWindow(QMainWindow):
     def _receive_response(self, answer: str) -> None:
         if self._generation_cancel_requested:
             return
-        generation_finished_at = perf_counter()
-        if self._first_token_at is not None:
-            self._record_diagnostics_value("generate_ms", (generation_finished_at - self._first_token_at) * 1000)
-        render_started = perf_counter()
         self._render_timer.stop()
         self._remove_thinking()
         if self.pending_bubble is None:
@@ -1302,43 +1058,27 @@ class MainWindow(QMainWindow):
         if self._auto_scroll_enabled:
             self._scroll_to_bottom(smooth=True)
         self._set_status("Ready")
-        self._record_diagnostics_elapsed("render_ms", render_started)
-        self._finalize_diagnostics(answer)
 
     def _receive_cancelled(self) -> None:
-        generation_finished_at = perf_counter()
-        if self._first_token_at is not None:
-            self._record_diagnostics_value("generate_ms", (generation_finished_at - self._first_token_at) * 1000)
-        render_started = perf_counter()
         self._set_status("Stopped")
         self._finalize_partial_response(stopped=True)
-        self._record_diagnostics_elapsed("render_ms", render_started)
-        self._finalize_diagnostics(self.streamed_answer.strip(), self._response_failure_stage("cancelled"), "cancelled")
 
     def _receive_error(self, error: str) -> None:
         if self._generation_cancel_requested:
             return
         failed_stage = self._response_failure_stage(error)
-        generation_finished_at = perf_counter()
-        if self._first_token_at is not None:
-            self._record_diagnostics_value("generate_ms", (generation_finished_at - self._first_token_at) * 1000)
-        render_started = perf_counter()
         self._render_timer.stop()
         self._remove_thinking()
         if self.pending_bubble is not None and self.streamed_answer.strip():
             self.pending_bubble.set_text(self.streamed_answer)
             self._finalize_partial_response(stopped=True)
             error_message = self._format_generation_error(error, failed_stage, partial=True)
-            assistant_for_diagnostics = self.streamed_answer.strip()
         else:
             error_message = self._format_generation_error(error, failed_stage)
-            assistant_for_diagnostics = error_message
         self._add_message(error_message, "error")
         self.store.save(self.conversation)
         self._set_status("Error")
         self._scroll_to_bottom()
-        self._record_diagnostics_elapsed("render_ms", render_started)
-        self._finalize_diagnostics(assistant_for_diagnostics, failed_stage, error)
 
     def _append_assistant_message(self, answer: str) -> None:
         if self._finalized_current_response:
@@ -1431,24 +1171,6 @@ class MainWindow(QMainWindow):
             self.stop_button.setVisible(generating)
             self.send_button.setVisible(not generating)
 
-    def _set_controls_preparing(self, preparing: bool) -> None:
-        self.send_button.setEnabled(not preparing)
-        self.toolbar_send_button.setEnabled(not preparing)
-        self.sidebar.set_generating(preparing)
-        self.input_box.setEnabled(not preparing)
-        self.model_selector.setEnabled(not preparing)
-        self.toolbar_model_selector.setEnabled(not preparing)
-        self.tools_button.setEnabled(not preparing)
-        self.toolbar_tools_button.setEnabled(not preparing)
-        self.stop_button.hide()
-        self.toolbar_stop_button.hide()
-        if self._composer_multiline:
-            self.send_button.hide()
-            self.toolbar_send_button.setVisible(not preparing)
-        else:
-            self.toolbar_send_button.hide()
-            self.send_button.setVisible(not preparing)
-
     def _refresh_models(self) -> None:
         if self.model_thread is not None:
             return
@@ -1493,7 +1215,7 @@ class MainWindow(QMainWindow):
         self.toolbar_model_selector.blockSignals(False)
 
     def _model_changed(self, model_name: str) -> None:
-        if not model_name or self.thread is not None or self.prep_thread is not None:
+        if not model_name or self.thread is not None:
             return
         self.active_model = model_name
         self.preferences.selected_model = model_name
@@ -1517,12 +1239,6 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.worker is not None:
             self.worker.cancel()
-        if self.prep_thread is not None:
-            self.prep_thread.quit()
-            if not self.prep_thread.wait(2500):
-                event.ignore()
-                self.prep_thread.finished.connect(self.close)
-                return
         if self.thread is not None:
             self.thread.quit()
             if not self.thread.wait(2500):

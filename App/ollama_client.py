@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Iterator
 from time import perf_counter
-from typing import Any, Callable
+from typing import Any
 
 import requests
 from PySide6.QtCore import QObject, Signal, Slot
@@ -121,8 +121,6 @@ class OllamaWorker(QObject):
         messages: list[dict[str, str]],
         model_name: str = DEFAULT_MODEL_NAME,
         read_timeout_seconds: int = READ_TIMEOUT_SECONDS,
-        request_kind: str = "chat",
-        diagnostic_callback: Callable[[dict[str, object]], None] | None = None,
         options: dict[str, Any] | None = None,
         think: bool | None = None,
     ) -> None:
@@ -130,8 +128,6 @@ class OllamaWorker(QObject):
         self._messages = messages
         self._model_name = model_name
         self._read_timeout_seconds = read_timeout_seconds
-        self._request_kind = request_kind
-        self._diagnostic_callback = diagnostic_callback
         self._options = options
         self._think = think
         self._cancelled = False
@@ -145,20 +141,8 @@ class OllamaWorker(QObject):
         done_seen = False
         first_event_at: float | None = None
         first_visible_token_at: float | None = None
-        request_started_at: float | None = None
         try:
             self.request_started.emit()
-            request_started_at = perf_counter()
-            self._emit_diagnostic(
-                "request_start",
-                model=self._model_name,
-                message_count=len(self._messages),
-                roles=[message.get("role", "") for message in self._messages],
-                message_lengths=[len(message.get("content", "")) for message in self._messages],
-                cancellation_requested=self._cancelled,
-                think=self._think,
-                options=self._options,
-            )
             payload: dict[str, Any] = {
                 "model": self._model_name,
                 "messages": self._messages,
@@ -175,36 +159,19 @@ class OllamaWorker(QObject):
                 stream=True,
                 timeout=(CONNECT_TIMEOUT_SECONDS, self._read_timeout_seconds),
             )
-            self._emit_diagnostic("http_status", status_code=self._response.status_code)
             if self._response.status_code >= 400:
                 raise OllamaError(_http_error_message(self._response, self._model_name))
 
             self.connected.emit()
             for line in self._response.iter_lines(decode_unicode=True):
-                now = perf_counter()
                 if first_event_at is None:
-                    first_event_at = now
-                    self._emit_diagnostic(
-                        "first_event",
-                        elapsed_ms=self._elapsed_ms(request_started_at, now),
-                        cancellation_requested=self._cancelled,
-                    )
+                    first_event_at = perf_counter()
                 data = parse_stream_line(line)
                 event_count += 1
                 if not data:
                     empty_event_count += 1
                     continue
                 if error := data.get("error"):
-                    self._emit_stream_summary(
-                        request_started_at,
-                        first_event_at,
-                        first_visible_token_at,
-                        event_count,
-                        empty_event_count,
-                        len("".join(complete_answer)),
-                        done_seen,
-                    )
-                    self._emit_diagnostic("stream_error", error=str(error), cancellation_requested=self._cancelled)
                     message = str(error)
                     if "not found" in message.lower() or "pull model" in message.lower():
                         raise ModelMissingError(
@@ -215,25 +182,11 @@ class OllamaWorker(QObject):
                 done = bool(data.get("done"))
                 done_seen = done_seen or done
                 if self._cancelled:
-                    self._emit_stream_summary(
-                        request_started_at,
-                        first_event_at,
-                        first_visible_token_at,
-                        event_count,
-                        empty_event_count,
-                        len("".join(complete_answer)),
-                        done_seen,
-                    )
                     self.cancelled.emit()
                     return
                 if chunk:
                     if first_visible_token_at is None:
                         first_visible_token_at = perf_counter()
-                        self._emit_diagnostic(
-                            "first_visible_token",
-                            elapsed_ms=self._elapsed_ms(request_started_at, first_visible_token_at),
-                            cancellation_requested=self._cancelled,
-                        )
                     complete_answer.append(chunk)
                     self.chunk_received.emit(chunk)
                 else:
@@ -242,28 +195,10 @@ class OllamaWorker(QObject):
                     break
 
             if self._cancelled:
-                self._emit_stream_summary(
-                    request_started_at,
-                    first_event_at,
-                    first_visible_token_at,
-                    event_count,
-                    empty_event_count,
-                    len("".join(complete_answer)),
-                    done_seen,
-                )
                 self.cancelled.emit()
                 return
 
             answer = "".join(complete_answer).strip()
-            self._emit_stream_summary(
-                request_started_at,
-                first_event_at,
-                first_visible_token_at,
-                event_count,
-                empty_event_count,
-                len(answer),
-                done_seen,
-            )
             if not answer:
                 raise EmptyResponseError(
                     self._empty_response_message(event_count, empty_event_count, done_seen, first_event_at)
@@ -278,40 +213,14 @@ class OllamaWorker(QObject):
                 stage = "before first event" if first_event_at is None else (
                     "before first visible token" if first_visible_token_at is None else "during streaming"
                 )
-                self._emit_stream_summary(
-                    request_started_at,
-                    first_event_at,
-                    first_visible_token_at,
-                    event_count,
-                    empty_event_count,
-                    len("".join(complete_answer)),
-                    done_seen,
-                )
-                self._emit_diagnostic(
-                    "error",
-                    source="timeout",
-                    stage=stage,
-                    message=f"read_timeout={self._read_timeout_seconds}",
-                )
                 self.failed.emit(
                     f"Ollama request timed out {stage} after {self._read_timeout_seconds} seconds."
                 )
         except InvalidStreamError as error:
             if not self._cancelled:
-                self._emit_stream_summary(
-                    request_started_at,
-                    first_event_at,
-                    first_visible_token_at,
-                    event_count,
-                    empty_event_count,
-                    len("".join(complete_answer)),
-                    done_seen,
-                )
-                self._emit_diagnostic("error", source="invalid_stream", stage="stream parsing", message=str(error))
                 self.failed.emit(str(error))
         except EmptyResponseError as error:
             if not self._cancelled:
-                self._emit_diagnostic("error", source="empty_response", stage="before first visible token", message=str(error))
                 self.failed.emit(str(error))
         except ModelMissingError as error:
             if not self._cancelled:
@@ -330,39 +239,8 @@ class OllamaWorker(QObject):
 
     def cancel(self) -> None:
         self._cancelled = True
-        self._emit_diagnostic("cancel_requested", cancellation_requested=True)
         if self._response is not None:
             self._response.close()
-
-    def _emit_diagnostic(self, event_name: str, **values: Any) -> None:
-        values["event"] = event_name
-        values["request_kind"] = self._request_kind
-        if self._diagnostic_callback is not None:
-            try:
-                self._diagnostic_callback(values)
-            except Exception:
-                pass
-
-    def _emit_stream_summary(
-        self,
-        request_started_at: float | None,
-        first_event_at: float | None,
-        first_visible_token_at: float | None,
-        event_count: int,
-        empty_event_count: int,
-        visible_content_length: int,
-        done_seen: bool,
-    ) -> None:
-        self._emit_diagnostic(
-            "stream_summary",
-            time_to_first_event_ms=self._elapsed_ms(request_started_at, first_event_at),
-            time_to_first_visible_token_ms=self._elapsed_ms(request_started_at, first_visible_token_at),
-            event_count=event_count,
-            empty_event_count=empty_event_count,
-            visible_content_length=visible_content_length,
-            done=done_seen,
-            cancellation_requested=self._cancelled,
-        )
 
     def _empty_response_message(
         self,
@@ -377,12 +255,6 @@ class OllamaWorker(QObject):
             "Ollama completed the stream before sending visible assistant text "
             f"(events={event_count}, empty_events={empty_event_count}, done={done_seen})."
         )
-
-    @staticmethod
-    def _elapsed_ms(started_at: float | None, ended_at: float | None) -> float | None:
-        if started_at is None or ended_at is None:
-            return None
-        return round((ended_at - started_at) * 1000, 3)
 
 
 class ModelDiscoveryWorker(QObject):

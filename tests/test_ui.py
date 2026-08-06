@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from time import perf_counter, sleep
+from time import perf_counter
 from unittest.mock import Mock, patch
 
 import requests
@@ -24,12 +24,11 @@ from conversation_store import ConversationStore  # noqa: E402
 import design  # noqa: E402
 from design import Colors, PNG_CONTROL_ICON_SIZE, asset_icon_path, icon  # noqa: E402
 from main import MainWindow  # noqa: E402
-from memory_v2.models import CATEGORIES, MutationKind, MutationStatus  # noqa: E402
-from memory_v2.pipeline import MemorySystem  # noqa: E402
-from memory_v2.store import MemoryStore  # noqa: E402
+from memory_manager import MemoryRow  # noqa: E402
+from memory_store import CATEGORIES, MemoryStore  # noqa: E402
 from ollama_client import InvalidStreamError, OllamaWorker, discover_models, iter_message_chunks  # noqa: E402
 from preferences import Preferences  # noqa: E402
-from prompts import build_ollama_messages, format_relevant_memories  # noqa: E402
+from prompts import build_ollama_messages  # noqa: E402
 from sidebar import ChatSidebar  # noqa: E402
 from widgets import AutoGrowingInput, CodeBlock, MarkdownView, MessageActions, MessageBubble  # noqa: E402
 
@@ -67,9 +66,6 @@ class ChatFoundationTests(unittest.TestCase):
             if predicate():
                 return
         self.fail("Timed out waiting for asynchronous UI work.")
-
-    def _wait_for_request_preparation(self, window: MainWindow) -> None:
-        self._wait_until(lambda: window.prep_thread is None)
 
     def _composer_wrap_boundary_text(self, window: MainWindow) -> tuple[str, str]:
         width = window._stable_composer_text_width()
@@ -147,6 +143,20 @@ class ChatFoundationTests(unittest.TestCase):
         lines = (line for line in ['{"message":{"content":"A"},"done":false}', '{"done":true}'])
         self.assertEqual(list(iter_message_chunks(lines)), [("A", False), ("", True)])
 
+    def test_build_ollama_messages_prepends_system_and_drops_old_system(self) -> None:
+        messages = [
+            {"role": "system", "content": "old"},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+        ]
+        assembled = build_ollama_messages(messages, "custom prompt")
+        self.assertEqual(assembled, [
+            {"role": "system", "content": "custom prompt"},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+        ])
+        self.assertNotIn({"role": "system", "content": "old"}, assembled)
+
     def test_conversation_persistence_round_trips_unicode(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = ConversationStore(Path(temp_dir))
@@ -159,197 +169,6 @@ class ChatFoundationTests(unittest.TestCase):
             assert restored is not None
             self.assertEqual(restored.id, conversation.id)
             self.assertEqual(restored.messages[1]["content"], "Hello, Violet")
-
-    # ------------------------------------------------------------------ memory V2
-
-    def test_memory_v2_pipeline_save_retrieve_update_delete(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            service = MemorySystem(MemoryStore(Path(temp_dir) / "memory.db"))
-            create = service.handle_user_message(
-                "Remember that my favorite color is purple.",
-                conversation_id="c1",
-                message_id="1",
-            )
-            self.assertEqual(create.action, MutationKind.CREATE)
-            self.assertEqual(create.action_status, MutationStatus.SUCCESS)
-            self.assertEqual(service.list_memories()[0].value, "purple")
-
-            update = service.handle_user_message(
-                "Change my favorite color to red.",
-                conversation_id="c1",
-                message_id="2",
-            )
-            self.assertEqual(update.action, MutationKind.UPDATE)
-            self.assertEqual(update.action_status, MutationStatus.SUCCESS)
-            record = service.store.active_by_canonical_key("preferences:user:favorite color")
-            self.assertIsNotNone(record)
-            assert record is not None
-            self.assertEqual(record.value, "red")
-
-            question = service.handle_user_message(
-                "What is my favorite color?",
-                conversation_id="c1",
-                message_id="3",
-            )
-            self.assertTrue(question.retrieval is not None and question.retrieval.injected)
-            self.assertEqual(question.retrieval.selected[0].record.value, "red")
-
-            delete = service.handle_user_message(
-                "Delete the memory about my favorite color.",
-                conversation_id="c1",
-                message_id="4",
-            )
-            self.assertEqual(delete.action, MutationKind.DELETE)
-            self.assertEqual(delete.action_status, MutationStatus.SUCCESS)
-            self.assertEqual(service.list_memories(), [])
-
-    def test_memory_v2_questions_are_read_only(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            service = MemorySystem(MemoryStore(Path(temp_dir) / "memory.db"))
-            service.handle_user_message(
-                "Remember that my favorite color is purple.",
-                conversation_id="c1",
-                message_id="1",
-            )
-            outcome = service.handle_user_message(
-                "What is my favorite color?",
-                conversation_id="c1",
-                message_id="2",
-            )
-            self.assertIsNone(outcome.action)
-            self.assertIsNone(outcome.action_status)
-            self.assertEqual(len(service.list_memories()), 1)
-
-    def test_memory_v2_favorite_color_not_confused_with_favorite_drink(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            service = MemorySystem(MemoryStore(Path(temp_dir) / "memory.db"))
-            service.handle_user_message("My favorite drink is water.", conversation_id="c1", message_id="1")
-            service.handle_user_message(
-                "Remember that my favorite color is purple.",
-                conversation_id="c1",
-                message_id="2",
-            )
-            color = service.handle_user_message("What is my favorite color?", conversation_id="c1", message_id="3")
-            color_values = [item.record.value for item in color.retrieval.selected]
-            self.assertIn("purple", color_values)
-            self.assertNotIn("water", color_values)
-            drink = service.handle_user_message("What is my favorite drink?", conversation_id="c1", message_id="4")
-            drink_values = [item.record.value for item in drink.retrieval.selected]
-            self.assertIn("water", drink_values)
-            self.assertNotIn("purple", drink_values)
-
-    def test_memory_v2_explicit_save_uses_single_response_path(self) -> None:
-        window, _temp_dir = self._window_with_temp_store()
-        with patch.object(window, "_start_generation") as generation:
-            window.input_box.setPlainText("Remember that my favorite color is purple.")
-            window.send_message()
-            self._wait_until(lambda: generation.called)
-        generation.assert_called_once()
-        memories = window.memory_service.list_memories()
-        self.assertEqual(len(memories), 1)
-        self.assertEqual(memories[0].key, "favorite color")
-        self.assertEqual(memories[0].value, "purple")
-        window.close()
-
-    def test_memory_v2_question_retrieval_injects_memories(self) -> None:
-        window, _temp_dir = self._window_with_temp_store()
-        window.memory_service.handle_user_message(
-            "Remember that my favorite color is purple.",
-            conversation_id="c1",
-            message_id="1",
-        )
-        with patch.object(window, "_start_generation") as generation:
-            window.input_box.setPlainText("What is my favorite color?")
-            window.send_message()
-            self._wait_until(lambda: generation.called)
-        messages = generation.call_args.args[0]
-        combined = "\n".join(message.get("content", "") for message in messages)
-        self.assertIn("[Relevant user memories]", combined)
-        self.assertIn("purple", combined)
-        window.close()
-
-    def test_memory_v2_save_renders_no_confirmation_label(self) -> None:
-        window, _temp_dir = self._window_with_temp_store()
-        with patch.object(window, "_start_generation") as generation:
-            window.input_box.setPlainText("Remember that my favorite color is purple.")
-            window.send_message()
-            self._wait_until(lambda: generation.called)
-        window._receive_response("Purple is a nice choice.")
-        self.app.processEvents()
-        labels = [label.text() for label in window.findChildren(QLabel)]
-        self.assertNotIn("✓ Remembered", labels)
-        self.assertNotIn("Memory updated.", labels)
-        window.close()
-
-    def test_memory_v2_window_diagnostics_are_inert(self) -> None:
-        window, _temp_dir = self._window_with_temp_store()
-        self.assertIsNone(window.current_diagnostics)
-        window._record_ollama_diagnostic_event({"request_kind": "chat", "event": "request_start"})
-        window._record_diagnostics_elapsed("prompt_ms", perf_counter())
-        window._receive_response("Hello there.")
-        self.assertIsNone(window.current_diagnostics)
-        window.close()
-
-    def test_send_message_returns_before_slow_memory_preparation_finishes(self) -> None:
-        class SlowMemorySystem(MemorySystem):
-            def handle_user_message(self, *_args, **_kwargs) -> object:
-                sleep(0.45)
-                return super().handle_user_message(*_args, **_kwargs)
-
-        window, _temp_dir = self._window_with_temp_store()
-        window.memory_service = SlowMemorySystem(window.memory_store)
-        with patch.object(window, "_start_generation") as generation:
-            window.input_box.setPlainText("This should not freeze the UI.")
-            started = perf_counter()
-            window.send_message()
-            elapsed_ms = (perf_counter() - started) * 1000
-            self.assertLess(elapsed_ms, 120)
-            self.assertIsNotNone(window.prep_thread)
-            self._wait_until(lambda: generation.called)
-        window.close()
-
-    def test_settings_overlay_memory_manager_search_edit_delete(self) -> None:
-        window, _temp_dir = self._window_with_temp_store()
-        window.show()
-        window.memory_service.handle_user_message(
-            "Remember that my favorite color is purple.",
-            conversation_id="c1",
-            message_id="1",
-        )
-        window.open_settings_overlay()
-        self.assertTrue(window.settings_overlay.isVisible())
-        self.assertEqual(
-            [window.settings_overlay.category_filter.itemText(index) for index in range(window.settings_overlay.category_filter.count())],
-            ["All", *CATEGORIES],
-        )
-        self.assertIn("Category", [window.settings_overlay.sort_order.itemText(index) for index in range(window.settings_overlay.sort_order.count())])
-        window.settings_overlay.search_input.setText("favorite")
-        self.app.processEvents()
-        records = window.settings_overlay.store.search_memories("favorite")
-        self.assertTrue(records)
-        record = records[0]
-        edited = window.settings_overlay.store.update_memory(
-            record.id,
-            category=record.category,
-            subject=record.subject,
-            key=record.key,
-            value="blue",
-            content="favorite color is blue",
-            manual=True,
-        )
-        self.assertIsNotNone(edited)
-        assert edited is not None
-        self.assertTrue(edited.manually_edited)
-        window.settings_overlay.store.archive_memory(record.id)
-        self.assertIsNone(window.memory_service.store.active_by_canonical_key(record.canonical_key))
-        window.settings_overlay.store.restore_memory(record.id)
-        restored = window.memory_service.store.active_by_canonical_key(record.canonical_key)
-        self.assertIsNotNone(restored)
-        assert restored is not None
-        self.assertEqual(restored.value, "blue")
-        window.settings_overlay.store.delete_memory(record.id)
-        self.assertNotIn(record.id, [m.id for m in window.settings_overlay.store.list_memories(include_archived=True)])
-        window.close()
 
     # ------------------------------------------------------------------ chat foundation
 
@@ -396,7 +215,6 @@ class ChatFoundationTests(unittest.TestCase):
             window.scroll_area.verticalScrollBar().setValue(0)
             window.input_box.setPlainText("Scroll now")
             window.send_message()
-            self._wait_for_request_preparation(window)
             self.app.processEvents()
             bar = window.scroll_area.verticalScrollBar()
             self.assertEqual(bar.value(), bar.maximum())
@@ -737,12 +555,77 @@ class ChatFoundationTests(unittest.TestCase):
                 window.settings_overlay.content_stack.currentWidget(),
                 window.settings_overlay.tab_pages[name],
             )
-        window.settings_overlay.tab_buttons[2].click()
+        window.settings_overlay.tab_buttons[1].click()
         self.assertIs(
             window.settings_overlay.content_stack.currentWidget(),
-            window.settings_overlay.tab_pages["Memory"],
+            window.settings_overlay.tab_pages["Theme"],
         )
         window.close()
+
+    def test_memory_tab_lists_search_edit_archive_delete(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        store = window.settings_overlay.store
+        record = store.insert_memory(
+            category="Preferences",
+            subject="me",
+            key="favorite color",
+            value="purple",
+            content="favorite color is purple",
+        )
+        window.open_settings_overlay()
+        self.assertTrue(window.settings_overlay.isVisible())
+        self.assertEqual(
+            [
+                window.settings_overlay.category_filter.itemText(index)
+                for index in range(window.settings_overlay.category_filter.count())
+            ],
+            ["All", *CATEGORIES],
+        )
+        window.settings_overlay.search_input.setText("favorite")
+        self.app.processEvents()
+        self.assertTrue(store.search_memories("favorite"))
+        edited = store.update_memory(record.id, value="blue", content="favorite color is blue", manual=True)
+        self.assertIsNotNone(edited)
+        assert edited is not None
+        self.assertEqual(edited.value, "blue")
+        store.archive_memory(record.id)
+        self.assertNotIn(record.id, [memory.id for memory in store.list_memories()])
+        store.restore_memory(record.id)
+        self.assertIn(record.id, [memory.id for memory in store.list_memories()])
+        store.delete_memory(record.id)
+        self.assertNotIn(record.id, [memory.id for memory in store.list_memories(include_archived=True)])
+        window.close()
+
+    def test_memory_tab_search_filters_rows_and_clear_all(self) -> None:
+        window, _temp_dir = self._window_with_temp_store()
+        window.show()
+        store = window.settings_overlay.store
+        store.insert_memory(category="Facts", subject="sun", key="distance", value="93 million miles")
+        store.insert_memory(category="People", subject="Alice", key="phone", value="555-0100")
+        window.open_settings_overlay()
+        window.settings_overlay.select_tab("Memory")
+        self.app.processEvents()
+        self.assertEqual(len(self._memory_rows(window.settings_overlay)), 2)
+        window.settings_overlay.search_input.setText("sun")
+        self.app.processEvents()
+        self.assertEqual(len(self._memory_rows(window.settings_overlay)), 1)
+        window.settings_overlay.search_input.setText("")
+        self.app.processEvents()
+        window.settings_overlay.clear_all()
+        self.assertTrue(window.settings_overlay.confirm_panel.isVisible())
+        window.settings_overlay._confirmed_clear_all()
+        self.app.processEvents()
+        self.assertEqual(store.list_memories(), [])
+        window.close()
+
+    def _memory_rows(self, overlay) -> list[MemoryRow]:
+        rows = []
+        for index in range(overlay.rows_layout.count()):
+            widget = overlay.rows_layout.itemAt(index).widget()
+            if isinstance(widget, MemoryRow):
+                rows.append(widget)
+        return rows
 
     def test_theme_tab_applies_presets_and_manages_custom_presets(self) -> None:
         window, temp_dir = self._window_with_temp_store()

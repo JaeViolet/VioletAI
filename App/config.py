@@ -15,8 +15,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONVERSATIONS_DIR = PROJECT_ROOT / "memory" / "conversations"
 PREFERENCES_PATH = PROJECT_ROOT / "memory" / "preferences.json"
 MEMORY_DB_PATH = PROJECT_ROOT / "memory" / "memory.db"
-LOGS_DIR = PROJECT_ROOT / "logs"
-MEMORY_LOG_PATH = LOGS_DIR / "memory.log"
 APP_FOOTER_TEXT = "VioletAI can make mistakes. Check important information."
 
 from prompts import BASE_SYSTEM_PROMPT  # noqa: E402
