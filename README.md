@@ -12,7 +12,7 @@ VioletAI aims to feel like an extension of the user:
 - understands ongoing projects
 - adapts to preferences
 - maintains continuity across conversations
-- keeps the user in control
+- keeps user data and personalization under the user's control
 
 ## Current Features
 
@@ -29,10 +29,10 @@ VioletAI is separated into independent systems:
 
 - **Core** — assistant orchestration, identity, and prompts
 - **Models** — AI model connections and management
-- **Memory** — memory interface designed for future backends
+- **Memory** — replaceable memory interface layer
 - **Conversations** — chat history management
 - **UI** — desktop experience
-- **Tools** — future capabilities
+- **Tools** — future capabilities and integrations
 
 ## Requirements
 
