@@ -1,22 +1,44 @@
 # VioletAI
 
-A private, local desktop chat assistant powered by [Ollama](https://ollama.com).
+VioletAI is a local-first personal AI assistant designed to grow with the user over time.
 
-## Features
+The goal is not just a chatbot that answers questions. The goal is a persistent assistant that maintains continuity, understands the user, and evolves through interaction.
 
-- Native desktop chat window (PySide6, Fusion style)
-- Streaming responses from a local Ollama model
-- Conversation history with search, pin, rename, and delete
-- Model selection from locally installed Ollama models
-- Memory tab for saved facts and preferences
-- Theme presets with custom accent colors
-- No cloud, no tracking — everything runs on your machine
+## Vision
+
+VioletAI aims to feel like an extension of the user:
+
+- remembers important context
+- understands ongoing projects
+- adapts to preferences
+- maintains continuity across conversations
+- keeps the user in control
+
+## Current Features
+
+- Desktop AI interface built with PySide6
+- Local AI models through Ollama
+- Model selection and management
+- Conversation history
+- Settings and themes
+- Modular architecture for future capabilities
+
+## Architecture
+
+VioletAI is separated into independent systems:
+
+- **Core** — assistant orchestration, identity, and prompts
+- **Models** — AI model connections and management
+- **Memory** — memory interface designed for future backends
+- **Conversations** — chat history management
+- **UI** — desktop experience
+- **Tools** — future capabilities
 
 ## Requirements
 
 - Python 3.11+
-- [Ollama](https://ollama.com) running locally (default: `http://127.0.0.1:11434`)
-- A pulled model (default: `qwen3.5:9b` — set in `core/config.py`)
+- Ollama running locally
+- A local model installed
 
 ## Install
 
@@ -37,18 +59,15 @@ $env:QT_QPA_PLATFORM="offscreen"
 python -m unittest discover -s tests -p "test_*.py"
 ```
 
-## Project layout
+## Project Status
 
-```
-app/                 Application entry point
-core/                Config, engine orchestration, identity, prompts
-memory/              Memory bridge (interface + local SQLite backend; future Letta adapter)
-models/              Ollama connection and model management
-conversations/       Chat history storage
-ui/                  Window, chat view, sidebar, settings, widgets, styles, icons
-tools/               Tool registry (ToolSpec + available_tools())
-data/                Runtime data (conversations, preferences, memory db)
-tests/               Domain-split tests (no Ollama required)
-```
+VioletAI is actively evolving. The current foundation focuses on clean architecture, local AI, and creating a platform for persistent personal intelligence.
+
+Future goals:
+
+- persistent AI memory
+- deeper personalization
+- tool usage
+- continuous improvement
 
 See `docs/ARCHITECTURE.md` for details.
