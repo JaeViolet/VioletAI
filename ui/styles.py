@@ -135,10 +135,6 @@ def app_stylesheet(accent: str = Colors.ACCENT) -> str:
             color: {Colors.TEXT_MUTED}; font-size: 11px; font-weight: 650;
             letter-spacing: 1px; text-transform: uppercase;
         }}
-        #memoryValue {{ color: {Colors.TEXT}; font-size: 14px; }}
-        #memoryMeta {{ color: {Colors.TEXT_FAINT}; font-size: 12px; }}
-        #settingsMemoryRow {{ background: transparent; }}
-        #settingsMemoryRow:hover {{ background: #111111; }}
         #themePreset {{ background: #101010; border: 1px solid #262626; border-radius: 0px; }}
         #themePreset:hover {{ background: #171717; }}
         #themePreset[active="true"] {{ border: 1px solid {accent}; }}

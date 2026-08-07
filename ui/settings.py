@@ -1,13 +1,10 @@
-"""Native Memory Manager UI for VioletAI settings."""
+"""Settings overlay UI for VioletAI."""
 
 from __future__ import annotations
-
-from datetime import datetime
 
 from PySide6.QtCore import QPropertyAnimation, QSize, Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QComboBox,
     QFrame,
     QGraphicsOpacityEffect,
     QGridLayout,
@@ -24,7 +21,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from memory.manager import CATEGORIES, MemoryManager, MemoryRecord
 from ui.design import Motion, icon
 from ui.themes import BUILTIN_THEMES, DEFAULT_ACCENT, DEFAULT_THEME_NAME, is_builtin
 from ui.widgets import apply_interaction_cursors
@@ -58,27 +54,12 @@ TAB_ICONS = [
 ]
 
 
-def _local_datetime(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone()
-
-
-def _format_memory_stamp(value: str) -> str:
-    try:
-        local = _local_datetime(value)
-    except (ValueError, TypeError):
-        return ""
-    if local.date() == datetime.now().astimezone().date():
-        return f"{local.hour}:{local.minute:02d}"
-    return f"{local.day:02d}-{local.month:02d}-{local.year}"
-
-
 class SettingsOverlay(QFrame):
     closed = Signal()
     theme_changed = Signal()
 
-    def __init__(self, store: MemoryManager, preferences: Preferences | None = None, parent: QWidget | None = None) -> None:
+    def __init__(self, preferences: Preferences | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.store = store
         self.preferences = preferences
         self.setObjectName("settingsPanel")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -127,13 +108,12 @@ class SettingsOverlay(QFrame):
         right_layout.addWidget(self.content_scroll, 1)
         root.addWidget(right, 1)
 
-        self._build_memory_page()
         self._build_theme_page()
 
         self.tab_pages: dict[str, QWidget] = {
             "Settings": self._build_placeholder_page(),
             "Theme": self.theme_page,
-            "Memory": self.memory_page,
+            "Memory": self._build_placeholder_page(),
             "Tools": self._build_placeholder_page(),
             "Web Search": self._build_placeholder_page(),
             "Files": self._build_placeholder_page(),
@@ -183,121 +163,6 @@ class SettingsOverlay(QFrame):
         nav_layout.addWidget(self.tabs_scroll, 1)
         nav.setFixedWidth(220)
         return nav
-
-    def _build_memory_page(self) -> None:
-        self.memory_page = QWidget(objectName="settingsPage")
-        layout = QVBoxLayout(self.memory_page)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(12)
-
-        search_row = QHBoxLayout()
-        search_row.setSpacing(10)
-        self.search_input = QLineEdit(objectName="settingsSearchInput")
-        self.search_input.setPlaceholderText("Search memories")
-        clear = QPushButton("Clear all", objectName="settingsClearButton")
-        clear.clicked.connect(self.clear_all)
-        search_row.addWidget(self.search_input, 1)
-        search_row.addWidget(clear)
-        layout.addLayout(search_row)
-
-        self.confirm_panel = QFrame(objectName="settingsConfirm")
-        confirm_layout = QVBoxLayout(self.confirm_panel)
-        confirm_layout.setContentsMargins(16, 12, 16, 12)
-        confirm_layout.setSpacing(6)
-        confirm_title = QLabel("Clear all memories?", objectName="settingsConfirmTitle")
-        confirm_text = QLabel("This permanently deletes every memory. This cannot be undone.", objectName="settingsConfirmText")
-        confirm_text.setWordWrap(True)
-        confirm_buttons = QHBoxLayout()
-        confirm_buttons.setSpacing(8)
-        confirm_buttons.addStretch()
-        cancel_btn = QPushButton("Cancel", objectName="settingsActionButton")
-        confirm_btn = QPushButton("Clear all", objectName="settingsDangerButton")
-        cancel_btn.clicked.connect(self._hide_confirmation)
-        confirm_btn.clicked.connect(self._confirmed_clear_all)
-        confirm_buttons.addWidget(cancel_btn)
-        confirm_buttons.addWidget(confirm_btn)
-        confirm_layout.addWidget(confirm_title)
-        confirm_layout.addWidget(confirm_text)
-        confirm_layout.addLayout(confirm_buttons)
-        self.confirm_panel.hide()
-        layout.addWidget(self.confirm_panel)
-
-        self.edit_panel = QFrame(objectName="settingsConfirm")
-        edit_layout = QVBoxLayout(self.edit_panel)
-        edit_layout.setContentsMargins(16, 12, 16, 12)
-        edit_layout.setSpacing(8)
-        edit_title = QLabel("Edit memory", objectName="settingsConfirmTitle")
-        self.edit_input = QLineEdit(objectName="settingsSearchInput")
-        self.edit_error = QLabel("Memory value cannot be empty.", objectName="settingsErrorText")
-        self.edit_error.hide()
-        edit_buttons = QHBoxLayout()
-        edit_buttons.setSpacing(8)
-        edit_buttons.addStretch()
-        cancel_edit = QPushButton("Cancel", objectName="settingsActionButton")
-        save_edit = QPushButton("Save", objectName="settingsActionButton")
-        cancel_edit.clicked.connect(self._cancel_edit)
-        save_edit.clicked.connect(self._save_edit)
-        self.edit_input.returnPressed.connect(self._save_edit)
-        edit_buttons.addWidget(cancel_edit)
-        edit_buttons.addWidget(save_edit)
-        edit_layout.addWidget(edit_title)
-        edit_layout.addWidget(self.edit_input)
-        edit_layout.addWidget(self.edit_error)
-        edit_layout.addLayout(edit_buttons)
-        self.edit_panel.hide()
-        layout.addWidget(self.edit_panel)
-
-        self.delete_panel = QFrame(objectName="settingsConfirm")
-        delete_layout = QVBoxLayout(self.delete_panel)
-        delete_layout.setContentsMargins(16, 12, 16, 12)
-        delete_layout.setSpacing(6)
-        delete_title = QLabel("Delete this memory?", objectName="settingsConfirmTitle")
-        delete_text = QLabel("This permanently deletes this memory. This cannot be undone.", objectName="settingsConfirmText")
-        delete_text.setWordWrap(True)
-        delete_buttons = QHBoxLayout()
-        delete_buttons.setSpacing(8)
-        delete_buttons.addStretch()
-        cancel_delete = QPushButton("Cancel", objectName="settingsActionButton")
-        confirm_delete = QPushButton("Delete", objectName="settingsDangerButton")
-        cancel_delete.clicked.connect(self._cancel_delete)
-        confirm_delete.clicked.connect(self._confirmed_delete)
-        delete_buttons.addWidget(cancel_delete)
-        delete_buttons.addWidget(confirm_delete)
-        delete_layout.addWidget(delete_title)
-        delete_layout.addWidget(delete_text)
-        delete_layout.addLayout(delete_buttons)
-        self.delete_panel.hide()
-        layout.addWidget(self.delete_panel)
-
-        filters = QHBoxLayout()
-        filters.setSpacing(8)
-        self.category_filter = self._make_combo(["All", *CATEGORIES], 7)
-        self.include_archived = self._make_combo(["Enabled", "Disabled", "All"], 8)
-        self.sort_order = self._make_combo(["Created", "Updated", "Category", "Accessed"], 7)
-        filters.addWidget(self.category_filter)
-        filters.addWidget(self.include_archived)
-        filters.addWidget(self.sort_order)
-        filters.addStretch()
-        layout.addLayout(filters)
-
-        self.rows = QWidget()
-        self.rows_layout = QVBoxLayout(self.rows)
-        self.rows_layout.setContentsMargins(0, 0, 0, 0)
-        self.rows_layout.setSpacing(6)
-        self.rows_layout.addStretch()
-        layout.addWidget(self.rows, 1)
-
-        self.search_input.textChanged.connect(self.refresh)
-        self.category_filter.currentTextChanged.connect(self.refresh)
-        self.include_archived.currentTextChanged.connect(self.refresh)
-        self.sort_order.currentTextChanged.connect(self.refresh)
-
-    def _make_combo(self, items: list[str], min_chars: int) -> QComboBox:
-        combo = QComboBox(objectName="modelSelector")
-        combo.addItems(items)
-        combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        combo.setMinimumContentsLength(min_chars)
-        return combo
 
     def _build_placeholder_page(self) -> QWidget:
         page = QWidget(objectName="settingsPage")
@@ -505,13 +370,9 @@ class SettingsOverlay(QFrame):
             button.style().polish(button)
         self.content_stack.setCurrentWidget(self.tab_pages[name])
         self.header_title.setText(name)
-        if name == "Memory":
-            self.refresh()
-        elif name == "Theme":
+        if name == "Theme":
             self._sync_accent_controls()
             self._rebuild_presets()
-        else:
-            self.confirm_panel.hide()
 
     def show_overlay(self) -> None:
         if self.parentWidget() is not None:
@@ -524,7 +385,6 @@ class SettingsOverlay(QFrame):
                 (parent_rect.height() - height) // 2,
             )
         self.select_tab("Settings")
-        self.refresh()
         self._fading_out = False
         self.fade.stop()
         self.opacity.setOpacity(0)
@@ -551,152 +411,6 @@ class SettingsOverlay(QFrame):
         self._fading_out = False
         self.hide()
         self.closed.emit()
-
-    def refresh(self) -> None:
-        while self.rows_layout.count() > 1:
-            item = self.rows_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        status = self.include_archived.currentText()
-        self.confirm_panel.hide()
-        self.edit_panel.hide()
-        self.delete_panel.hide()
-        records = self.store.search(
-            self.search_input.text().strip(),
-            self.category_filter.currentText(),
-            include_archived=status != "Enabled",
-        )
-        if status == "Disabled":
-            records = [record for record in records if not record.active]
-        records = self._sort_records(records)
-        for record in records:
-            self.rows_layout.insertWidget(
-                self.rows_layout.count() - 1,
-                MemoryRow(record, self.store, self.refresh, self._open_edit_panel, self._open_delete_panel),
-            )
-        if not records:
-            empty = QLabel("No memories found.", objectName="settingsPlaceholderText")
-            self.rows_layout.insertWidget(0, empty)
-        apply_interaction_cursors(self)
-
-    def _sort_records(self, records: list[MemoryRecord]) -> list[MemoryRecord]:
-        order = self.sort_order.currentText()
-        if order == "Created":
-            return sorted(records, key=lambda record: record.created_at, reverse=True)
-        if order == "Category":
-            return sorted(records, key=lambda record: (record.category, record.subject, record.key))
-        if order == "Accessed":
-            return sorted(records, key=lambda record: (record.last_accessed_at or "", record.access_count), reverse=True)
-        return sorted(records, key=lambda record: record.updated_at, reverse=True)
-
-    def clear_all(self) -> None:
-        self.edit_panel.hide()
-        self.delete_panel.hide()
-        self.confirm_panel.show()
-
-    def _hide_confirmation(self) -> None:
-        self.confirm_panel.hide()
-
-    def _confirmed_clear_all(self) -> None:
-        self.confirm_panel.hide()
-        self.store.clear()
-        self.refresh()
-
-    def _open_edit_panel(self, record: MemoryRecord) -> None:
-        self._editing_record = record
-        self.confirm_panel.hide()
-        self.delete_panel.hide()
-        self.edit_input.setText(record.value)
-        self.edit_error.hide()
-        self.edit_panel.show()
-        self.edit_input.setFocus()
-        self.edit_input.selectAll()
-        if self.content_scroll.verticalScrollBar() is not None:
-            self.content_scroll.verticalScrollBar().setValue(0)
-
-    def _save_edit(self) -> None:
-        record = self._editing_record
-        if record is None:
-            return
-        value = self.edit_input.text().strip()
-        if not value:
-            self.edit_error.show()
-            return
-        self.edit_panel.hide()
-        record.value = value
-        record.content = f"{record.key}: {value}"
-        self.store.save(record)
-        self.refresh()
-
-    def _cancel_edit(self) -> None:
-        self.edit_panel.hide()
-
-    def _open_delete_panel(self, record: MemoryRecord) -> None:
-        self._deleting_record = record
-        self.confirm_panel.hide()
-        self.edit_panel.hide()
-        self.delete_panel.show()
-        if self.content_scroll.verticalScrollBar() is not None:
-            self.content_scroll.verticalScrollBar().setValue(0)
-
-    def _confirmed_delete(self) -> None:
-        record = self._deleting_record
-        self.delete_panel.hide()
-        if record is None:
-            return
-        self.store.delete(record.id)
-        self.refresh()
-
-    def _cancel_delete(self) -> None:
-        self.delete_panel.hide()
-
-
-class MemoryRow(QFrame):
-    def __init__(
-        self,
-        record: MemoryRecord,
-        store: MemoryManager,
-        refresh_callback,
-        edit_requested,
-        delete_requested,
-    ) -> None:
-        super().__init__()
-        self.record = record
-        self.store = store
-        self.refresh_callback = refresh_callback
-        self.setObjectName("settingsMemoryRow")
-        layout = QGridLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(6)
-
-        value = QLabel(record.value)
-        value.setObjectName("memoryValue")
-        value.setWordWrap(True)
-        meta = QLabel(f"{record.category} ┬╖ {record.key}")
-        meta.setObjectName("memoryMeta")
-        stamp = QLabel(_format_memory_stamp(record.created_at))
-        stamp.setObjectName("memoryMeta")
-        stamp.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
-        layout.addWidget(value, 0, 0, 1, 3)
-        layout.addWidget(stamp, 0, 3)
-        layout.addWidget(meta, 1, 0, 1, 4)
-
-        edit = QPushButton("Edit", objectName="settingsActionButton")
-        toggle = QPushButton("Disable" if record.active else "Enable", objectName="settingsActionButton")
-        delete = QPushButton("Delete", objectName="settingsActionButton")
-        edit.clicked.connect(lambda: edit_requested(record))
-        toggle.clicked.connect(self.toggle_archive)
-        delete.clicked.connect(lambda: delete_requested(record))
-        layout.addWidget(edit, 2, 1)
-        layout.addWidget(toggle, 2, 2)
-        layout.addWidget(delete, 2, 3)
-
-    def toggle_archive(self) -> None:
-        if self.record.active:
-            self.store.archive(self.record.id)
-        else:
-            self.store.restore(self.record.id)
-        self.refresh_callback()
 
 
 class ThemePresetCard(QFrame):

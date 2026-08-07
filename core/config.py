@@ -14,7 +14,6 @@ READ_TIMEOUT_SECONDS = 30
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONVERSATIONS_DIR = PROJECT_ROOT / "data" / "conversations"
 PREFERENCES_PATH = PROJECT_ROOT / "data" / "preferences.json"
-MEMORY_DB_PATH = PROJECT_ROOT / "data" / "memory.db"
 APP_FOOTER_TEXT = "VioletAI can make mistakes. Check important information."
 
 from core.identity import BASE_SYSTEM_PROMPT  # noqa: E402

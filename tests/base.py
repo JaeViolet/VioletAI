@@ -20,7 +20,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from conversations.manager import ConversationStore  # noqa: E402
-from memory.manager import LocalMemoryBackend, MemoryManager  # noqa: E402
 from ui.window import MainWindow  # noqa: E402
 
 
@@ -34,15 +33,11 @@ class BaseWindowTests(unittest.TestCase):
     def _window_with_temp_store(self) -> tuple[MainWindow, tempfile.TemporaryDirectory]:
         temp_dir = tempfile.TemporaryDirectory()
         store = ConversationStore(Path(temp_dir.name))
-        memory_store = MemoryManager(LocalMemoryBackend(Path(temp_dir.name) / "memory.db"))
         patcher = patch("ui.window.ConversationStore", return_value=store)
-        memory_patcher = patch("ui.window.MemoryManager", return_value=memory_store)
         refresh = patch.object(MainWindow, "_refresh_models")
         patcher.start()
-        memory_patcher.start()
         refresh.start()
         self.addCleanup(patcher.stop)
-        self.addCleanup(memory_patcher.stop)
         self.addCleanup(refresh.stop)
         self.addCleanup(temp_dir.cleanup)
         return MainWindow(), temp_dir

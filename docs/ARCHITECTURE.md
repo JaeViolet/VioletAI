@@ -32,9 +32,6 @@ VioletAI/
 │   ├── ollama.py             # Local model connection
 │   └── manager.py            # Model selection
 │
-├── memory/
-│   └── manager.py            # Memory interface layer
-│
 ├── conversations/
 │   └── manager.py            # Conversation history
 │
@@ -78,18 +75,20 @@ Future model providers should be replaceable without changing the assistant arch
 
 ### Memory
 
-The memory layer is an abstraction boundary.
+The legacy memory implementation has been removed. The settings UI keeps a
+Memory tab as a placeholder, disconnected from any backend, reserved for future
+Letta memory management.
 
-It should provide VioletAI with access to persistent context while avoiding ownership of memory intelligence.
-
-The memory layer should not contain:
+When Letta is integrated it should provide VioletAI with access to persistent
+context while avoiding ownership of memory intelligence. The memory system
+should not contain:
 
 - personality logic
 - retrieval decisions
 - AI reasoning
 - memory ranking
 
-Future memory systems can be connected behind this interface.
+Letta will connect behind this placeholder.
 
 ### Conversations
 
@@ -129,7 +128,7 @@ Completed:
 - Conversation system
 - Settings and themes
 - Modular project structure
-- Memory interface foundation
+- Legacy memory system removed (Memory tab kept as a placeholder)
 
 In progress:
 

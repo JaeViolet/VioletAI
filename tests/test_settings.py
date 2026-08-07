@@ -1,19 +1,16 @@
-"""Settings overlay, memory tab, theme tab, and click-outside-to-close tests."""
+"""Settings overlay, theme tab, Memory tab placeholder, and click-outside-to-close tests."""
 
 from __future__ import annotations
 
 import unittest
-import uuid
 from pathlib import Path
 from unittest.mock import patch
 
 from PySide6.QtCore import QEvent, QPointF, Qt
 from PySide6.QtGui import QMouseEvent
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel
 
-from memory.manager import CATEGORIES, MemoryRecord, utc_now
 from ui.preferences import Preferences
-from ui.settings import MemoryRow
 
 try:
     from tests.base import BaseWindowTests
@@ -85,89 +82,18 @@ class SettingsOverlayTests(BaseWindowTests):
         self._wait_until(lambda: not window.settings_overlay.isVisible())
         window.close()
 
-
-class MemoryTabTests(BaseWindowTests):
-    def _memory_record(self, **overrides) -> MemoryRecord:
-        fields = {
-            "id": uuid.uuid4().hex,
-            "category": "Facts",
-            "subject": "",
-            "key": "",
-            "value": "",
-            "content": "",
-            "created_at": utc_now(),
-            "updated_at": utc_now(),
-        }
-        fields.update(overrides)
-        return MemoryRecord(**fields)
-
-    def _memory_rows(self, overlay) -> list[MemoryRow]:
-        rows = []
-        for index in range(overlay.rows_layout.count()):
-            widget = overlay.rows_layout.itemAt(index).widget()
-            if isinstance(widget, MemoryRow):
-                rows.append(widget)
-        return rows
-
-    def test_memory_tab_lists_search_edit_archive_delete(self) -> None:
+    def test_memory_tab_remains_as_placeholder(self) -> None:
         window, _temp_dir = self._window_with_temp_store()
         window.show()
-        store = window.settings_overlay.store
-        record = store.save(
-            self._memory_record(
-                category="Preferences",
-                subject="me",
-                key="favorite color",
-                value="purple",
-                content="favorite color is purple",
-            )
-        )
         window.open_settings_overlay()
-        self.assertTrue(window.settings_overlay.isVisible())
-        self.assertEqual(
-            [
-                window.settings_overlay.category_filter.itemText(index)
-                for index in range(window.settings_overlay.category_filter.count())
-            ],
-            ["All", *CATEGORIES],
-        )
-        window.settings_overlay.search_input.setText("favorite")
-        self.app.processEvents()
-        self.assertTrue(store.search("favorite"))
-        record.value = "blue"
-        record.content = "favorite color is blue"
-        edited = store.save(record)
-        self.assertIsNotNone(edited)
-        assert edited is not None
-        self.assertEqual(edited.value, "blue")
-        store.archive(record.id)
-        self.assertNotIn(record.id, [memory.id for memory in store.search()])
-        store.restore(record.id)
-        self.assertIn(record.id, [memory.id for memory in store.search()])
-        store.delete(record.id)
-        self.assertNotIn(record.id, [memory.id for memory in store.search(include_archived=True)])
-        window.close()
-
-    def test_memory_tab_search_filters_rows_and_clear_all(self) -> None:
-        window, _temp_dir = self._window_with_temp_store()
-        window.show()
-        store = window.settings_overlay.store
-        store.save(self._memory_record(category="Facts", subject="sun", key="distance", value="93 million miles"))
-        store.save(self._memory_record(category="People", subject="Alice", key="phone", value="555-0100"))
-        window.open_settings_overlay()
+        self.assertIn("Memory", window.settings_overlay.tab_pages)
         window.settings_overlay.select_tab("Memory")
-        self.app.processEvents()
-        self.assertEqual(len(self._memory_rows(window.settings_overlay)), 2)
-        window.settings_overlay.search_input.setText("sun")
-        self.app.processEvents()
-        self.assertEqual(len(self._memory_rows(window.settings_overlay)), 1)
-        window.settings_overlay.search_input.setText("")
-        self.app.processEvents()
-        window.settings_overlay.clear_all()
-        self.assertTrue(window.settings_overlay.confirm_panel.isVisible())
-        window.settings_overlay._confirmed_clear_all()
-        self.app.processEvents()
-        self.assertEqual(store.search(), [])
+        self.assertIs(
+            window.settings_overlay.content_stack.currentWidget(),
+            window.settings_overlay.tab_pages["Memory"],
+        )
+        labels = [label.text() for label in window.settings_overlay.tab_pages["Memory"].findChildren(QLabel)]
+        self.assertTrue(any(text.startswith("This section is not implemented yet.") for text in labels))
         window.close()
 
 

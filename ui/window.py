@@ -31,13 +31,11 @@ from core.config import (
     APP_FOOTER_TEXT,
     APP_NAME,
     DEFAULT_MODEL_NAME,
-    MEMORY_DB_PATH,
     SYSTEM_PROMPT,
 )
 from conversations.manager import Conversation, ConversationStore
 from core.prompts import build_ollama_messages
 from core.engine import Engine, ModelManager
-from memory.manager import LocalMemoryBackend, MemoryManager
 from tools.manager import available_tools
 from ui.chat_view import ChatView
 from ui.design import PNG_CONTROL_ICON_SIZE, icon
@@ -122,7 +120,6 @@ class MainWindow(QMainWindow):
         self.active_model = self.preferences.selected_model or DEFAULT_MODEL_NAME
         self.available_models: list[str] = []
         self.store = ConversationStore()
-        self.memory_store = MemoryManager(LocalMemoryBackend(MEMORY_DB_PATH))
         self.conversation = self._load_or_create_conversation()
         self.messages = self.conversation.messages
 
@@ -295,7 +292,7 @@ class MainWindow(QMainWindow):
         self.search_overlay = SearchOverlay(self.chat_panel)
         self.search_overlay.selected.connect(self._select_from_search)
         self.search_overlay.search_changed.connect(self._rebuild_search_results)
-        self.settings_overlay = SettingsOverlay(self.memory_store, self.preferences, self.chat_panel)
+        self.settings_overlay = SettingsOverlay(self.preferences, self.chat_panel)
         self.settings_overlay.theme_changed.connect(self._apply_style)
         self.confirm_overlay = ConfirmBackdrop(self.chat_panel)
         self.confirm_overlay.confirmed.connect(self._confirmed_delete_conversation)

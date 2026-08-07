@@ -29,7 +29,7 @@ VioletAI is separated into independent systems:
 
 - **Core** — assistant orchestration, identity, and prompts
 - **Models** — AI model connections and management
-- **Memory** — replaceable memory interface layer
+- **Memory** — placeholder tab reserved for future Letta memory management
 - **Conversations** — chat history management
 - **UI** — desktop experience
 - **Tools** — future capabilities and integrations
